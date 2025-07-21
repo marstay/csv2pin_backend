@@ -84,7 +84,7 @@ app.post('/api/export-pin', async (req, res) => {
     await page.setViewport({ width: 1000, height: 1500 });
     // Use environment variable for frontend base URL, fallback to localhost for local dev
     const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
-    const url = `${FRONTEND_BASE_URL}/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
+    const url = `https://lovely-douhua-6f53bb.netlify.app/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
     console.log('[export-pin] Navigating to', url);
     await page.goto(url, { waitUntil: 'networkidle0' });
     console.log('[export-pin] Taking screenshot...');
