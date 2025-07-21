@@ -82,7 +82,9 @@ app.post('/api/export-pin', async (req, res) => {
     browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
     const page = await browser.newPage();
     await page.setViewport({ width: 1000, height: 1500 });
-    const url = `http://localhost:3000/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
+    // Use environment variable for frontend base URL, fallback to localhost for local dev
+    const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
+    const url = `${FRONTEND_BASE_URL}/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
     console.log('[export-pin] Navigating to', url);
     await page.goto(url, { waitUntil: 'networkidle0' });
     console.log('[export-pin] Taking screenshot...');
