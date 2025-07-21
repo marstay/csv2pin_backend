@@ -71,25 +71,30 @@ app.post('/api/generate-image', async (req, res) => {
 // POST /api/export-pin (Puppeteer server-side rendering)
 app.post('/api/export-pin', async (req, res) => {
   const { pinData, template } = req.body;
+  console.log('[export-pin] Request received', { pinData: !!pinData, template });
   if (!pinData || !template) {
+    console.error('[export-pin] Missing pinData or template');
     return res.status(400).json({ error: 'pinData and template are required' });
   }
   let browser;
   try {
+    console.log('[export-pin] Launching Puppeteer...');
     browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
     const page = await browser.newPage();
     await page.setViewport({ width: 1000, height: 1500 });
-    // Point to the frontend export page, passing data as query param
     const url = `http://localhost:3000/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
+    console.log('[export-pin] Navigating to', url);
     await page.goto(url, { waitUntil: 'networkidle0' });
-    // Screenshot the full page (should be just the pin)
+    console.log('[export-pin] Taking screenshot...');
     const buffer = await page.screenshot({ type: 'png', fullPage: true });
     await browser.close();
+    console.log('[export-pin] Screenshot taken and browser closed. Sending response.');
     res.set('Content-Type', 'image/png');
     res.send(buffer);
   } catch (err) {
+    console.error('[export-pin] Error:', err, err.stack);
     if (browser) await browser.close();
-    res.status(500).json({ error: 'Failed to export pin', details: err.message });
+    res.status(500).json({ error: 'Failed to export pin', details: err.message, stack: err.stack });
   }
 });
 
