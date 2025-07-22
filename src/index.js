@@ -3,7 +3,31 @@ import cors from 'cors';
 import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
 dotenv.config();
+
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
+console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+async function requirePro(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('is_pro')
+    .eq('id', user.id)
+    .single();
+  if (!profile?.is_pro) {
+    return res.status(403).json({ error: 'Pro membership required.' });
+  }
+  req.user = user;
+  next();
+}
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -59,7 +83,32 @@ app.post('/api/generate-image', async (req, res) => {
 
     if (prediction.status === 'succeeded') {
       // SDXL returns an array of image URLs
-      return res.json({ imageUrl: prediction.output[0] });
+      const replicateUrl = prediction.output[0];
+      try {
+        // Download the image as a buffer
+        const imageRes = await fetch(replicateUrl);
+        const arrayBuffer = await imageRes.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        // Determine file extension
+        const fileExt = replicateUrl.split('.').pop().split('?')[0];
+        const fileName = `ai-image-${Date.now()}-${Math.floor(Math.random()*10000)}.${fileExt}`;
+        // Upload to Supabase Storage
+        const { error: uploadError } = await supabaseAdmin.storage.from('ai-images').upload(fileName, buffer, {
+          contentType: imageRes.headers.get('content-type') || 'image/png',
+          upsert: true,
+        });
+        if (uploadError) {
+          console.error('Error uploading to Supabase Storage:', uploadError);
+          return res.json({ imageUrl: replicateUrl });
+        }
+        // Get public URL
+        const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+        const publicUrl = publicUrlData?.publicUrl || replicateUrl;
+        return res.json({ imageUrl: publicUrl });
+      } catch (err) {
+        console.error('Error downloading/uploading image:', err);
+        return res.json({ imageUrl: replicateUrl });
+      }
     } else {
       return res.status(500).json({ error: 'Image generation failed' });
     }
@@ -84,7 +133,7 @@ app.post('/api/export-pin', async (req, res) => {
     await page.setViewport({ width: 1000, height: 1500 });
     // Use environment variable for frontend base URL, fallback to localhost for local dev
     const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
-    const url = `https://lovely-douhua-6f53bb.netlify.app/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
+    const url = `${FRONTEND_BASE_URL}/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
     console.log('[export-pin] Navigating to', url);
     await page.goto(url, { waitUntil: 'networkidle0' });
     console.log('[export-pin] Taking screenshot...');
@@ -98,6 +147,12 @@ app.post('/api/export-pin', async (req, res) => {
     if (browser) await browser.close();
     res.status(500).json({ error: 'Failed to export pin', details: err.message, stack: err.stack });
   }
+});
+
+// Example Pro-only endpoint for saving CSV
+app.post('/api/csv', requirePro, async (req, res) => {
+  // Save CSV logic here (not implemented)
+  res.json({ message: 'CSV saved (Pro only endpoint)' });
 });
 
 // --- Pinterest OAuth2 Integration ---
@@ -143,6 +198,20 @@ app.get('/api/pinterest/callback', async (req, res) => {
   } catch (err) {
     res.status(500).send('OAuth2 error: ' + err.message);
   }
+});
+
+// In-memory store for latest boards (for demo; use a DB for production)
+let latestBoards = {};
+
+// Endpoint for Make.com to POST boards
+app.post('/api/pinterest-boards-result', express.json(), (req, res) => {
+  latestBoards['default'] = req.body.boards || req.body; // Accept either { boards: [...] } or just an array
+  res.json({ status: 'ok' });
+});
+
+// Endpoint for frontend to GET boards
+app.get('/api/pinterest-boards', (req, res) => {
+  res.json({ boards: latestBoards['default'] || [] });
 });
 
 app.listen(PORT, () => {
