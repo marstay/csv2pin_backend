@@ -5,6 +5,7 @@ import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
+import axios from 'axios';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -196,29 +197,53 @@ app.get('/api/pinterest/login', (req, res) => {
   res.redirect(`https://www.pinterest.com/oauth/?${params.toString()}`);
 });
 
+
+async function exchangePinterestCodeForToken(code, redirectUri) {
+  const body = {
+    grant_type: 'authorization_code',
+    code,
+    client_id: process.env.PINTEREST_CLIENT_ID,
+    client_secret: process.env.PINTEREST_CLIENT_SECRET,
+    redirect_uri: redirectUri,
+  };
+
+  console.log('🔄 Exchanging Pinterest OAuth Code for Token...');
+  console.log('➡️ Code:', code);
+  console.log('➡️ Redirect URI:', redirectUri);
+  console.log('➡️ Client ID:', process.env.PINTEREST_CLIENT_ID);
+  console.log('➡️ Client Secret Present:', !!process.env.PINTEREST_CLIENT_SECRET);
+
+  const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  console.log('📤 Raw Body:', JSON.stringify(body));
+
+  const result = await response.json();
+
+  console.log('📬 Pinterest Response Status:', response.status);
+  console.log('📦 Pinterest Response Body:', result);
+
+  return result;
+}
+
+
+
+
+
+
 // Handle Pinterest OAuth2 callback
 app.get('/api/pinterest/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
   // Optionally, validate the state parameter here
-
-  // Exchange code for access token
   try {
-    const tokenRes = await fetch('https://api.pinterest.com/v5/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        code,
-        client_id: process.env.PINTEREST_CLIENT_ID,
-        client_secret: process.env.PINTEREST_CLIENT_SECRET,
-        redirect_uri: process.env.PINTEREST_REDIRECT_URI,
-      }),
-    });
-    const tokenData = await tokenRes.json();
+    const tokenData = await exchangePinterestCodeForToken(code, process.env.PINTEREST_REDIRECT_URI);
     if (tokenData.access_token) {
-      // You should store the access_token securely (e.g., in a DB or session)
-      // For demo, just show it
       res.send(`<pre>Access Token: ${tokenData.access_token}\n\n${JSON.stringify(tokenData, null, 2)}</pre>`);
     } else {
       res.status(400).send(`<pre>Failed to get access token:\n${JSON.stringify(tokenData, null, 2)}</pre>`);
@@ -236,21 +261,16 @@ app.post('/api/pinterest/oauth', async (req, res) => {
   const token = authHeader.split(' ')[1];
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  // Log the values sent to Pinterest for debugging
+  console.log({
+    client_id: process.env.PINTEREST_CLIENT_ID,
+    client_secret: process.env.PINTEREST_CLIENT_SECRET ? process.env.PINTEREST_CLIENT_SECRET.slice(0,3) + '...' + process.env.PINTEREST_CLIENT_SECRET.slice(-3) : undefined,
+    redirect_uri: redirectUri,
+    code
+  });
   try {
-    const tokenRes = await fetch('https://api.pinterest.com/v5/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        code,
-        client_id: process.env.PINTEREST_CLIENT_ID || '1523726',
-        client_secret: process.env.PINTEREST_CLIENT_SECRET || 'aad2e8dbe9c662974ab4fcbf59a5712222ee1a35',
-        redirect_uri: redirectUri,
-      }),
-    });
-    const tokenData = await tokenRes.json();
+    const tokenData = await exchangePinterestCodeForToken(code, redirectUri);
     if (tokenData.access_token) {
-      // Store the access token in the user's profile
       await supabaseAdmin
         .from('profiles')
         .update({ pinterest_access_token: tokenData.access_token })
