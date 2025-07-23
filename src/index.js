@@ -156,7 +156,7 @@ app.post('/api/generate-field', requirePro, async (req, res) => {
   const { content, type } = req.body; // type: 'title' or 'description'
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
   const prompt = type === 'title'
-    ? `Write a catchy Pinterest title (max 100 characters) for this content. Only return the title, nothing else:\n${content}`
+    ? `Write a catchy Pinterest title (max 100 characters) for this content. Only return the title, nothing else. Do not include any quotes or special characters in your response:\n${content}`
     : `Write a Pinterest description (max 500 characters) for this content. Only return the description, nothing else:\n${content}`;
   try {
     const completion = await openai.chat.completions.create({
@@ -166,7 +166,10 @@ app.post('/api/generate-field', requirePro, async (req, res) => {
       temperature: 0.7,
     });
     let result = completion.choices[0].message.content.trim();
-    if (type === 'title') result = result.slice(0, 100);
+    if (type === 'title') {
+      // Remove quotes and special characters except basic punctuation
+      result = result.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>/?]+/g, '').slice(0, 100);
+    }
     if (type === 'description') result = result.slice(0, 500);
     res.json({ result });
   } catch (err) {
