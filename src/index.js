@@ -228,6 +228,42 @@ app.get('/api/pinterest/callback', async (req, res) => {
   }
 });
 
+app.post('/api/pinterest/oauth', async (req, res) => {
+  const { code, redirectUri } = req.body;
+  const authHeader = req.headers.authorization;
+  if (!code || !redirectUri) return res.status(400).json({ error: 'Missing code or redirectUri' });
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const tokenRes = await fetch('https://api.pinterest.com/v5/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code,
+        client_id: process.env.PINTEREST_CLIENT_ID || '1523726',
+        client_secret: process.env.PINTEREST_CLIENT_SECRET || 'aad2e8dbe9c662974ab4fcbf59a5712222ee1a35',
+        redirect_uri: redirectUri,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    if (tokenData.access_token) {
+      // Store the access token in the user's profile
+      await supabaseAdmin
+        .from('profiles')
+        .update({ pinterest_access_token: tokenData.access_token })
+        .eq('id', user.id);
+      return res.json({ access_token: tokenData.access_token });
+    } else {
+      return res.status(400).json({ error: tokenData });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // In-memory store for latest boards (for demo; use a DB for production)
 let latestBoards = {};
 
