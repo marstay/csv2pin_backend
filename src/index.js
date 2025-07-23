@@ -5,7 +5,6 @@ import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
-import axios from 'axios';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
