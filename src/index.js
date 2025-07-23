@@ -4,12 +4,14 @@ import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
 console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 async function requirePro(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -146,6 +148,29 @@ app.post('/api/export-pin', async (req, res) => {
     console.error('[export-pin] Error:', err, err.stack);
     if (browser) await browser.close();
     res.status(500).json({ error: 'Failed to export pin', details: err.message, stack: err.stack });
+  }
+});
+
+// POST /api/generate-field (Pro only)
+app.post('/api/generate-field', requirePro, async (req, res) => {
+  const { content, type } = req.body; // type: 'title' or 'description'
+  if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
+  const prompt = type === 'title'
+    ? `Write a catchy Pinterest title (max 100 characters) for this content:\n${content}`
+    : `Write a Pinterest description (max 500 characters) for this content:\n${content}`;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: type === 'title' ? 100 : 500,
+      temperature: 0.7,
+    });
+    let result = completion.choices[0].message.content.trim();
+    if (type === 'title') result = result.slice(0, 100);
+    if (type === 'description') result = result.slice(0, 500);
+    res.json({ result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
