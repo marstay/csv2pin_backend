@@ -239,23 +239,8 @@ app.get('/api/pinterest/callback', async (req, res) => {
   console.log('Received code:', code);
   console.log('Received state:', state);
   if (!code) return res.status(400).send('Missing code');
-  try {
-    console.log('Calling exchangePinterestCodeForToken with:');
-    console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
-    console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
-    console.log('code:', code);
-    console.log('client_secret present:', !!process.env.PINTEREST_CLIENT_SECRET);
-    const tokenData = await exchangePinterestCodeForToken(code, process.env.PINTEREST_REDIRECT_URI);
-    console.log('Token exchange result:', tokenData);
-    if (tokenData.access_token) {
-      res.send(`<pre>Access Token: ${tokenData.access_token}\n\n${JSON.stringify(tokenData, null, 2)}</pre>`);
-    } else {
-      res.status(400).send(`<pre>Failed to get access token:\n${JSON.stringify(tokenData, null, 2)}</pre>`);
-    }
-  } catch (err) {
-    console.error('OAuth2 error:', err);
-    res.status(500).send('OAuth2 error: ' + err.message);
-  }
+  // Redirect to frontend with code for user association
+  res.redirect(`https://csv2pin.com/pinterest/finish?code=${code}`);
 });
 
 app.post('/api/pinterest/oauth', async (req, res) => {
