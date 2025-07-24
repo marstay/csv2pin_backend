@@ -186,6 +186,10 @@ app.post('/api/csv', requirePro, async (req, res) => {
 // --- Pinterest OAuth2 Integration ---
 // Redirect user to Pinterest OAuth2
 app.get('/api/pinterest/login', (req, res) => {
+  console.log('--- Pinterest OAuth Login Initiated ---');
+  console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
+  console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
+  console.log('scope:', 'pins:read boards:read');
   const params = new URLSearchParams({
     client_id: process.env.PINTEREST_CLIENT_ID,
     redirect_uri: process.env.PINTEREST_REDIRECT_URI,
@@ -193,44 +197,35 @@ app.get('/api/pinterest/login', (req, res) => {
     scope: 'pins:read boards:read',
     state: 'secureRandomState123', // TODO: Use a real random state for security
   });
-  res.redirect(`https://www.pinterest.com/oauth/?${params.toString()}`);
+  const redirectUrl = `https://www.pinterest.com/oauth/?${params.toString()}`;
+  console.log('Redirecting to:', redirectUrl);
+  res.redirect(redirectUrl);
 });
 
 
 async function exchangePinterestCodeForToken(code, redirectUri) {
-  const body = {
-    grant_type: 'authorization_code',
-    code,
-    client_id: process.env.PINTEREST_CLIENT_ID,
-    client_secret: process.env.PINTEREST_CLIENT_SECRET,
-    redirect_uri: redirectUri,
-  };
-
-  console.log('🔄 Exchanging Pinterest OAuth Code for Token...');
-  console.log('✅ Request Parameters:', body);
-  const jsonBody = JSON.stringify(body);
-  console.log('➡️ JSON Body:', jsonBody);
-
+  const params = new URLSearchParams();
+  params.append('grant_type', 'authorization_code');
+  params.append('code', code);
+  params.append('client_id', process.env.PINTEREST_CLIENT_ID);
+  params.append('client_secret', process.env.PINTEREST_CLIENT_SECRET);
+  params.append('redirect_uri', redirectUri);
+  const bodyString = params.toString();
+  console.log('--- Exchanging Pinterest Code for Token ---');
+  console.log('Request body:', bodyString);
   const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
       'Accept': 'application/json',
     },
-    body: jsonBody,
+    body: bodyString,
   });
-
-  console.log('📬 Pinterest Response Status:', response.status);
-
   const text = await response.text();
-  try {
-    const json = JSON.parse(text);
-    console.log('📦 Pinterest Response Body (parsed):', json);
-    return json;
-  } catch (e) {
-    console.log('📦 Pinterest Response Body (raw):', text);
-    throw new Error('Failed to parse Pinterest response JSON');
-  }
+  let result;
+  try { result = JSON.parse(text); } catch { result = text; }
+  console.log('Pinterest token endpoint response:', response.status, result);
+  return result;
 }
 
 
@@ -238,16 +233,25 @@ async function exchangePinterestCodeForToken(code, redirectUri) {
 // Handle Pinterest OAuth2 callback
 app.get('/api/pinterest/callback', async (req, res) => {
   const { code, state } = req.query;
+  console.log('--- Pinterest OAuth Callback ---');
+  console.log('Received code:', code);
+  console.log('Received state:', state);
   if (!code) return res.status(400).send('Missing code');
-  // Optionally, validate the state parameter here
   try {
+    console.log('Calling exchangePinterestCodeForToken with:');
+    console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
+    console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
+    console.log('code:', code);
+    console.log('client_secret present:', !!process.env.PINTEREST_CLIENT_SECRET);
     const tokenData = await exchangePinterestCodeForToken(code, process.env.PINTEREST_REDIRECT_URI);
+    console.log('Token exchange result:', tokenData);
     if (tokenData.access_token) {
       res.send(`<pre>Access Token: ${tokenData.access_token}\n\n${JSON.stringify(tokenData, null, 2)}</pre>`);
     } else {
       res.status(400).send(`<pre>Failed to get access token:\n${JSON.stringify(tokenData, null, 2)}</pre>`);
     }
   } catch (err) {
+    console.error('OAuth2 error:', err);
     res.status(500).send('OAuth2 error: ' + err.message);
   }
 });
