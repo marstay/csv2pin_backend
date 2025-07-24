@@ -388,8 +388,8 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
     return res.status(400).json({ error: 'No Pinterest access token found for user.' });
   }
 
-  // Create pin via Pinterest API
-  const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
+  // Create pin via Pinterest API (use sandbox for trial access)
+  const pinterestRes = await fetch('https://api-sandbox.pinterest.com/v5/pins', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${profile.pinterest_access_token}`,
