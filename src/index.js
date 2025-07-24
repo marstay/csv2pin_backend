@@ -206,29 +206,30 @@ app.get('/api/pinterest/login', (req, res) => {
 async function exchangePinterestCodeForToken(code, redirectUri) {
   console.log('redirectUri used in token exchange:', redirectUri);
   
-  // Use URLSearchParams to properly encode all parameters
+  // Try Method 1: Basic Auth (Confidential Client approach)
+  const basicAuth = Buffer.from(`${process.env.PINTEREST_CLIENT_ID}:${process.env.PINTEREST_CLIENT_SECRET}`).toString('base64');
+  
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
     code: code,
-    client_id: process.env.PINTEREST_CLIENT_ID,
-    client_secret: process.env.PINTEREST_CLIENT_SECRET,
     redirect_uri: redirectUri
   });
 
-  console.log('--- Exchanging Pinterest Code for Token ---');
+  console.log('--- Exchanging Pinterest Code for Token (Method 1: Basic Auth) ---');
   console.log('Request body:', params.toString());
 
   try {
-    const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+    let response = await fetch('https://api.pinterest.com/v5/oauth/token', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
+        'Authorization': `Basic ${basicAuth}`,
       },
       body: params.toString(),
     });
 
-    const text = await response.text();
+    let text = await response.text();
     let result;
     try { 
       result = JSON.parse(text); 
@@ -236,7 +237,38 @@ async function exchangePinterestCodeForToken(code, redirectUri) {
       result = { error: 'Invalid JSON response', response: text }; 
     }
 
-    console.log('Pinterest token endpoint response:', response.status, result);
+    console.log('Pinterest token endpoint response (Method 1):', response.status, result);
+
+    // If Method 1 fails, try Method 2: Include credentials in body
+    if (!response.ok && response.status === 400) {
+      console.log('--- Trying Method 2: Credentials in body ---');
+      
+      const paramsWithCreds = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        client_id: process.env.PINTEREST_CLIENT_ID,
+        client_secret: process.env.PINTEREST_CLIENT_SECRET,
+        redirect_uri: redirectUri
+      });
+
+      response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json',
+        },
+        body: paramsWithCreds.toString(),
+      });
+
+      text = await response.text();
+      try { 
+        result = JSON.parse(text); 
+      } catch { 
+        result = { error: 'Invalid JSON response', response: text }; 
+      }
+
+      console.log('Pinterest token endpoint response (Method 2):', response.status, result);
+    }
 
     if (!response.ok) {
       throw new Error(`Pinterest API error: ${response.status} - ${JSON.stringify(result)}`);
@@ -248,7 +280,6 @@ async function exchangePinterestCodeForToken(code, redirectUri) {
     throw error;
   }
 }
-
 
 
 // Handle Pinterest OAuth2 callback
