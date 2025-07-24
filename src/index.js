@@ -190,7 +190,7 @@ app.get('/api/pinterest/login', (req, res) => {
     client_id: process.env.PINTEREST_CLIENT_ID,
     redirect_uri: process.env.PINTEREST_REDIRECT_URI,
     response_type: 'code',
-    scope: 'pins:read pins:write boards:read boards:write user_accounts:read',
+    scope: 'pins:read boards:read user_accounts:read',
     state: 'secureRandomState123', // TODO: Use a real random state for security
   });
   res.redirect(`https://www.pinterest.com/oauth/?${params.toString()}`);
