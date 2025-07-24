@@ -189,12 +189,12 @@ app.get('/api/pinterest/login', (req, res) => {
   console.log('--- Pinterest OAuth Login Initiated ---');
   console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
   console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
-  console.log('scope:', 'pins:write boards:read');
+  console.log('scope:', 'pins:write boards:read boards:write pins:read');
   const params = new URLSearchParams({
     client_id: process.env.PINTEREST_CLIENT_ID,
     redirect_uri: process.env.PINTEREST_REDIRECT_URI,
     response_type: 'code',
-    scope: 'pins:write boards:read', // <-- updated scopes
+    scope: 'pins:write boards:read boards:write pins:read', // updated scopes
     state: 'secureRandomState123', // TODO: Use a real random state for security
   });
   const redirectUrl = `https://www.pinterest.com/oauth/?${params.toString()}`;
