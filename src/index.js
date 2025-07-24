@@ -198,39 +198,41 @@ app.get('/api/pinterest/login', (req, res) => {
 
 
 async function exchangePinterestCodeForToken(code, redirectUri) {
-  const params = new URLSearchParams();
-  params.append('grant_type', 'authorization_code');
-  params.append('code', code);
-  params.append('client_id', process.env.PINTEREST_CLIENT_ID);
-  params.append('client_secret', process.env.PINTEREST_CLIENT_SECRET);
-  params.append('redirect_uri', redirectUri);
+  const body = {
+    grant_type: 'authorization_code',
+    code,
+    client_id: process.env.PINTEREST_CLIENT_ID,
+    client_secret: process.env.PINTEREST_CLIENT_SECRET,
+    redirect_uri: redirectUri,
+  };
 
   console.log('🔄 Exchanging Pinterest OAuth Code for Token...');
-  console.log('✅ Request Parameters:', {
-    code,
-    redirect_uri: redirectUri,
-    client_id: process.env.PINTEREST_CLIENT_ID,
-    client_secret_preview: process.env.PINTEREST_CLIENT_SECRET
-      ? `${process.env.PINTEREST_CLIENT_SECRET.slice(0, 4)}...${process.env.PINTEREST_CLIENT_SECRET.slice(-4)}`
-      : 'undefined',
-  });
+  console.log('✅ Request Parameters:', body);
+  const jsonBody = JSON.stringify(body);
+  console.log('➡️ JSON Body:', jsonBody);
 
   const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Type': 'application/json',
       'Accept': 'application/json',
     },
-    body: params, // ✅ Use the raw URLSearchParams object
+    body: jsonBody,
   });
 
-  const result = await response.json();
-
   console.log('📬 Pinterest Response Status:', response.status);
-  console.log('📦 Pinterest Response Body:', result);
 
-  return result;
+  const text = await response.text();
+  try {
+    const json = JSON.parse(text);
+    console.log('📦 Pinterest Response Body (parsed):', json);
+    return json;
+  } catch (e) {
+    console.log('📦 Pinterest Response Body (raw):', text);
+    throw new Error('Failed to parse Pinterest response JSON');
+  }
 }
+
 
 
 // Handle Pinterest OAuth2 callback
