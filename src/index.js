@@ -189,12 +189,12 @@ app.get('/api/pinterest/login', (req, res) => {
   console.log('--- Pinterest OAuth Login Initiated ---');
   console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
   console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
-  console.log('scope:', 'pins:read boards:read');
+  console.log('scope:', 'pins:write boards:read');
   const params = new URLSearchParams({
     client_id: process.env.PINTEREST_CLIENT_ID,
     redirect_uri: process.env.PINTEREST_REDIRECT_URI,
     response_type: 'code',
-    scope: 'pins:read boards:read',
+    scope: 'pins:write boards:read', // <-- updated scopes
     state: 'secureRandomState123', // TODO: Use a real random state for security
   });
   const redirectUrl = `https://www.pinterest.com/oauth/?${params.toString()}`;
@@ -364,6 +364,53 @@ app.get('/api/pinterest/boards', async (req, res) => {
   });
   const boards = await pinterestRes.json();
   res.json({ boards: boards.items || boards.data || [] });
+});
+
+app.post('/api/pinterest/create-pin', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { image_url, title, description, board_id, link } = req.body;
+  if (!image_url || !title || !description || !board_id) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  // Get the user's Pinterest access token from your DB
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', user.id)
+    .single();
+  if (profileError || !profile?.pinterest_access_token) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
+  }
+
+  // Create pin via Pinterest API
+  const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${profile.pinterest_access_token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      board_id,
+      title,
+      description,
+      media_source: {
+        source_type: 'image_url',
+        url: image_url,
+      },
+      link: link || undefined,
+    }),
+  });
+  const pinData = await pinterestRes.json();
+  if (!pinterestRes.ok) {
+    return res.status(400).json({ error: pinData });
+  }
+  res.json(pinData);
 });
 
 app.listen(PORT, () => {
