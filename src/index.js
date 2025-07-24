@@ -190,7 +190,7 @@ app.get('/api/pinterest/login', (req, res) => {
     client_id: process.env.PINTEREST_CLIENT_ID,
     redirect_uri: process.env.PINTEREST_REDIRECT_URI,
     response_type: 'code',
-    scope: 'pins:read boards:read user_accounts:read',
+    scope: 'pins:read boards:read',
     state: 'secureRandomState123', // TODO: Use a real random state for security
   });
   res.redirect(`https://www.pinterest.com/oauth/?${params.toString()}`);
@@ -198,29 +198,27 @@ app.get('/api/pinterest/login', (req, res) => {
 
 
 async function exchangePinterestCodeForToken(code, redirectUri) {
-  const body = {
-    grant_type: 'authorization_code',
-    code,
-    client_id: process.env.PINTEREST_CLIENT_ID,
-    client_secret: process.env.PINTEREST_CLIENT_SECRET,
-    redirect_uri: redirectUri,
-  };
+  const params = new URLSearchParams();
+  params.append('grant_type', 'authorization_code');
+  params.append('code', code);
+  params.append('client_id', process.env.PINTEREST_CLIENT_ID);
+  params.append('client_secret', process.env.PINTEREST_CLIENT_SECRET);
+  params.append('redirect_uri', redirectUri);
 
   console.log('🔄 Exchanging Pinterest OAuth Code for Token...');
   console.log('➡️ Code:', code);
   console.log('➡️ Redirect URI:', redirectUri);
   console.log('➡️ Client ID:', process.env.PINTEREST_CLIENT_ID);
   console.log('➡️ Client Secret Present:', !!process.env.PINTEREST_CLIENT_SECRET);
+  console.log('📤 Raw Body:', params.toString());
 
   const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: JSON.stringify(body),
+    body: params.toString(),
   });
-
-  console.log('📤 Raw Body:', JSON.stringify(body));
 
   const result = await response.json();
 
@@ -229,10 +227,6 @@ async function exchangePinterestCodeForToken(code, redirectUri) {
 
   return result;
 }
-
-
-
-
 
 
 // Handle Pinterest OAuth2 callback
