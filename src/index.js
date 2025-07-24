@@ -338,6 +338,34 @@ app.get('/api/pinterest-boards', (req, res) => {
   res.json({ boards: latestBoards['default'] || [] });
 });
 
+app.get('/api/pinterest/boards', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Get the user's Pinterest access token from your DB
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', user.id)
+    .single();
+  if (profileError || !profile?.pinterest_access_token) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
+  }
+
+  // Fetch boards from Pinterest API
+  const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
+    headers: {
+      'Authorization': `Bearer ${profile.pinterest_access_token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  const boards = await pinterestRes.json();
+  res.json({ boards: boards.items || boards.data || [] });
+});
+
 app.listen(PORT, () => {
   console.log(`Backend listening on port ${PORT}`);
 }); 
