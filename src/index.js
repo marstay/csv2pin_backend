@@ -215,7 +215,7 @@ async function exchangePinterestCodeForToken(code, redirectUri) {
       : 'undefined',
   });
 
-  const response = await fetch('https://api.pinterest.com/v1/oauth/token', {
+  const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
