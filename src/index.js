@@ -206,13 +206,13 @@ app.get('/api/pinterest/login', (req, res) => {
 async function exchangePinterestCodeForToken(code, redirectUri) {
   // Use the redirectUri as-is (should be plain, not encoded)
   console.log('redirectUri used in token exchange (should be plain):', redirectUri);
-  const params = new URLSearchParams();
-  params.append('grant_type', 'authorization_code');
-  params.append('code', code);
-  params.append('client_id', process.env.PINTEREST_CLIENT_ID);
-  params.append('client_secret', process.env.PINTEREST_CLIENT_SECRET);
-  params.append('redirect_uri', redirectUri);
-  const bodyString = params.toString();
+  // Manually build the body string so redirect_uri is not encoded
+  const bodyString =
+    'grant_type=authorization_code' +
+    `&code=${code}` +
+    `&client_id=${process.env.PINTEREST_CLIENT_ID}` +
+    `&client_secret=${process.env.PINTEREST_CLIENT_SECRET}` +
+    `&redirect_uri=${redirectUri}`;
   console.log('--- Exchanging Pinterest Code for Token ---');
   console.log('Request body:', bodyString);
   const response = await fetch('https://api.pinterest.com/v5/oauth/token', {
