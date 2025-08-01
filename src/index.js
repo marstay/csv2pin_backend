@@ -324,6 +324,58 @@ app.post('/api/pinterest/oauth', async (req, res) => {
   }
 });
 
+// Debug endpoint to check Pinterest connection status
+app.get('/api/pinterest/status', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Get the user's Pinterest access token from your DB
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', user.id)
+    .single();
+
+  const hasToken = !!profile?.pinterest_access_token;
+  const tokenLength = profile?.pinterest_access_token?.length || 0;
+
+  // Test the token with Pinterest API
+  let tokenValid = false;
+  let pinterestError = null;
+
+  if (hasToken) {
+    try {
+      const testRes = await fetch('https://api.pinterest.com/v5/user_account', {
+        headers: {
+          'Authorization': `Bearer ${profile.pinterest_access_token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      if (testRes.ok) {
+        tokenValid = true;
+      } else {
+        const errorData = await testRes.json();
+        pinterestError = errorData;
+      }
+    } catch (error) {
+      pinterestError = { message: error.message };
+    }
+  }
+
+  res.json({
+    user_id: user.id,
+    has_token: hasToken,
+    token_length: tokenLength,
+    token_valid: tokenValid,
+    pinterest_error: pinterestError,
+    profile_error: profileError
+  });
+});
+
 // In-memory store for latest boards (for demo; use a DB for production)
 let latestBoards = {};
 
@@ -384,33 +436,59 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
     .select('pinterest_access_token')
     .eq('id', user.id)
     .single();
+  
+  console.log('--- Pinterest Create Pin Debug ---');
+  console.log('User ID:', user.id);
+  console.log('Profile Error:', profileError);
+  console.log('Has Access Token:', !!profile?.pinterest_access_token);
+  console.log('Access Token Length:', profile?.pinterest_access_token?.length);
+  console.log('Board ID:', board_id);
+  console.log('Image URL:', image_url);
+  
   if (profileError || !profile?.pinterest_access_token) {
     return res.status(400).json({ error: 'No Pinterest access token found for user.' });
   }
 
-  // Create pin via Pinterest API (use sandbox for trial access)
-  const pinterestRes = await fetch('https://api-sandbox.pinterest.com/v5/pins', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${profile.pinterest_access_token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      board_id,
-      title,
-      description,
-      media_source: {
-        source_type: 'image_url',
-        url: image_url,
+  // Try standard Pinterest API
+  try {
+    console.log(`Using Pinterest API: https://api.pinterest.com/v5/pins`);
+    
+    const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${profile.pinterest_access_token}`,
+        'Content-Type': 'application/json',
       },
-      link: link || undefined,
-    }),
-  });
-  const pinData = await pinterestRes.json();
-  if (!pinterestRes.ok) {
-    return res.status(400).json({ error: pinData });
+      body: JSON.stringify({
+        board_id,
+        title,
+        description,
+        media_source: {
+          source_type: 'image_url',
+          url: image_url,
+        },
+        link: link || undefined,
+      }),
+    });
+    
+    const pinData = await pinterestRes.json();
+    console.log(`Pinterest API Response:`, pinterestRes.status, pinData);
+    
+    if (pinterestRes.ok) {
+      return res.json(pinData);
+    } else {
+      return res.status(400).json({ error: pinData });
+    }
+  } catch (error) {
+    console.log(`Error with Pinterest API:`, error.message);
+    return res.status(400).json({ 
+      error: { 
+        code: 2, 
+        message: `Pinterest API error: ${error.message}`, 
+        status: "failure" 
+      } 
+    });
   }
-  res.json(pinData);
 });
 
 app.listen(PORT, () => {
