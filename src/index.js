@@ -1,0 +1,775 @@
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import puppeteer from 'puppeteer';
+import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
+import Stripe from 'stripe';
+dotenv.config();
+
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
+console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2022-11-15',
+});
+
+async function requirePro(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('is_pro')
+    .eq('id', user.id)
+    .single();
+  if (!profile?.is_pro) {
+    return res.status(403).json({ error: 'Pro membership required.' });
+  }
+  req.user = user;
+  next();
+}
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+app.use(cors());
+app.use(express.json());
+
+const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
+
+// POST /api/generate-image
+app.post('/api/generate-image', async (req, res) => {
+  console.log('Received request:', req.body);
+  const { title } = req.body;
+  if (!title) {
+    return res.status(400).json({ error: 'Title is required' });
+  }
+
+  if (!REPLICATE_API_TOKEN) {
+    return res.status(500).json({ error: 'Replicate API token not set' });
+  }
+
+  try {
+    // Construct a highly optimized Pinterest-style prompt
+    const pinterestPrompt = `Create an eye-catching, scroll-stopping Pinterest pin background for a blog post titled "${title}". The image must be vertical (portrait layout), visually stunning, and use vibrant, modern colors with a clean, contemporary style. Soft lighting, shallow depth of field, high resolution, professional photographer style. Absolutely no text, words, or lettering—only visuals. The design should be suitable as a background for a Pinterest pin, with clear space for text overlay.`;
+    // Call Replicate SDXL API
+    const response = await fetch('https://api.replicate.com/v1/predictions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${REPLICATE_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        version: '7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc',
+        input: {
+          prompt: pinterestPrompt,
+          width: 1024,
+          height: 1536,
+        }
+      }),
+    });
+
+    const data = await response.json();
+
+    // Replicate returns a prediction object; poll until status is 'succeeded'
+    let prediction = data;
+    while (prediction.status !== 'succeeded' && prediction.status !== 'failed') {
+      await new Promise(r => setTimeout(r, 1500));
+      const pollRes = await fetch(`https://api.replicate.com/v1/predictions/${prediction.id}`, {
+        headers: { 'Authorization': `Token ${REPLICATE_API_TOKEN}` }
+      });
+      prediction = await pollRes.json();
+    }
+
+    if (prediction.status === 'succeeded') {
+      // SDXL returns an array of image URLs
+      const replicateUrl = prediction.output[0];
+      try {
+        // Download the image as a buffer
+        const imageRes = await fetch(replicateUrl);
+        const arrayBuffer = await imageRes.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        // Determine file extension
+        const fileExt = replicateUrl.split('.').pop().split('?')[0];
+        const fileName = `ai-image-${Date.now()}-${Math.floor(Math.random()*10000)}.${fileExt}`;
+        // Upload to Supabase Storage
+        const { error: uploadError } = await supabaseAdmin.storage.from('ai-images').upload(fileName, buffer, {
+          contentType: imageRes.headers.get('content-type') || 'image/png',
+          upsert: true,
+        });
+        if (uploadError) {
+          console.error('Error uploading to Supabase Storage:', uploadError);
+          return res.json({ imageUrl: replicateUrl });
+        }
+        // Get public URL
+        const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+        const publicUrl = publicUrlData?.publicUrl || replicateUrl;
+        return res.json({ imageUrl: publicUrl });
+      } catch (err) {
+        console.error('Error downloading/uploading image:', err);
+        return res.json({ imageUrl: replicateUrl });
+      }
+    } else {
+      return res.status(500).json({ error: 'Image generation failed' });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: 'Error calling Replicate API', details: err.message });
+  }
+});
+
+// POST /api/export-pin (Puppeteer server-side rendering)
+app.post('/api/export-pin', async (req, res) => {
+  const { pinData, template } = req.body;
+  console.log('[export-pin] Request received', { pinData: !!pinData, template });
+  console.log('[export-pin] Template type:', typeof template);
+  console.log('[export-pin] Template value:', template);
+  if (!pinData || !template) {
+    console.error('[export-pin] Missing pinData or template');
+    return res.status(400).json({ error: 'pinData and template are required' });
+  }
+  let browser;
+  try {
+    console.log('[export-pin] Launching Puppeteer...');
+    browser = await puppeteer.launch({ 
+      headless: 'new', 
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      timeout: 30000
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1000, height: 1500 });
+    // Use environment variable for frontend base URL, fallback to localhost for local dev
+    const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
+    
+    // Construct the URL with template parameter
+    const url = `${FRONTEND_BASE_URL}/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
+    console.log('[export-pin] Navigating to', url);
+    console.log('[export-pin] Encoded template:', encodeURIComponent(template));
+    
+    // Add timeout and better error handling
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+    
+    // Capture console logs from the page
+    page.on('console', msg => console.log('[Puppeteer Console]', msg.text()));
+    
+    // Capture page errors
+    page.on('pageerror', error => console.log('[Puppeteer Page Error]', error.message));
+    
+    // Wait a bit for the page to fully load using setTimeout
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    const pageTitle = await page.title();
+    console.log('[export-pin] Page title:', pageTitle);
+    
+    // Get the page content to see if it's loading correctly
+    const pageContent = await page.content();
+    console.log('[export-pin] Page content length:', pageContent.length);
+    console.log('[export-pin] Page content includes "ExportPinPage":', pageContent.includes('ExportPinPage'));
+    console.log('[export-pin] Page content includes "PinTemplate23":', pageContent.includes('PinTemplate23'));
+    
+    const templateReceived = await page.evaluate(() => {
+      if (window.exportDebug) {
+        return window.exportDebug;
+      }
+      return null;
+    });
+    console.log('[export-pin] Template debug info:', templateReceived);
+    
+    // Check if the template component is rendering
+    const templateComponent = await page.evaluate(() => {
+      const templateDiv = document.querySelector('div');
+      if (templateDiv) {
+        return {
+          className: templateDiv.className,
+          style: templateDiv.style.cssText,
+          children: templateDiv.children.length
+        };
+      }
+      return null;
+    });
+    console.log('[export-pin] Template component info:', templateComponent);
+    
+    console.log('[export-pin] Taking screenshot...');
+    const buffer = await page.screenshot({ type: 'png', fullPage: true });
+    await browser.close();
+    console.log('[export-pin] Screenshot taken and browser closed. Sending response.');
+    res.set('Content-Type', 'image/png');
+    res.send(buffer);
+  } catch (err) {
+    console.error('[export-pin] Error:', err, err.stack);
+    if (browser) await browser.close();
+    res.status(500).json({ error: 'Failed to export pin', details: err.message, stack: err.stack });
+  }
+});
+
+// POST /api/generate-field (Pro only)
+app.post('/api/generate-field', requirePro, async (req, res) => {
+  const { content, type } = req.body; // type: 'title' or 'description'
+  if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
+  const prompt = type === 'title'
+    ? `Write a concise, curiosity-driven Pinterest pin title (max 100 characters) for this content. The title should make people want to click to learn more. It should include emotional triggers, urgency, or questions where possible. Avoid generic phrases and focus on being unique and compelling. Target people interested in food safety, kitchen tips, or expiration dates. Only return the title, nothing else. Do not include any quotes or special characters in your response:\n${content}`
+    : `Write an engaging Pinterest pin description (max 500 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Include a soft call to action, and add 4–6 relevant hashtags at the end targeting food safety, storage tips, AI food scanning, and kitchen hacks. Only return the description, nothing else:\n${content}`;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: type === 'title' ? 100 : 500,
+      temperature: 0.7,
+    });
+    let result = completion.choices[0].message.content.trim();
+    if (type === 'title') {
+      // Remove quotes and special characters except basic punctuation
+      result = result.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>/?]+/g, '').slice(0, 100);
+    }
+    if (type === 'description') result = result.slice(0, 500);
+    res.json({ result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// CSV save endpoint for all registered users
+app.post('/api/csv', async (req, res) => {
+  // Save CSV logic here (not implemented)
+  res.json({ message: 'CSV saved (available to all registered users)' });
+});
+
+// --- Pinterest OAuth2 Integration ---
+// Redirect user to Pinterest OAuth2
+app.get('/api/pinterest/login', (req, res) => {
+  console.log('--- Pinterest OAuth Login Initiated ---');
+  console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
+  console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
+  console.log('scope:', 'pins:write boards:read boards:write pins:read user_accounts:read');
+  const params = new URLSearchParams({
+    client_id: process.env.PINTEREST_CLIENT_ID,
+    redirect_uri: process.env.PINTEREST_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'pins:write boards:read boards:write pins:read user_accounts:read', // added user_accounts:read
+    state: 'secureRandomState123', // TODO: Use a real random state for security
+  });
+  const redirectUrl = `https://www.pinterest.com/oauth/?${params.toString()}`;
+  console.log('Redirecting to:', redirectUrl);
+  res.redirect(redirectUrl);
+});
+
+
+async function exchangePinterestCodeForToken(code, redirectUri) {
+  console.log('redirectUri used in token exchange:', redirectUri);
+  
+  // Try Method 1: Basic Auth (Confidential Client approach)
+  const basicAuth = Buffer.from(`${process.env.PINTEREST_CLIENT_ID}:${process.env.PINTEREST_CLIENT_SECRET}`).toString('base64');
+  
+  const params = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code: code,
+    redirect_uri: redirectUri
+  });
+
+  console.log('--- Exchanging Pinterest Code for Token (Method 1: Basic Auth) ---');
+  console.log('Request body:', params.toString());
+
+  try {
+    let response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        'Authorization': `Basic ${basicAuth}`,
+      },
+      body: params.toString(),
+    });
+
+    let text = await response.text();
+    let result;
+    try { 
+      result = JSON.parse(text); 
+    } catch { 
+      result = { error: 'Invalid JSON response', response: text }; 
+    }
+
+    console.log('Pinterest token endpoint response (Method 1):', response.status, result);
+
+    // If Method 1 fails, try Method 2: Include credentials in body
+    if (!response.ok && response.status === 400) {
+      console.log('--- Trying Method 2: Credentials in body ---');
+      
+      const paramsWithCreds = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        client_id: process.env.PINTEREST_CLIENT_ID,
+        client_secret: process.env.PINTEREST_CLIENT_SECRET,
+        redirect_uri: redirectUri
+      });
+
+      response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json',
+        },
+        body: paramsWithCreds.toString(),
+      });
+
+      text = await response.text();
+      try { 
+        result = JSON.parse(text); 
+      } catch { 
+        result = { error: 'Invalid JSON response', response: text }; 
+      }
+
+      console.log('Pinterest token endpoint response (Method 2):', response.status, result);
+    }
+
+    if (!response.ok) {
+      throw new Error(`Pinterest API error: ${response.status} - ${JSON.stringify(result)}`);
+    }
+
+    return result;
+  } catch (error) {
+    console.error('Error in exchangePinterestCodeForToken:', error);
+    throw error;
+  }
+}
+
+
+// Handle Pinterest OAuth2 callback
+app.get('/api/pinterest/callback', async (req, res) => {
+  const { code, state } = req.query;
+  console.log('--- Pinterest OAuth Callback ---');
+  console.log('Received code:', code);
+  console.log('Received state:', state);
+  if (!code) return res.status(400).send('Missing code');
+  // Redirect to frontend with code for user association
+  res.redirect(`https://csv2pin.com/pinterest/finish?code=${code}`);
+});
+
+app.post('/api/pinterest/oauth', async (req, res) => {
+  const { code, redirectUri } = req.body;
+  const authHeader = req.headers.authorization;
+  if (!code || !redirectUri) return res.status(400).json({ error: 'Missing code or redirectUri' });
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  // Log the values sent to Pinterest for debugging
+  console.log({
+    client_id: process.env.PINTEREST_CLIENT_ID,
+    client_secret: process.env.PINTEREST_CLIENT_SECRET ? process.env.PINTEREST_CLIENT_SECRET.slice(0,3) + '...' + process.env.PINTEREST_CLIENT_SECRET.slice(-3) : undefined,
+    redirect_uri: redirectUri,
+    code
+  });
+  try {
+    const tokenData = await exchangePinterestCodeForToken(code, redirectUri);
+    if (tokenData.access_token) {
+      await supabaseAdmin
+        .from('profiles')
+        .update({ pinterest_access_token: tokenData.access_token })
+        .eq('id', user.id);
+      return res.json({ access_token: tokenData.access_token });
+    } else {
+      return res.status(400).json({ error: tokenData });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug endpoint to check Pinterest connection status
+app.get('/api/pinterest/status', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Get the user's Pinterest access token from your DB
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', user.id)
+    .single();
+
+  const hasToken = !!profile?.pinterest_access_token;
+  const tokenLength = profile?.pinterest_access_token?.length || 0;
+
+  // Test the token with Pinterest API
+  let tokenValid = false;
+  let pinterestError = null;
+
+  if (hasToken) {
+    try {
+      const testRes = await fetch('https://api.pinterest.com/v5/user_account', {
+        headers: {
+          'Authorization': `Bearer ${profile.pinterest_access_token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      if (testRes.ok) {
+        tokenValid = true;
+      } else {
+        const errorData = await testRes.json();
+        pinterestError = errorData;
+      }
+    } catch (error) {
+      pinterestError = { message: error.message };
+    }
+  }
+
+  res.json({
+    user_id: user.id,
+    has_token: hasToken,
+    token_length: tokenLength,
+    token_valid: tokenValid,
+    pinterest_error: pinterestError,
+    profile_error: profileError
+  });
+});
+
+// In-memory store for latest boards (for demo; use a DB for production)
+let latestBoards = {};
+
+// Endpoint for Make.com to POST boards
+app.post('/api/pinterest-boards-result', express.json(), (req, res) => {
+  latestBoards['default'] = req.body.boards || req.body; // Accept either { boards: [...] } or just an array
+  res.json({ status: 'ok' });
+});
+
+// Endpoint for frontend to GET boards
+app.get('/api/pinterest-boards', (req, res) => {
+  res.json({ boards: latestBoards['default'] || [] });
+});
+
+app.get('/api/pinterest/boards', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  // Get the user's Pinterest access token from your DB
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', user.id)
+    .single();
+  if (profileError || !profile?.pinterest_access_token) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
+  }
+
+  // Fetch boards from Pinterest API
+  const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
+    headers: {
+      'Authorization': `Bearer ${profile.pinterest_access_token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  const boards = await pinterestRes.json();
+  res.json({ boards: boards.items || boards.data || [] });
+});
+
+app.post('/api/pinterest/create-pin', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { image_url, title, description, board_id, link } = req.body;
+  if (!image_url || !title || !description || !board_id) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  // Get the user's Pinterest access token from your DB
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', user.id)
+    .single();
+  
+  console.log('--- Pinterest Create Pin Debug ---');
+  console.log('User ID:', user.id);
+  console.log('Profile Error:', profileError);
+  console.log('Has Access Token:', !!profile?.pinterest_access_token);
+  console.log('Access Token Length:', profile?.pinterest_access_token?.length);
+  console.log('Board ID:', board_id);
+  console.log('Image URL:', image_url);
+  
+  if (profileError || !profile?.pinterest_access_token) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
+  }
+
+  // Try standard Pinterest API
+  try {
+    console.log(`Using Pinterest API: https://api.pinterest.com/v5/pins`);
+    
+    const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${profile.pinterest_access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        board_id,
+        title,
+        description,
+        media_source: {
+          source_type: 'image_url',
+          url: image_url,
+        },
+        link: link || undefined,
+      }),
+    });
+    
+    const pinData = await pinterestRes.json();
+    console.log(`Pinterest API Response:`, pinterestRes.status, pinData);
+    
+    if (pinterestRes.ok) {
+      return res.json(pinData);
+    } else {
+      return res.status(400).json({ error: pinData });
+    }
+  } catch (error) {
+    console.log(`Error with Pinterest API:`, error.message);
+    return res.status(400).json({ 
+      error: { 
+        code: 2, 
+        message: `Pinterest API error: ${error.message}`, 
+        status: "failure" 
+      } 
+    });
+  }
+});
+
+// Stripe checkout session endpoint
+app.post('/api/create-checkout-session', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { planType } = req.body;
+  
+  // Define plan configurations
+  const plans = {
+    'creator': {
+      name: 'Creator Plan',
+      price: 1200, // $12.00 in cents
+      credits: 500,
+      planType: 'creator'
+    },
+    'pro': {
+      name: 'Pro Plan',
+      price: 2500, // $25.00 in cents
+      credits: 1500,
+      planType: 'pro'
+    },
+    'agency': {
+      name: 'Agency Plan',
+      price: 5600, // $56.00 in cents
+      credits: 5000,
+      planType: 'agency'
+    }
+  };
+
+  const plan = plans[planType];
+  if (!plan) {
+    return res.status(400).json({ error: 'Invalid plan type' });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: plan.name,
+              description: `${plan.credits} credits per month`,
+            },
+            unit_amount: plan.price,
+            recurring: {
+              interval: 'month',
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/pricing`,
+      client_reference_id: user.id,
+      metadata: {
+        userId: user.id,
+        planType: plan.planType,
+        credits: plan.credits.toString()
+      }
+    });
+
+
+
+    res.json({ sessionId: session.id });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+
+
+// Stripe webhook endpoint
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      await handleCheckoutSessionCompleted(session);
+      break;
+    case 'invoice.payment_succeeded':
+      const invoice = event.data.object;
+      await handleInvoicePaymentSucceeded(invoice);
+      break;
+    case 'customer.subscription.deleted':
+      const subscription = event.data.object;
+      await handleSubscriptionDeleted(subscription);
+      break;
+    default:
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+async function handleCheckoutSessionCompleted(session) {
+  const userId = session.metadata.userId;
+  const planType = session.metadata.planType;
+  const credits = parseInt(session.metadata.credits);
+
+  try {
+    // Update user profile with new plan and credits
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({
+        plan_type: planType,
+        credits_remaining: credits,
+        is_pro: true,
+        stripe_customer_id: session.customer,
+        stripe_subscription_id: session.subscription
+      })
+      .eq('id', userId);
+
+    if (error) {
+      console.error('Error updating user profile:', error);
+    } else {
+      console.log(`User ${userId} upgraded to ${planType} plan`);
+    }
+  } catch (error) {
+    console.error('Error handling checkout session completed:', error);
+  }
+}
+
+async function handleInvoicePaymentSucceeded(invoice) {
+  const subscriptionId = invoice.subscription;
+  
+  try {
+    // Get subscription details
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+    const customerId = subscription.customer;
+    
+    // Find user by Stripe customer ID
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('id, plan_type')
+      .eq('stripe_customer_id', customerId)
+      .single();
+
+    if (error || !profile) {
+      console.error('User not found for customer ID:', customerId);
+      return;
+    }
+
+    // Define credits for each plan
+    const planCredits = {
+      'creator': 500,
+      'pro': 1500,
+      'agency': 5000
+    };
+
+    const credits = planCredits[profile.plan_type] || 0;
+
+    // Reset credits for the new month
+    const { error: updateError } = await supabaseAdmin
+      .from('profiles')
+      .update({ credits_remaining: credits })
+      .eq('id', profile.id);
+
+    if (updateError) {
+      console.error('Error updating credits:', updateError);
+    } else {
+      console.log(`Credits reset for user ${profile.id} to ${credits}`);
+    }
+  } catch (error) {
+    console.error('Error handling invoice payment succeeded:', error);
+  }
+}
+
+async function handleSubscriptionDeleted(subscription) {
+  const customerId = subscription.customer;
+  
+  try {
+    // Find user by Stripe customer ID
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('id')
+      .eq('stripe_customer_id', customerId)
+      .single();
+
+    if (error || !profile) {
+      console.error('User not found for customer ID:', customerId);
+      return;
+    }
+
+    // Downgrade user to free plan
+    const { error: updateError } = await supabaseAdmin
+      .from('profiles')
+      .update({
+        plan_type: 'free',
+        credits_remaining: 50,
+        is_pro: false,
+        stripe_subscription_id: null
+      })
+      .eq('id', profile.id);
+
+    if (updateError) {
+      console.error('Error downgrading user:', updateError);
+    } else {
+      console.log(`User ${profile.id} downgraded to free plan`);
+    }
+  } catch (error) {
+    console.error('Error handling subscription deleted:', error);
+  }
+}
+
+app.listen(PORT, () => {
+  console.log(`Backend listening on port ${PORT}`);
+}); 
