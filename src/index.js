@@ -13,9 +13,9 @@ console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: '2022-11-15',
-});
+}) : null;
 
 async function requirePro(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -549,6 +549,10 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
 
 // Stripe checkout session endpoint
 app.post('/api/create-checkout-session', async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe not configured' });
+  }
+  
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
@@ -627,6 +631,10 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
 // Stripe webhook endpoint
 app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe not configured' });
+  }
+  
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -661,6 +669,8 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
 });
 
 async function handleCheckoutSessionCompleted(session) {
+  if (!stripe) return;
+  
   const userId = session.metadata.userId;
   const planType = session.metadata.planType;
   const credits = parseInt(session.metadata.credits);
@@ -689,6 +699,8 @@ async function handleCheckoutSessionCompleted(session) {
 }
 
 async function handleInvoicePaymentSucceeded(invoice) {
+  if (!stripe) return;
+  
   const subscriptionId = invoice.subscription;
   
   try {
@@ -734,6 +746,8 @@ async function handleInvoicePaymentSucceeded(invoice) {
 }
 
 async function handleSubscriptionDeleted(subscription) {
+  if (!stripe) return;
+  
   const customerId = subscription.customer;
   
   try {
@@ -769,6 +783,109 @@ async function handleSubscriptionDeleted(subscription) {
     console.error('Error handling subscription deleted:', error);
   }
 }
+
+// WordPress API endpoints
+app.post('/api/wordpress/test-connection', async (req, res) => {
+  const { siteUrl, username, appPassword } = req.body;
+  
+  if (!siteUrl || !username || !appPassword) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    // Clean up the site URL
+    const cleanSiteUrl = siteUrl.replace(/\/$/, ''); // Remove trailing slash
+    
+    const auth = Buffer.from(`${username}:${appPassword}`).toString('base64');
+    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=1`, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (response.ok) {
+      res.json({ success: true, message: 'Connection successful' });
+    } else {
+      const errorData = await response.json().catch(() => ({}));
+      res.status(400).json({ 
+        error: 'Invalid credentials or site URL',
+        details: errorData
+      });
+    }
+  } catch (error) {
+    console.error('WordPress connection error:', error);
+    res.status(500).json({ error: 'Connection failed. Please check your site URL and credentials.' });
+  }
+});
+
+app.post('/api/wordpress/fetch-posts', async (req, res) => {
+  const { siteUrl, username, appPassword } = req.body;
+  
+  if (!siteUrl || !username || !appPassword) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    const cleanSiteUrl = siteUrl.replace(/\/$/, '');
+    const auth = Buffer.from(`${username}:${appPassword}`).toString('base64');
+    
+    // Fetch posts with more details
+    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=50&_embed`, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      return res.status(400).json({ 
+        error: 'Failed to fetch posts',
+        details: errorData
+      });
+    }
+    
+    const posts = await response.json();
+    
+    // Transform WordPress posts to our format
+    const transformedPosts = posts.map(post => {
+      // Extract featured image URL if available
+      let featuredImageUrl = '';
+      if (post._embedded && post._embedded['wp:featuredmedia'] && post._embedded['wp:featuredmedia'][0]) {
+        featuredImageUrl = post._embedded['wp:featuredmedia'][0].source_url;
+      }
+      
+      // Clean up content by removing HTML tags
+      const cleanContent = post.content.rendered
+        .replace(/<[^>]*>/g, '') // Remove HTML tags
+        .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+        .trim();
+      
+      const cleanExcerpt = post.excerpt.rendered
+        .replace(/<[^>]*>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      
+      return {
+        id: post.id,
+        title: post.title.rendered,
+        content: cleanContent,
+        excerpt: cleanExcerpt,
+        featured_image_url: featuredImageUrl,
+        link: post.link,
+        date: post.date,
+        author: post.author,
+        categories: post.categories.join(', ')
+      };
+    });
+    
+    res.json({ posts: transformedPosts });
+  } catch (error) {
+    console.error('WordPress fetch posts error:', error);
+    res.status(500).json({ error: 'Failed to fetch posts' });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Backend listening on port ${PORT}`);
