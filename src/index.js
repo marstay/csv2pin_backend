@@ -796,8 +796,11 @@ app.post('/api/wordpress/test-connection', async (req, res) => {
     // Clean up the site URL
     const cleanSiteUrl = siteUrl.replace(/\/$/, ''); // Remove trailing slash
     
+    console.log('Testing connection to:', cleanSiteUrl);
+    console.log('Username:', username);
+    
     const auth = Buffer.from(`${username}:${appPassword}`).toString('base64');
-    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=1`, {
+    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=1&status=publish`, {
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json'
@@ -805,9 +808,16 @@ app.post('/api/wordpress/test-connection', async (req, res) => {
     });
     
     if (response.ok) {
-      res.json({ success: true, message: 'Connection successful' });
+      const posts = await response.json();
+      console.log('Connection test - posts found:', posts.length);
+      res.json({ 
+        success: true, 
+        message: 'Connection successful',
+        postsFound: posts.length
+      });
     } else {
       const errorData = await response.json().catch(() => ({}));
+      console.log('Connection test failed:', errorData);
       res.status(400).json({ 
         error: 'Invalid credentials or site URL',
         details: errorData
@@ -830,8 +840,31 @@ app.post('/api/wordpress/fetch-posts', async (req, res) => {
     const cleanSiteUrl = siteUrl.replace(/\/$/, '');
     const auth = Buffer.from(`${username}:${appPassword}`).toString('base64');
     
-    // Fetch posts with more details
-    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=50&_embed`, {
+    console.log('Fetching posts from:', `${cleanSiteUrl}/wp-json/wp/v2/posts`);
+    console.log('Using auth for user:', username);
+    
+    // First, let's test the basic posts endpoint
+    const testResponse = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=1`, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    console.log('Test response status:', testResponse.status);
+    console.log('Test response headers:', Object.fromEntries(testResponse.headers.entries()));
+    
+    if (!testResponse.ok) {
+      const errorText = await testResponse.text();
+      console.log('Test response error:', errorText);
+      return res.status(400).json({ 
+        error: 'Failed to fetch posts',
+        details: { status: testResponse.status, body: errorText }
+      });
+    }
+    
+    // Now fetch posts with more details
+    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=50&_embed&status=publish`, {
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json'
@@ -847,6 +880,9 @@ app.post('/api/wordpress/fetch-posts', async (req, res) => {
     }
     
     const posts = await response.json();
+    
+    console.log('Raw posts response:', JSON.stringify(posts, null, 2));
+    console.log('Number of posts found:', posts.length);
     
     // Transform WordPress posts to our format
     const transformedPosts = posts.map(post => {
