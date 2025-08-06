@@ -863,8 +863,8 @@ app.post('/api/wordpress/fetch-posts', async (req, res) => {
       });
     }
     
-    // Now fetch posts with more details
-    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=50&_embed&status=publish`, {
+    // Now fetch posts with more details - try without status filter first
+    const response = await fetch(`${cleanSiteUrl}/wp-json/wp/v2/posts?per_page=50&_embed`, {
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json'
@@ -883,9 +883,14 @@ app.post('/api/wordpress/fetch-posts', async (req, res) => {
     
     console.log('Raw posts response:', JSON.stringify(posts, null, 2));
     console.log('Number of posts found:', posts.length);
+    console.log('Posts structure:', posts.length > 0 ? Object.keys(posts[0]) : 'No posts');
     
-    // Transform WordPress posts to our format
-    const transformedPosts = posts.map(post => {
+    // Filter to only published posts if we got any posts
+    const publishedPosts = posts.filter(post => post.status === 'publish');
+    console.log('Published posts found:', publishedPosts.length);
+    
+    // Transform WordPress posts to our format - use filtered posts
+    const transformedPosts = publishedPosts.map(post => {
       // Extract featured image URL if available
       let featuredImageUrl = '';
       if (post._embedded && post._embedded['wp:featuredmedia'] && post._embedded['wp:featuredmedia'][0]) {
