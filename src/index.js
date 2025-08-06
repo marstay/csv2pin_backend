@@ -784,6 +784,11 @@ async function handleSubscriptionDeleted(subscription) {
   }
 }
 
+// Test endpoint
+app.get('/api/test', (req, res) => {
+  res.json({ message: 'Backend is working' });
+});
+
 // WordPress API endpoints
 app.post('/api/wordpress/test-connection', async (req, res) => {
   const { siteUrl, username, appPassword } = req.body;
