@@ -213,6 +213,8 @@ app.post('/api/export-pin', async (req, res) => {
     await page.setViewport({ width: 1000, height: 1500 });
     // Use environment variable for frontend base URL, fallback to localhost for local dev
     const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
+    console.log('[export-pin] FRONTEND_BASE_URL from env:', process.env.FRONTEND_BASE_URL);
+    console.log('[export-pin] Final FRONTEND_BASE_URL:', FRONTEND_BASE_URL);
     
     // Construct the URL with template parameters
     const params = new URLSearchParams();
