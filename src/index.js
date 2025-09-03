@@ -246,7 +246,15 @@ app.post('/api/export-pin', async (req, res) => {
     });
     
     // Capture page errors
-    page.on('pageerror', error => console.log('[Puppeteer Page Error]', error.message));
+    page.on('pageerror', error => {
+      console.log('[Puppeteer Page Error]', error.message);
+      console.log('[Puppeteer Page Error Stack]', error.stack);
+    });
+    
+    // Capture network failures
+    page.on('requestfailed', request => {
+      console.log('[Puppeteer Request Failed]', request.url(), request.failure().errorText);
+    });
     
     // Wait a bit for the page to fully load using setTimeout
     await new Promise(resolve => setTimeout(resolve, 2000));
@@ -272,6 +280,22 @@ app.post('/api/export-pin', async (req, res) => {
     
     // Show first 500 chars of page content for debugging
     console.log('[export-pin] Page content preview:', pageContent.substring(0, 500));
+    
+    // Test if JavaScript is working at all
+    try {
+      const jsTest = await page.evaluate(() => {
+        return {
+          hasWindow: typeof window !== 'undefined',
+          hasDocument: typeof document !== 'undefined',
+          hasReact: typeof window !== 'undefined' && window.React,
+          hasReactDOM: typeof window !== 'undefined' && window.ReactDOM,
+          userAgent: navigator.userAgent
+        };
+      });
+      console.log('[export-pin] JavaScript execution test:', jsTest);
+    } catch (e) {
+      console.log('[export-pin] JavaScript execution failed:', e.message);
+    }
     
     const templateReceived = await page.evaluate(() => {
       if (window.exportDebug) {
