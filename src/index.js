@@ -309,10 +309,17 @@ app.post('/api/export-pin', async (req, res) => {
           hasReact: typeof window !== 'undefined' && window.React,
           hasReactDOM: typeof window !== 'undefined' && window.ReactDOM,
           hasExportDebug: typeof window !== 'undefined' && window.exportDebug,
-          rootElement: document.getElementById('root')?.innerHTML?.length || 0
+          rootElement: document.getElementById('root')?.innerHTML?.length || 0,
+          isExportPageWorking: typeof window !== 'undefined' && window.exportDebug && window.exportDebug.templateKey
         };
       });
       console.log('[export-pin] React loading test after wait:', reactTest);
+      
+      if (reactTest.isExportPageWorking) {
+        console.log('[export-pin] ✅ ExportPinPage is working correctly!');
+      } else {
+        console.log('[export-pin] ❌ ExportPinPage is not working properly');
+      }
     } catch (e) {
       console.log('[export-pin] React test failed:', e.message);
     }
