@@ -211,6 +211,17 @@ app.post('/api/export-pin', async (req, res) => {
     });
     const page = await browser.newPage();
     await page.setViewport({ width: 1000, height: 1500 });
+    
+    // Set up console log capture BEFORE navigating to the page
+    page.on('console', msg => {
+      const text = msg.text();
+      console.log('[Puppeteer Console]', text);
+      // Check for ExportPinPage loading
+      if (text.includes('ExportPinPage component is loading')) {
+        console.log('[export-pin] ✅ ExportPinPage component loaded successfully!');
+      }
+    });
+    
     // Use environment variable for frontend base URL, fallback to localhost for local dev
     const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
     console.log('[export-pin] FRONTEND_BASE_URL from env:', process.env.FRONTEND_BASE_URL);
@@ -234,16 +245,6 @@ app.post('/api/export-pin', async (req, res) => {
     
     // Wait a bit more for React to hydrate
     await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    // Capture console logs from the page
-    page.on('console', msg => {
-      const text = msg.text();
-      console.log('[Puppeteer Console]', text);
-      // Check for ExportPinPage loading
-      if (text.includes('ExportPinPage component is loading')) {
-        console.log('[export-pin] ✅ ExportPinPage component loaded successfully!');
-      }
-    });
     
     // Capture page errors
     page.on('pageerror', error => {
