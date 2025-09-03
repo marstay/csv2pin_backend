@@ -232,6 +232,9 @@ app.post('/api/export-pin', async (req, res) => {
     // Add timeout and better error handling
     await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
     
+    // Wait a bit more for React to hydrate
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
     // Capture console logs from the page
     page.on('console', msg => {
       const text = msg.text();
@@ -258,6 +261,17 @@ app.post('/api/export-pin', async (req, res) => {
     // Check for React app indicators instead of component names
     const hasReactApp = pageContent.includes('react') || pageContent.includes('React');
     console.log('[export-pin] Page appears to be React app:', hasReactApp);
+    
+    // Debug: Check what's actually on the page
+    const hasRootDiv = pageContent.includes('id="root"') || pageContent.includes('id=\'root\'');
+    const hasScriptTags = pageContent.includes('<script');
+    const hasCSV2Pin = pageContent.includes('CSV2Pin') || pageContent.includes('csv2pin');
+    console.log('[export-pin] Page has root div:', hasRootDiv);
+    console.log('[export-pin] Page has script tags:', hasScriptTags);
+    console.log('[export-pin] Page mentions CSV2Pin:', hasCSV2Pin);
+    
+    // Show first 500 chars of page content for debugging
+    console.log('[export-pin] Page content preview:', pageContent.substring(0, 500));
     
     const templateReceived = await page.evaluate(() => {
       if (window.exportDebug) {
