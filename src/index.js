@@ -123,12 +123,80 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
+// --- Custom Templates CRUD (Supabase) ---
+// Requires authenticated user (Bearer token)
+async function requireUser(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+  req.user = user;
+  next();
+}
+
+// List templates for current user
+app.get('/api/custom-templates', requireUser, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('custom_templates')
+      .select('id,name,template_json,updated_at,created_at')
+      .eq('user_id', req.user.id)
+      .order('updated_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    const templates = (data || []).map(row => ({ id: row.id, name: row.name, ...row.template_json }));
+    res.json({ templates });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create or update a template
+app.post('/api/custom-templates', requireUser, async (req, res) => {
+  try {
+    const tpl = req.body;
+    if (!tpl || !tpl.id || !tpl.elements) {
+      return res.status(400).json({ error: 'Invalid template payload' });
+    }
+    const row = {
+      id: tpl.id,
+      user_id: req.user.id,
+      name: tpl.name || 'Untitled Template',
+      template_json: tpl,
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await supabaseAdmin
+      .from('custom_templates')
+      .upsert(row, { onConflict: 'id' });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete a template
+app.delete('/api/custom-templates/:id', requireUser, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabaseAdmin
+      .from('custom_templates')
+      .delete()
+      .match({ id, user_id: req.user.id });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/export-pin (Puppeteer server-side rendering)
 app.post('/api/export-pin', async (req, res) => {
-  const { pinData, template } = req.body;
+  const { pinData, template, templateType, templateData } = req.body;
   console.log('[export-pin] Request received', { pinData: !!pinData, template });
   console.log('[export-pin] Template type:', typeof template);
   console.log('[export-pin] Template value:', template);
+  console.log('[export-pin] Template meta:', { templateType, hasTemplateData: !!templateData });
   if (!pinData || !template) {
     console.error('[export-pin] Missing pinData or template');
     return res.status(400).json({ error: 'pinData and template are required' });
@@ -146,8 +214,16 @@ app.post('/api/export-pin', async (req, res) => {
     // Use environment variable for frontend base URL, fallback to localhost for local dev
     const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
     
-    // Construct the URL with template parameter
-    const url = `${FRONTEND_BASE_URL}/export-pin?data=${encodeURIComponent(JSON.stringify(pinData))}&template=${encodeURIComponent(template)}`;
+    // Construct the URL with template parameters
+    const params = new URLSearchParams();
+    params.set('data', JSON.stringify(pinData));
+    params.set('template', template);
+    if (templateType) params.set('templateType', templateType);
+    if (templateType === 'custom' && templateData) {
+      // Pass full custom template JSON to the export page
+      params.set('templateData', JSON.stringify(templateData));
+    }
+    const url = `${FRONTEND_BASE_URL}/export-pin?${params.toString()}`;
     console.log('[export-pin] Navigating to', url);
     console.log('[export-pin] Encoded template:', encodeURIComponent(template));
     
