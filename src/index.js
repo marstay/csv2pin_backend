@@ -289,12 +289,32 @@ app.post('/api/export-pin', async (req, res) => {
           hasDocument: typeof document !== 'undefined',
           hasReact: typeof window !== 'undefined' && window.React,
           hasReactDOM: typeof window !== 'undefined' && window.ReactDOM,
-          userAgent: navigator.userAgent
+          userAgent: navigator.userAgent,
+          scriptCount: document.querySelectorAll('script').length,
+          scriptSources: Array.from(document.querySelectorAll('script')).map(s => s.src || 'inline').slice(0, 5)
         };
       });
       console.log('[export-pin] JavaScript execution test:', jsTest);
     } catch (e) {
       console.log('[export-pin] JavaScript execution failed:', e.message);
+    }
+    
+    // Check if React is loading by waiting longer and checking again
+    console.log('[export-pin] Waiting additional 5 seconds for React to load...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    
+    try {
+      const reactTest = await page.evaluate(() => {
+        return {
+          hasReact: typeof window !== 'undefined' && window.React,
+          hasReactDOM: typeof window !== 'undefined' && window.ReactDOM,
+          hasExportDebug: typeof window !== 'undefined' && window.exportDebug,
+          rootElement: document.getElementById('root')?.innerHTML?.length || 0
+        };
+      });
+      console.log('[export-pin] React loading test after wait:', reactTest);
+    } catch (e) {
+      console.log('[export-pin] React test failed:', e.message);
     }
     
     const templateReceived = await page.evaluate(() => {
