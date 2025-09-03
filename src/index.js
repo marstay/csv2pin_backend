@@ -233,7 +233,14 @@ app.post('/api/export-pin', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
     
     // Capture console logs from the page
-    page.on('console', msg => console.log('[Puppeteer Console]', msg.text()));
+    page.on('console', msg => {
+      const text = msg.text();
+      console.log('[Puppeteer Console]', text);
+      // Check for ExportPinPage loading
+      if (text.includes('ExportPinPage component is loading')) {
+        console.log('[export-pin] ✅ ExportPinPage component loaded successfully!');
+      }
+    });
     
     // Capture page errors
     page.on('pageerror', error => console.log('[Puppeteer Page Error]', error.message));
@@ -247,8 +254,10 @@ app.post('/api/export-pin', async (req, res) => {
     // Get the page content to see if it's loading correctly
     const pageContent = await page.content();
     console.log('[export-pin] Page content length:', pageContent.length);
-    console.log('[export-pin] Page content includes "ExportPinPage":', pageContent.includes('ExportPinPage'));
-    console.log('[export-pin] Page content includes "PinTemplate23":', pageContent.includes('PinTemplate23'));
+    
+    // Check for React app indicators instead of component names
+    const hasReactApp = pageContent.includes('react') || pageContent.includes('React');
+    console.log('[export-pin] Page appears to be React app:', hasReactApp);
     
     const templateReceived = await page.evaluate(() => {
       if (window.exportDebug) {
