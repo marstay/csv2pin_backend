@@ -603,6 +603,24 @@ app.post('/api/pinterest/oauth', async (req, res) => {
   try {
     const tokenData = await exchangePinterestCodeForToken(code, redirectUri);
     if (tokenData.access_token) {
+      // Enforce plan limits
+      const { data: profile } = await supabaseAdmin
+        .from('profiles')
+        .select('plan_type')
+        .eq('id', user.id)
+        .single();
+      const planType = (profile?.plan_type || 'free');
+      const { data: existing } = await supabaseAdmin
+        .from('pinterest_accounts')
+        .select('id')
+        .eq('user_id', user.id);
+      const count = Array.isArray(existing) ? existing.length : 0;
+      const planLimits = { free: 1, creator: 3, pro: Infinity, agency: Infinity };
+      const limit = planLimits[planType] ?? 1;
+      if (count >= limit) {
+        return res.status(403).json({ error: `Plan limit reached. Your plan (${planType}) allows ${limit === Infinity ? 'unlimited' : limit} account(s).` });
+      }
+
       // Fetch account info for labeling
       let accountName = '';
       try {
