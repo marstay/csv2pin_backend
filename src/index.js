@@ -602,16 +602,146 @@ app.post('/api/pinterest/oauth', async (req, res) => {
   try {
     const tokenData = await exchangePinterestCodeForToken(code, redirectUri);
     if (tokenData.access_token) {
-      await supabaseAdmin
-        .from('profiles')
-        .update({ pinterest_access_token: tokenData.access_token })
-        .eq('id', user.id);
-      return res.json({ access_token: tokenData.access_token });
+      // Fetch account info for labeling
+      let accountName = '';
+      try {
+        const accRes = await fetch('https://api.pinterest.com/v5/user_account', {
+          headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
+        });
+        const acc = await accRes.json();
+        accountName = acc?.username || acc?.profile?.username || 'Pinterest Account';
+      } catch (e) {
+        console.warn('Failed to fetch Pinterest account info:', e?.message || e);
+      }
+      // Save token to pinterest_accounts
+      const { error: insertError } = await supabaseAdmin
+        .from('pinterest_accounts')
+        .insert({ user_id: user.id, access_token: tokenData.access_token, account_name: accountName });
+      if (insertError) {
+        console.error('Error saving pinterest account:', insertError);
+      }
+      return res.json({ access_token: tokenData.access_token, account_name: accountName });
     } else {
       return res.status(400).json({ error: tokenData });
     }
   } catch (err) {
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// List Pinterest accounts for current user
+app.get('/api/pinterest/accounts', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data, error } = await supabaseAdmin
+    .from('pinterest_accounts')
+    .select('id, account_name, created_at')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ accounts: data || [] });
+});
+
+function extractAccountId(req) {
+  return req.query.account_id || req.body?.account_id || null;
+}
+
+async function getPinterestAccessTokenForUser(userId, accountId) {
+  if (!accountId) {
+    // Fallback to single-token in profiles for backwards compatibility
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('pinterest_access_token')
+      .eq('id', userId)
+      .single();
+    return profile?.pinterest_access_token || null;
+  }
+  const { data: account } = await supabaseAdmin
+    .from('pinterest_accounts')
+    .select('access_token')
+    .eq('id', accountId)
+    .eq('user_id', userId)
+    .single();
+  return account?.access_token || null;
+}
+
+app.get('/api/pinterest/boards', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const accountId = extractAccountId(req);
+  const accessToken = await getPinterestAccessTokenForUser(user.id, accountId);
+  if (!accessToken) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
+  }
+
+  // Fetch boards from Pinterest API
+  const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  const boards = await pinterestRes.json();
+  res.json({ boards: boards.items || boards.data || [] });
+});
+
+app.post('/api/pinterest/create-pin', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { image_url, title, description, board_id, link, account_id } = req.body;
+  if (!image_url || !title || !description || !board_id) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+  if (!accessToken) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user/account.' });
+  }
+
+  try {
+    const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        board_id,
+        title,
+        description,
+        media_source: {
+          source_type: 'image_url',
+          url: image_url,
+        },
+        link: link || undefined,
+      }),
+    });
+
+    const pinData = await pinterestRes.json();
+    if (pinterestRes.ok) {
+      return res.json(pinData);
+    } else {
+      return res.status(400).json({ error: pinData });
+    }
+  } catch (error) {
+    return res.status(400).json({ 
+      error: { 
+        code: 2, 
+        message: `Pinterest API error: ${error.message}`, 
+        status: 'failure' 
+      } 
+    });
   }
 });
 
@@ -688,20 +818,16 @@ app.get('/api/pinterest/boards', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  // Get the user's Pinterest access token from your DB
-  const { data: profile, error: profileError } = await supabaseAdmin
-    .from('profiles')
-    .select('pinterest_access_token')
-    .eq('id', user.id)
-    .single();
-  if (profileError || !profile?.pinterest_access_token) {
+  const accountId = extractAccountId(req);
+  const accessToken = await getPinterestAccessTokenForUser(user.id, accountId);
+  if (!accessToken) {
     return res.status(400).json({ error: 'No Pinterest access token found for user.' });
   }
 
   // Fetch boards from Pinterest API
   const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
     headers: {
-      'Authorization': `Bearer ${profile.pinterest_access_token}`,
+      'Authorization': `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
   });
@@ -716,38 +842,21 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { image_url, title, description, board_id, link } = req.body;
+  const { image_url, title, description, board_id, link, account_id } = req.body;
   if (!image_url || !title || !description || !board_id) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
 
-  // Get the user's Pinterest access token from your DB
-  const { data: profile, error: profileError } = await supabaseAdmin
-    .from('profiles')
-    .select('pinterest_access_token')
-    .eq('id', user.id)
-    .single();
-  
-  console.log('--- Pinterest Create Pin Debug ---');
-  console.log('User ID:', user.id);
-  console.log('Profile Error:', profileError);
-  console.log('Has Access Token:', !!profile?.pinterest_access_token);
-  console.log('Access Token Length:', profile?.pinterest_access_token?.length);
-  console.log('Board ID:', board_id);
-  console.log('Image URL:', image_url);
-  
-  if (profileError || !profile?.pinterest_access_token) {
-    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
+  const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+  if (!accessToken) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user/account.' });
   }
 
-  // Try standard Pinterest API
   try {
-    console.log(`Using Pinterest API: https://api.pinterest.com/v5/pins`);
-    
     const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${profile.pinterest_access_token}`,
+        'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -763,20 +872,17 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
     });
     
     const pinData = await pinterestRes.json();
-    console.log(`Pinterest API Response:`, pinterestRes.status, pinData);
-    
     if (pinterestRes.ok) {
       return res.json(pinData);
     } else {
       return res.status(400).json({ error: pinData });
     }
   } catch (error) {
-    console.log(`Error with Pinterest API:`, error.message);
     return res.status(400).json({ 
       error: { 
         code: 2, 
         message: `Pinterest API error: ${error.message}`, 
-        status: "failure" 
+        status: 'failure' 
       } 
     });
   }
