@@ -41,6 +41,35 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+function sanitizeDescription(input) {
+  if (!input) return '';
+  let desc = String(input);
+  // Remove raw URLs and domain-like tokens
+  desc = desc.replace(/https?:\/\/\S+/gi, '');
+  desc = desc.replace(/\b([a-z0-9-]+\.)+[a-z]{2,}\b/gi, '');
+  // Remove common CTA phrases about visiting/clicking for more info
+  const ctaPatterns = [
+    /visit\s+[^.\n]+/gi,
+    /click( the)? link( below| above| in bio)?/gi,
+    /learn more( at| here)?/gi,
+    /read more( at| here)?/gi,
+    /see more( at| here)?/gi,
+    /for more info(rmation)?/gi
+  ];
+  ctaPatterns.forEach((re) => { desc = desc.replace(re, ''); });
+  // Collapse multiple spaces
+  desc = desc.replace(/\s{2,}/g, ' ').trim();
+  // Ensure hashtags exist (>=3). If not, append some generic but safe hashtags
+  const hashtags = (desc.match(/#[A-Za-z0-9_]+/g) || []).length;
+  if (hashtags < 3) {
+    const toAdd = ['#tips', '#guide', '#inspiration'].slice(0, 3 - hashtags).join(' ');
+    desc = (desc + ' ' + toAdd).trim();
+  }
+  // Enforce 450 char limit
+  if (desc.length > 450) desc = desc.slice(0, 450);
+  return desc;
+}
+
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 
 // POST /api/generate-image
@@ -365,8 +394,8 @@ app.post('/api/generate-field', requirePro, async (req, res) => {
   const { content, type } = req.body; // type: 'title' or 'description'
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
   const prompt = type === 'title'
-    ? `Write a concise, curiosity-driven Pinterest pin title (max 100 characters) for this content. The title should make people want to click to learn more. It should include emotional triggers, urgency, or questions where possible. Avoid generic phrases and focus on being unique and compelling. Target people interested in food safety, kitchen tips, or expiration dates. Only return the title, nothing else. Do not include any quotes or special characters in your response:\n${content}`
-    : `Write an engaging Pinterest pin description (max 500 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Include a soft call to action, and add 4–6 relevant hashtags at the end targeting food safety, storage tips, AI food scanning, and kitchen hacks. Only return the description, nothing else:\n${content}`;
+    ? `Write a concise, curiosity-driven Pinterest pin title (max 100 characters) for this content. The title should make people want to click to learn more. It should include emotional triggers, urgency, or questions where possible. Avoid generic phrases and focus on being unique and compelling. Only return the title, nothing else. Do not include any quotes or special characters in your response:\n${content}`
+    : `Write an engaging Pinterest pin description (max 450 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Avoid phrases like "+visit site+", "+click the link+", or adding URLs. Include 4–6 relevant hashtags at the end. Only return the description, nothing else:\n${content}`;
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-3.5-turbo',
@@ -379,7 +408,7 @@ app.post('/api/generate-field', requirePro, async (req, res) => {
       // Remove quotes and special characters except basic punctuation
       result = result.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>\/?]+/g, '').slice(0, 100);
     }
-    if (type === 'description') result = result.slice(0, 500);
+    if (type === 'description') result = sanitizeDescription(result);
     res.json({ result });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -392,7 +421,7 @@ app.post('/api/analyze-image', requirePro, async (req, res) => {
     const { imageUrl, urlHint } = req.body;
     if (!imageUrl) return res.status(400).json({ error: 'Missing imageUrl' });
 
-    const systemPrompt = `You are helping generate Pinterest pin metadata. First, read any visible text in the image (OCR). Then propose a compelling title (<=100 chars) and an engaging description (<=500 chars) suitable for Pinterest, optionally incorporating the provided destination URL context if relevant. Return JSON with keys: extractedText, title, description. Do not include markdown, code fences, or commentary.`;
+    const systemPrompt = `You are helping generate Pinterest pin metadata. First, read any visible text in the image (OCR). Then propose a compelling title (<=100 chars) and an engaging description (<=450 chars) suitable for Pinterest. The description must include 4–6 relevant hashtags at the end. Do not include URLs or phrases like \"visit example.com\", \"click the link\", or similar calls to visit a site. If a destination URL context is provided, use it only to infer keywords, but never include the URL or a CTA. Return JSON with keys: extractedText, title, description. Do not include markdown, code fences, or commentary.`;
 
     const userPrompt = `Image URL: ${imageUrl}\n${urlHint ? `Destination URL (context): ${urlHint}` : ''}`;
 
@@ -409,7 +438,7 @@ app.post('/api/analyze-image', requirePro, async (req, res) => {
         }
       ],
       temperature: 0.4,
-      max_tokens: 500
+      max_tokens: 600
     });
 
     const raw = response.choices?.[0]?.message?.content?.trim() || '';
@@ -420,13 +449,13 @@ app.post('/api/analyze-image', requirePro, async (req, res) => {
       const maybe = JSON.parse(raw);
       extracted.extractedText = String(maybe.extractedText || '').slice(0, 2000);
       extracted.title = String(maybe.title || '').slice(0, 100);
-      extracted.description = String(maybe.description || '').slice(0, 500);
+      extracted.description = sanitizeDescription(String(maybe.description || ''));
     } catch (_) {
       // Fallback heuristic: split lines
       const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
       extracted.extractedText = lines.join(' ').slice(0, 2000);
-      extracted.title = lines[0]?.slice(0, 100) || '';
-      extracted.description = lines.slice(1).join(' ').slice(0, 500) || '';
+      extracted.title = (lines[0] || '').slice(0, 100);
+      extracted.description = sanitizeDescription(lines.slice(1).join(' '));
     }
 
     // Final cleanup for title
