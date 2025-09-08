@@ -754,35 +754,24 @@ app.get('/api/pinterest/status', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  // Get the user's Pinterest access token from your DB
-  const { data: profile, error: profileError } = await supabaseAdmin
-    .from('profiles')
-    .select('pinterest_access_token')
-    .eq('id', user.id)
-    .single();
-
-  const hasToken = !!profile?.pinterest_access_token;
-  const tokenLength = profile?.pinterest_access_token?.length || 0;
-
-  // Test the token with Pinterest API
+  // Load accounts
+  const { data: accounts, error: accError } = await supabaseAdmin
+    .from('pinterest_accounts')
+    .select('id, account_name, access_token');
+  const hasToken = Array.isArray(accounts) && accounts.some(a => !!a.access_token);
   let tokenValid = false;
   let pinterestError = null;
 
   if (hasToken) {
     try {
+      const anyToken = accounts.find(a => a.access_token)?.access_token;
       const testRes = await fetch('https://api.pinterest.com/v5/user_account', {
         headers: {
-          'Authorization': `Bearer ${profile.pinterest_access_token}`,
+          'Authorization': `Bearer ${anyToken}`,
           'Content-Type': 'application/json',
         },
       });
-      
-      if (testRes.ok) {
-        tokenValid = true;
-      } else {
-        const errorData = await testRes.json();
-        pinterestError = errorData;
-      }
+      if (testRes.ok) tokenValid = true; else pinterestError = await testRes.json();
     } catch (error) {
       pinterestError = { message: error.message };
     }
@@ -790,11 +779,11 @@ app.get('/api/pinterest/status', async (req, res) => {
 
   res.json({
     user_id: user.id,
-    has_token: hasToken,
-    token_length: tokenLength,
+    has_accounts: hasToken,
+    accounts_count: Array.isArray(accounts) ? accounts.length : 0,
     token_valid: tokenValid,
     pinterest_error: pinterestError,
-    profile_error: profileError
+    profile_error: accError
   });
 });
 
