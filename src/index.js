@@ -377,12 +377,65 @@ app.post('/api/generate-field', requirePro, async (req, res) => {
     let result = completion.choices[0].message.content.trim();
     if (type === 'title') {
       // Remove quotes and special characters except basic punctuation
-      result = result.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>/?]+/g, '').slice(0, 100);
+      result = result.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>\/?]+/g, '').slice(0, 100);
     }
     if (type === 'description') result = result.slice(0, 500);
     res.json({ result });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// New: Analyze image with OpenAI Vision to extract text and generate metadata (Pro only)
+app.post('/api/analyze-image', requirePro, async (req, res) => {
+  try {
+    const { imageUrl, urlHint } = req.body;
+    if (!imageUrl) return res.status(400).json({ error: 'Missing imageUrl' });
+
+    const systemPrompt = `You are helping generate Pinterest pin metadata. First, read any visible text in the image (OCR). Then propose a compelling title (<=100 chars) and an engaging description (<=500 chars) suitable for Pinterest, optionally incorporating the provided destination URL context if relevant. Return JSON with keys: extractedText, title, description. Do not include markdown, code fences, or commentary.`;
+
+    const userPrompt = `Image URL: ${imageUrl}\n${urlHint ? `Destination URL (context): ${urlHint}` : ''}`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: userPrompt },
+            { type: 'image_url', image_url: { url: imageUrl } }
+          ]
+        }
+      ],
+      temperature: 0.4,
+      max_tokens: 500
+    });
+
+    const raw = response.choices?.[0]?.message?.content?.trim() || '';
+
+    // Attempt to parse JSON; if model returned plain text, wrap it
+    let extracted = { extractedText: '', title: '', description: '' };
+    try {
+      const maybe = JSON.parse(raw);
+      extracted.extractedText = String(maybe.extractedText || '').slice(0, 2000);
+      extracted.title = String(maybe.title || '').slice(0, 100);
+      extracted.description = String(maybe.description || '').slice(0, 500);
+    } catch (_) {
+      // Fallback heuristic: split lines
+      const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+      extracted.extractedText = lines.join(' ').slice(0, 2000);
+      extracted.title = lines[0]?.slice(0, 100) || '';
+      extracted.description = lines.slice(1).join(' ').slice(0, 500) || '';
+    }
+
+    // Final cleanup for title
+    extracted.title = extracted.title.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>\/?]+/g, '').slice(0, 100);
+
+    return res.json(extracted);
+  } catch (err) {
+    console.error('analyze-image error:', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
