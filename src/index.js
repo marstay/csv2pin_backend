@@ -672,10 +672,10 @@ async function getPinterestAccessTokenForUser(userId, accountId) {
   if (!accountId) {
     // Fallback to single-token in profiles for backwards compatibility
     const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('pinterest_access_token')
+    .from('profiles')
+    .select('pinterest_access_token')
       .eq('id', userId)
-      .single();
+    .single();
     return profile?.pinterest_access_token || null;
   }
   const { data: account } = await supabaseAdmin
