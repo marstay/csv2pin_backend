@@ -580,8 +580,9 @@ app.get('/api/pinterest/callback', async (req, res) => {
   console.log('Received code:', code);
   console.log('Received state:', state);
   if (!code) return res.status(400).send('Missing code');
-  // Redirect to frontend with code for user association
-  res.redirect(`https://csv2pin.com/pinterest/finish?code=${code}`);
+  // Redirect to frontend with code for user association (use env FRONTEND_URL)
+  const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+  res.redirect(`${FRONTEND_URL.replace(/\/$/, '')}/pinterest/finish?code=${code}`);
 });
 
 app.post('/api/pinterest/oauth', async (req, res) => {
