@@ -880,19 +880,19 @@ app.post('/api/create-checkout-session', async (req, res) => {
     'creator': {
       name: 'Creator Plan',
       price: 1200, // $12.00 in cents
-      credits: 500,
+      credits: 1000,
       planType: 'creator'
     },
     'pro': {
       name: 'Pro Plan',
       price: 2500, // $25.00 in cents
-      credits: 1500,
+      credits: 3000,
       planType: 'pro'
     },
     'agency': {
       name: 'Agency Plan',
       price: 5600, // $56.00 in cents
-      credits: 5000,
+      credits: 7500,
       planType: 'agency'
     }
   };
