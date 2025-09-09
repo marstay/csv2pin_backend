@@ -376,6 +376,18 @@ app.post('/api/export-pin', async (req, res) => {
     });
     console.log('[export-pin] Template component info:', templateComponent);
     
+    // Ensure all images are fully loaded before screenshot (important for multi-image templates)
+    try {
+      await page.waitForFunction(() => {
+        const imgs = Array.from(document.images || []);
+        if (imgs.length === 0) return true;
+        return imgs.every((img) => img.complete && img.naturalWidth > 0);
+      }, { timeout: 10000 });
+      console.log('[export-pin] All images reported loaded.');
+    } catch (e) {
+      console.log('[export-pin] Proceeding without full image load confirmation:', e.message);
+    }
+
     console.log('[export-pin] Taking screenshot...');
     const buffer = await page.screenshot({ type: 'png', fullPage: true });
     await browser.close();
