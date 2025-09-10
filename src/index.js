@@ -966,7 +966,7 @@ app.post('/api/create-credits-session', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { creditsPack } = req.body; // '250' | '500' | '1000' | '3000'
+  const { creditsPack, couponCode } = req.body; // '250' | '500' | '1000' | '3000', optional coupon
   const packs = {
     '250': { name: 'Top-up 250 credits', amount: 600, credits: 250 },   // $6.00
     '500': { name: 'Top-up 500 credits', amount: 1000, credits: 500 },  // $10.00
@@ -998,6 +998,7 @@ app.post('/api/create-credits-session', async (req, res) => {
         type: 'topup',
         credits: String(pack.credits),
       },
+      discounts: couponCode ? [{ coupon: couponCode }] : undefined,
       ui_mode: 'hosted',
     });
 
