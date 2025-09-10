@@ -891,7 +891,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
   const plans = {
     'creator': {
       name: 'Creator Plan',
-      price: 1200, // $12.00 in cents
+      price: 1500, // $15.00 in cents
       credits: 1000,
       planType: 'creator'
     },
@@ -954,6 +954,61 @@ app.post('/api/create-checkout-session', async (req, res) => {
 });
 
 
+// One-time credits top-up checkout session endpoint
+app.post('/api/create-credits-session', async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe not configured' });
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { creditsPack } = req.body; // '250' | '500' | '1000' | '3000'
+  const packs = {
+    '250': { name: 'Top-up 250 credits', amount: 600, credits: 250 },   // $6.00
+    '500': { name: 'Top-up 500 credits', amount: 1000, credits: 500 },  // $10.00
+    '1000': { name: 'Top-up 1000 credits', amount: 1800, credits: 1000 }, // $18.00
+    '3000': { name: 'Top-up 3000 credits', amount: 3600, credits: 3000 }, // $36.00
+  };
+  const pack = packs[String(creditsPack)];
+  if (!pack) return res.status(400).json({ error: 'Invalid credits pack' });
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: pack.name },
+            unit_amount: pack.amount,
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/pricing`,
+      client_reference_id: user.id,
+      metadata: {
+        userId: user.id,
+        type: 'topup',
+        credits: String(pack.credits),
+      },
+      ui_mode: 'hosted',
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Error creating credits checkout session:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+
 
 // Stripe webhook endpoint
 app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -978,6 +1033,28 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
     case 'checkout.session.completed':
       const session = event.data.object;
       await handleCheckoutSessionCompleted(session);
+      // Handle one-time credits top-up
+      if (session?.metadata?.type === 'topup' && session?.metadata?.userId && session?.metadata?.credits) {
+        const userId = session.metadata.userId;
+        const addCredits = parseInt(session.metadata.credits, 10) || 0;
+        if (addCredits > 0) {
+          try {
+            const { data: profile } = await supabaseAdmin
+              .from('profiles')
+              .select('credits_remaining')
+              .eq('id', userId)
+              .single();
+            const current = profile?.credits_remaining || 0;
+            const newCredits = current + addCredits;
+            await supabaseAdmin
+              .from('profiles')
+              .update({ credits_remaining: newCredits })
+              .eq('id', userId);
+          } catch (e) {
+            console.error('Error applying top-up credits:', e);
+          }
+        }
+      }
       break;
     case 'invoice.payment_succeeded':
       const invoice = event.data.object;
