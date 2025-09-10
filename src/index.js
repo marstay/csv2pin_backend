@@ -998,14 +998,25 @@ app.post('/api/create-credits-session', async (req, res) => {
         type: 'topup',
         credits: String(pack.credits),
       },
-      discounts: couponCode ? [{ coupon: couponCode }] : undefined,
-      ui_mode: 'hosted',
+      discounts: (couponCode && couponCode.trim()) ? [{ coupon: couponCode.trim() }] : undefined,
     });
 
     res.json({ url: session.url });
   } catch (error) {
     console.error('Error creating credits checkout session:', error);
-    res.status(500).json({ error: 'Failed to create checkout session' });
+    console.error('Error details:', {
+      message: error.message,
+      type: error.type,
+      code: error.code,
+      param: error.param,
+      creditsPack,
+      couponCode,
+      userId: user.id
+    });
+    res.status(500).json({ 
+      error: 'Failed to create checkout session',
+      details: error.message 
+    });
   }
 });
 
