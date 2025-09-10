@@ -976,6 +976,21 @@ app.post('/api/create-credits-session', async (req, res) => {
   const pack = packs[String(creditsPack)];
   if (!pack) return res.status(400).json({ error: 'Invalid credits pack' });
 
+  // Validate coupon code if provided
+  let validatedCoupon = null;
+  if (couponCode && couponCode.trim()) {
+    try {
+      const coupon = await stripe.coupons.retrieve(couponCode.trim());
+      if (!coupon.valid) {
+        return res.status(400).json({ error: 'Coupon code is not valid or has expired' });
+      }
+      validatedCoupon = couponCode.trim();
+    } catch (couponError) {
+      console.error('Coupon validation error:', couponError);
+      return res.status(400).json({ error: 'Invalid coupon code' });
+    }
+  }
+
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -998,7 +1013,7 @@ app.post('/api/create-credits-session', async (req, res) => {
         type: 'topup',
         credits: String(pack.credits),
       },
-      discounts: (couponCode && couponCode.trim()) ? [{ coupon: couponCode.trim() }] : undefined,
+      discounts: validatedCoupon ? [{ coupon: validatedCoupon }] : undefined,
     });
 
     res.json({ url: session.url });
