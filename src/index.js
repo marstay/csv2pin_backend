@@ -401,8 +401,8 @@ app.post('/api/export-pin', async (req, res) => {
   }
 });
 
-// POST /api/generate-field (Pro only)
-app.post('/api/generate-field', requirePro, async (req, res) => {
+// POST /api/generate-field (requires login; credits handled on frontend)
+app.post('/api/generate-field', requireUser, async (req, res) => {
   const { content, type } = req.body; // type: 'title' or 'description'
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
   const prompt = type === 'title'
@@ -427,8 +427,8 @@ app.post('/api/generate-field', requirePro, async (req, res) => {
   }
 });
 
-// New: Analyze image with OpenAI Vision to extract text and generate metadata (Pro only)
-app.post('/api/analyze-image', requirePro, async (req, res) => {
+// Analyze image with OpenAI Vision to extract text and generate metadata (requires login)
+app.post('/api/analyze-image', requireUser, async (req, res) => {
   try {
     const { imageUrl, urlHint } = req.body;
     if (!imageUrl) return res.status(400).json({ error: 'Missing imageUrl' });
