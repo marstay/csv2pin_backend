@@ -885,7 +885,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { planType } = req.body;
+  const { planType, couponCode } = req.body;
   
   // Define plan configurations
   const plans = {
@@ -912,6 +912,21 @@ app.post('/api/create-checkout-session', async (req, res) => {
   const plan = plans[planType];
   if (!plan) {
     return res.status(400).json({ error: 'Invalid plan type' });
+  }
+
+  // Validate coupon code if provided
+  let validatedCoupon = null;
+  if (couponCode && couponCode.trim()) {
+    try {
+      const coupon = await stripe.coupons.retrieve(couponCode.trim());
+      if (!coupon.valid) {
+        return res.status(400).json({ error: 'Coupon code is not valid or has expired' });
+      }
+      validatedCoupon = couponCode.trim();
+    } catch (couponError) {
+      console.error('Coupon validation error:', couponError);
+      return res.status(400).json({ error: 'Invalid coupon code' });
+    }
   }
 
   try {
@@ -941,7 +956,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
         userId: user.id,
         planType: plan.planType,
         credits: plan.credits.toString()
-      }
+      },
+      discounts: validatedCoupon ? [{ coupon: validatedCoupon }] : undefined
     });
 
 
