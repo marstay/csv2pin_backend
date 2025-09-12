@@ -723,6 +723,56 @@ app.get('/api/pinterest/boards', async (req, res) => {
   res.json({ boards: boards.items || boards.data || [] });
 });
 
+// Create a Pinterest board (name required; optional description, privacy PUBLIC/SECRET)
+app.post('/api/pinterest/create-board', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { name, description, privacy, account_id } = req.body || {};
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Board name is required' });
+  }
+
+  const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+  if (!accessToken) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user/account.' });
+  }
+
+  // Normalize privacy to Pinterest expected values: PUBLIC | SECRET
+  let privacyValue = undefined;
+  if (privacy) {
+    const p = String(privacy).toUpperCase();
+    if (p === 'PUBLIC' || p === 'SECRET') privacyValue = p; else privacyValue = undefined;
+  }
+
+  try {
+    const body = {
+      name: name.trim(),
+      description: description ? String(description).slice(0, 250) : undefined,
+      privacy: privacyValue,
+    };
+    const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    const resp = await pinterestRes.json().catch(() => ({}));
+    if (!pinterestRes.ok) {
+      return res.status(pinterestRes.status).json({ error: resp || { message: 'Pinterest API error' } });
+    }
+    return res.json(resp);
+  } catch (e) {
+    return res.status(500).json({ error: e.message || 'Failed to create board' });
+  }
+});
+
 app.post('/api/pinterest/create-pin', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
