@@ -1350,26 +1350,49 @@ app.delete('/api/pinterest/scheduled-pins/:id', async (req, res) => {
         return res.status(500).json({ error: 'Failed to cancel scheduled pin' });
       }
 
+      // Also update the corresponding user_images record
+      await supabaseAdmin
+        .from('user_images')
+        .update({ 
+          is_scheduled: false,
+          scheduled_for: null
+        })
+        .eq('user_id', user.id)
+        .eq('image_url', existingPin.image_url);
+
       return res.json({
         success: true,
         message: 'Scheduled pin cancelled successfully'
       });
     } else {
-      // Delete the pin
-      const { error: deleteError } = await supabaseAdmin
+      // Mark the pin as cancelled instead of deleting
+      const { error: updateError } = await supabaseAdmin
         .from('scheduled_pins')
-        .delete()
+        .update({ 
+          status: 'cancelled',
+          updated_at: new Date().toISOString()
+        })
         .eq('id', id)
         .eq('user_id', user.id);
 
-      if (deleteError) {
-        console.error('Error deleting scheduled pin:', deleteError);
-        return res.status(500).json({ error: 'Failed to delete scheduled pin' });
+      if (updateError) {
+        console.error('Error cancelling scheduled pin:', updateError);
+        return res.status(500).json({ error: 'Failed to cancel scheduled pin' });
       }
+
+      // Also update the corresponding user_images record to remove scheduled status
+      await supabaseAdmin
+        .from('user_images')
+        .update({ 
+          is_scheduled: false,
+          scheduled_for: null
+        })
+        .eq('user_id', user.id)
+        .eq('image_url', existingPin.image_url);
 
       return res.json({
         success: true,
-        message: 'Scheduled pin deleted successfully'
+        message: 'Scheduled pin cancelled successfully'
       });
     }
 
@@ -1967,6 +1990,62 @@ app.post('/api/wordpress/fetch-posts', async (req, res) => {
   } catch (error) {
     console.error('WordPress fetch posts error:', error);
     res.status(500).json({ error: 'Failed to fetch posts' });
+  }
+});
+
+// Permanently delete a cancelled or posted pin (for cleanup)
+app.delete('/api/pinterest/scheduled-pins/:id/permanent', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+
+  try {
+    // Check if pin exists and belongs to user
+    const { data: existingPin, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
+
+    if (fetchError || !existingPin) {
+      return res.status(404).json({ error: 'Scheduled pin not found' });
+    }
+
+    // Only allow permanent deletion of cancelled or posted pins
+    if (!['cancelled', 'posted'].includes(existingPin.status)) {
+      return res.status(400).json({ error: 'Can only permanently delete cancelled or posted pins' });
+    }
+
+    // Permanently delete the pin
+    const { error: deleteError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user.id);
+
+    if (deleteError) {
+      console.error('Error permanently deleting scheduled pin:', deleteError);
+      return res.status(500).json({ error: 'Failed to permanently delete scheduled pin' });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Scheduled pin permanently deleted'
+    });
+
+  } catch (error) {
+    console.error('Error permanently deleting scheduled pin:', error);
+    return res.status(500).json({ 
+      error: { 
+        message: `Failed to permanently delete scheduled pin: ${error.message}`, 
+        status: 'failure' 
+      } 
+    });
   }
 });
 
