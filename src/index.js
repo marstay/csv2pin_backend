@@ -41,6 +41,228 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+// Background job processor for scheduled pins
+async function processScheduledPins() {
+  console.log('🔄 Processing scheduled pins...');
+  
+  try {
+    // Get pins that are due to be posted
+    const { data: pinsToPost, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select(`
+        *,
+        pinterest_accounts(access_token)
+      `)
+      .in('status', ['scheduled', 'failed'])
+      .lte('scheduled_for', new Date().toISOString())
+      .or('next_retry_at.is.null,next_retry_at.lte.' + new Date().toISOString())
+      .order('scheduled_for', { ascending: true })
+      .limit(10); // Process 10 pins at a time
+
+    if (fetchError) {
+      console.error('❌ Error fetching scheduled pins:', fetchError);
+      return;
+    }
+
+    if (!pinsToPost || pinsToPost.length === 0) {
+      console.log('✅ No scheduled pins to process');
+      return;
+    }
+
+    console.log(`📌 Found ${pinsToPost.length} pins to process`);
+
+    for (const pin of pinsToPost) {
+      await processScheduledPin(pin);
+    }
+
+  } catch (error) {
+    console.error('❌ Error in processScheduledPins:', error);
+  }
+}
+
+async function processScheduledPin(pin) {
+  console.log(`🚀 Processing pin: ${pin.title.substring(0, 50)}...`);
+  
+  try {
+    // Mark as posting to prevent duplicate processing
+    const { error: updateError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .update({ 
+        status: 'posting',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', pin.id);
+
+    if (updateError) {
+      console.error('❌ Error updating pin status to posting:', updateError);
+      return;
+    }
+
+    // Get access token
+    const accessToken = pin.pinterest_accounts?.access_token;
+    if (!accessToken) {
+      await handlePinError(pin.id, 'No Pinterest access token found');
+      return;
+    }
+
+    // Create Pinterest pin using existing logic
+    const requestBody = {
+      board_id: pin.board_id,
+      title: pin.title,
+      description: pin.description,
+      media_source: {
+        source_type: 'image_url',
+        url: pin.image_url,
+      },
+      link: pin.link || undefined,
+    };
+    
+    console.log(`📤 Posting to Pinterest API for pin: ${pin.id}`);
+    
+    const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    const pinData = await pinterestRes.json();
+    
+    if (pinterestRes.ok) {
+      // Success - update pin as posted
+      await supabaseAdmin
+        .from('scheduled_pins')
+        .update({ 
+          status: 'posted',
+          posted_at: new Date().toISOString(),
+          pinterest_pin_id: pinData.id,
+          error_message: null,
+          retry_count: 0,
+          next_retry_at: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', pin.id);
+
+      // Deduct credits if not already done
+      if (!pin.credits_deducted) {
+        await deductUserCredits(pin.user_id, 1);
+        await supabaseAdmin
+          .from('scheduled_pins')
+          .update({ credits_deducted: true })
+          .eq('id', pin.id);
+      }
+
+      console.log(`✅ Successfully posted pin: ${pin.id} -> Pinterest ID: ${pinData.id}`);
+      
+    } else {
+      // Handle Pinterest API error
+      const errorMessage = pinData.message || pinData.error || 'Pinterest API error';
+      console.error(`❌ Pinterest API error for pin ${pin.id}:`, errorMessage);
+      
+      await handlePinError(pin.id, errorMessage, pin.retry_count || 0);
+    }
+
+  } catch (error) {
+    console.error(`❌ Error processing pin ${pin.id}:`, error);
+    await handlePinError(pin.id, error.message, pin.retry_count || 0);
+  }
+}
+
+async function handlePinError(pinId, errorMessage, currentRetryCount = 0) {
+  const maxRetries = 3;
+  const nextRetryCount = currentRetryCount + 1;
+  
+  if (nextRetryCount <= maxRetries) {
+    // Calculate exponential backoff: 5min, 15min, 45min
+    const backoffMinutes = 5 * Math.pow(3, currentRetryCount);
+    const nextRetryAt = new Date();
+    nextRetryAt.setMinutes(nextRetryAt.getMinutes() + backoffMinutes);
+    
+    await supabaseAdmin
+      .from('scheduled_pins')
+      .update({ 
+        status: 'failed',
+        error_message: errorMessage,
+        retry_count: nextRetryCount,
+        next_retry_at: nextRetryAt.toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', pinId);
+      
+    console.log(`🔄 Pin ${pinId} will retry in ${backoffMinutes} minutes (attempt ${nextRetryCount}/${maxRetries})`);
+  } else {
+    // Max retries reached
+    await supabaseAdmin
+      .from('scheduled_pins')
+      .update({ 
+        status: 'failed',
+        error_message: `Max retries reached: ${errorMessage}`,
+        next_retry_at: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', pinId);
+      
+    console.log(`❌ Pin ${pinId} failed permanently after ${maxRetries} retries`);
+  }
+}
+
+async function deductUserCredits(userId, amount) {
+  try {
+    const { data: profile, error: fetchError } = await supabaseAdmin
+      .from('profiles')
+      .select('credits_remaining')
+      .eq('id', userId)
+      .single();
+
+    if (fetchError || !profile) {
+      console.error('Error fetching user profile for credit deduction:', fetchError);
+      return;
+    }
+
+    const newCredits = Math.max(0, (profile.credits_remaining || 0) - amount);
+    
+    const { error: updateError } = await supabaseAdmin
+      .from('profiles')
+      .update({ credits_remaining: newCredits })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('Error updating user credits:', updateError);
+    } else {
+      console.log(`💳 Deducted ${amount} credits from user ${userId}, remaining: ${newCredits}`);
+    }
+  } catch (error) {
+    console.error('Error in deductUserCredits:', error);
+  }
+}
+
+// Start background job processor
+let schedulerInterval;
+
+function startScheduler() {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+  }
+  
+  // Process scheduled pins every 5 minutes
+  schedulerInterval = setInterval(processScheduledPins, 5 * 60 * 1000);
+  
+  // Process immediately on startup
+  setTimeout(processScheduledPins, 5000); // Wait 5 seconds after startup
+  
+  console.log('📅 Scheduled pin processor started (runs every 5 minutes)');
+}
+
+function stopScheduler() {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+    schedulerInterval = null;
+    console.log('📅 Scheduled pin processor stopped');
+  }
+}
+
 function sanitizeDescription(input) {
   if (!input) return '';
   let desc = String(input);
@@ -843,6 +1065,313 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
   }
 });
 
+// Schedule a pin for later posting
+app.post('/api/pinterest/schedule-pin', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { 
+    image_url, title, description, board_id, link, account_id,
+    scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern 
+  } = req.body;
+
+  // Validate required fields
+  if (!image_url || !title || !description || !board_id || !scheduled_for) {
+    return res.status(400).json({ error: 'Missing required fields: image_url, title, description, board_id, scheduled_for' });
+  }
+
+  // Validate scheduling time
+  const scheduleDate = new Date(scheduled_for);
+  const now = new Date();
+  if (scheduleDate <= now) {
+    return res.status(400).json({ error: 'Scheduled time must be in the future' });
+  }
+
+  // Validate not too far in future (1 year max)
+  const oneYearFromNow = new Date();
+  oneYearFromNow.setFullYear(oneYearFromNow.getFullYear() + 1);
+  if (scheduleDate > oneYearFromNow) {
+    return res.status(400).json({ error: 'Cannot schedule more than 1 year in advance' });
+  }
+
+  // Validate Pinterest account access
+  const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+  if (!accessToken) {
+    return res.status(400).json({ error: 'No Pinterest access token found for user/account.' });
+  }
+
+  // Validate recurrence pattern if provided
+  if (is_recurring && recurrence_pattern) {
+    const pattern = typeof recurrence_pattern === 'string' 
+      ? JSON.parse(recurrence_pattern) 
+      : recurrence_pattern;
+    
+    if (!['daily', 'weekly', 'monthly'].includes(pattern.type)) {
+      return res.status(400).json({ error: 'Invalid recurrence type. Must be daily, weekly, or monthly.' });
+    }
+    
+    if (!pattern.interval || pattern.interval < 1 || pattern.interval > 30) {
+      return res.status(400).json({ error: 'Invalid recurrence interval. Must be between 1 and 30.' });
+    }
+  }
+
+  try {
+    // Store original pin data for reference
+    const originalPinData = {
+      image_url, title, description, board_id, link, account_id,
+      user_id: user.id, created_at: new Date().toISOString()
+    };
+
+    // Insert scheduled pin
+    const { data: scheduledPin, error: insertError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .insert({
+        user_id: user.id,
+        pinterest_account_id: account_id,
+        title,
+        description,
+        image_url,
+        board_id,
+        link: link || '',
+        scheduled_for: scheduleDate.toISOString(),
+        timezone,
+        is_recurring,
+        recurrence_pattern: is_recurring ? recurrence_pattern : null,
+        original_pin_data: originalPinData
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Error inserting scheduled pin:', insertError);
+      return res.status(500).json({ error: 'Failed to schedule pin' });
+    }
+
+    return res.json({
+      success: true,
+      scheduled_pin: scheduledPin,
+      message: `Pin scheduled for ${scheduleDate.toLocaleString()}`
+    });
+
+  } catch (error) {
+    console.error('Error scheduling pin:', error);
+    return res.status(500).json({ 
+      error: { 
+        message: `Failed to schedule pin: ${error.message}`, 
+        status: 'failure' 
+      } 
+    });
+  }
+});
+
+// Get user's scheduled pins
+app.get('/api/pinterest/scheduled-pins', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { status, limit = 50, offset = 0 } = req.query;
+
+  try {
+    let query = supabaseAdmin
+      .from('scheduled_pins')
+      .select(`
+        *,
+        pinterest_accounts(account_name)
+      `)
+      .eq('user_id', user.id)
+      .order('scheduled_for', { ascending: true });
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data: scheduledPins, error: fetchError } = await query
+      .range(parseInt(offset), parseInt(offset) + parseInt(limit) - 1);
+
+    if (fetchError) {
+      console.error('Error fetching scheduled pins:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch scheduled pins' });
+    }
+
+    return res.json({
+      scheduled_pins: scheduledPins,
+      total: scheduledPins.length
+    });
+
+  } catch (error) {
+    console.error('Error fetching scheduled pins:', error);
+    return res.status(500).json({ 
+      error: { 
+        message: `Failed to fetch scheduled pins: ${error.message}`, 
+        status: 'failure' 
+      } 
+    });
+  }
+});
+
+// Update a scheduled pin
+app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+  const { 
+    title, description, scheduled_for, timezone, status,
+    is_recurring, recurrence_pattern 
+  } = req.body;
+
+  try {
+    // First check if pin exists and belongs to user
+    const { data: existingPin, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
+
+    if (fetchError || !existingPin) {
+      return res.status(404).json({ error: 'Scheduled pin not found' });
+    }
+
+    // Don't allow updates to posted pins
+    if (existingPin.status === 'posted') {
+      return res.status(400).json({ error: 'Cannot update a pin that has already been posted' });
+    }
+
+    // Validate new schedule time if provided
+    if (scheduled_for) {
+      const scheduleDate = new Date(scheduled_for);
+      const now = new Date();
+      if (scheduleDate <= now) {
+        return res.status(400).json({ error: 'Scheduled time must be in the future' });
+      }
+    }
+
+    // Build update object
+    const updates = {};
+    if (title) updates.title = title;
+    if (description) updates.description = description;
+    if (scheduled_for) updates.scheduled_for = new Date(scheduled_for).toISOString();
+    if (timezone) updates.timezone = timezone;
+    if (status) updates.status = status;
+    if (typeof is_recurring === 'boolean') updates.is_recurring = is_recurring;
+    if (recurrence_pattern) updates.recurrence_pattern = recurrence_pattern;
+
+    const { data: updatedPin, error: updateError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .update(updates)
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Error updating scheduled pin:', updateError);
+      return res.status(500).json({ error: 'Failed to update scheduled pin' });
+    }
+
+    return res.json({
+      success: true,
+      scheduled_pin: updatedPin,
+      message: 'Scheduled pin updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error updating scheduled pin:', error);
+    return res.status(500).json({ 
+      error: { 
+        message: `Failed to update scheduled pin: ${error.message}`, 
+        status: 'failure' 
+      } 
+    });
+  }
+});
+
+// Cancel/delete a scheduled pin
+app.delete('/api/pinterest/scheduled-pins/:id', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+
+  try {
+    // Check if pin exists and belongs to user
+    const { data: existingPin, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .single();
+
+    if (fetchError || !existingPin) {
+      return res.status(404).json({ error: 'Scheduled pin not found' });
+    }
+
+    // Don't allow deletion of posted pins, just mark as cancelled
+    if (existingPin.status === 'posted') {
+      return res.status(400).json({ error: 'Cannot delete a pin that has already been posted' });
+    }
+
+    // If pin is scheduled or failed, we can safely delete it
+    // If it's currently posting, mark as cancelled instead
+    if (existingPin.status === 'posting') {
+      const { error: updateError } = await supabaseAdmin
+        .from('scheduled_pins')
+        .update({ status: 'cancelled' })
+        .eq('id', id)
+        .eq('user_id', user.id);
+
+      if (updateError) {
+        console.error('Error cancelling scheduled pin:', updateError);
+        return res.status(500).json({ error: 'Failed to cancel scheduled pin' });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Scheduled pin cancelled successfully'
+      });
+    } else {
+      // Delete the pin
+      const { error: deleteError } = await supabaseAdmin
+        .from('scheduled_pins')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', user.id);
+
+      if (deleteError) {
+        console.error('Error deleting scheduled pin:', deleteError);
+        return res.status(500).json({ error: 'Failed to delete scheduled pin' });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Scheduled pin deleted successfully'
+      });
+    }
+
+  } catch (error) {
+    console.error('Error deleting scheduled pin:', error);
+    return res.status(500).json({ 
+      error: { 
+        message: `Failed to delete scheduled pin: ${error.message}`, 
+        status: 'failure' 
+      } 
+    });
+  }
+});
+
 // Debug endpoint to check Pinterest connection status
 app.get('/api/pinterest/status', async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -1429,6 +1958,47 @@ app.post('/api/wordpress/fetch-posts', async (req, res) => {
   }
 });
 
+// Manual trigger endpoint for scheduled pins (for testing/debugging)
+app.post('/api/pinterest/process-scheduled', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  console.log(`🔧 Manual trigger for scheduled pins by user: ${user.id}`);
+  
+  try {
+    await processScheduledPins();
+    res.json({ 
+      success: true, 
+      message: 'Scheduled pin processing triggered successfully' 
+    });
+  } catch (error) {
+    console.error('Error in manual scheduled pin processing:', error);
+    res.status(500).json({ 
+      error: 'Failed to process scheduled pins',
+      details: error.message 
+    });
+  }
+});
+
+// Graceful shutdown handling
+process.on('SIGTERM', () => {
+  console.log('🛑 SIGTERM received, shutting down gracefully');
+  stopScheduler();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('🛑 SIGINT received, shutting down gracefully');
+  stopScheduler();
+  process.exit(0);
+});
+
 app.listen(PORT, () => {
-  console.log(`Backend listening on port ${PORT}`);
+  console.log(`🚀 Backend listening on port ${PORT}`);
+  
+  // Start the scheduled pin processor
+  startScheduler();
 }); 
