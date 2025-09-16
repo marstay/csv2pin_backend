@@ -145,6 +145,18 @@ async function processScheduledPin(pin) {
         })
         .eq('id', pin.id);
 
+      // Also update the corresponding user_images record
+      await supabaseAdmin
+        .from('user_images')
+        .update({ 
+          pinterest_uploaded: true,
+          pinterest_pin_id: pinData.id,
+          is_scheduled: false,
+          scheduled_for: null
+        })
+        .eq('user_id', pin.user_id)
+        .eq('image_url', pin.image_url);
+
       // Deduct credits if not already done
       if (!pin.credits_deducted) {
         await deductUserCredits(pin.user_id, 1);
