@@ -646,7 +646,7 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
     const completion = await openai.chat.completions.create({
       model: 'gpt-3.5-turbo',
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: type === 'title' ? 100 : 500,
+      max_tokens: type === 'title' ? 150 : 500,
       temperature: 0.7,
     });
     let result = completion.choices[0].message.content.trim();
