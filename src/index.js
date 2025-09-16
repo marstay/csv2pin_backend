@@ -258,13 +258,13 @@ function startScheduler() {
     clearInterval(schedulerInterval);
   }
   
-  // Process scheduled pins every 5 minutes
-  schedulerInterval = setInterval(processScheduledPins, 5 * 60 * 1000);
+  // Process scheduled pins every 1 minute
+  schedulerInterval = setInterval(processScheduledPins, 1 * 60 * 1000);
   
   // Process immediately on startup
   setTimeout(processScheduledPins, 5000); // Wait 5 seconds after startup
   
-  console.log('📅 Scheduled pin processor started (runs every 5 minutes)');
+  console.log('📅 Scheduled pin processor started (runs every 1 minute)');
 }
 
 function stopScheduler() {
