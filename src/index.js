@@ -2460,12 +2460,15 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
         }
 
         // Fetch analytics for this pin with required date parameters
+        // Try a longer date range (1 year) to capture all historical data
         const endDate = new Date().toISOString().split('T')[0]; // Today
         const startDate = new Date();
-        startDate.setDate(startDate.getDate() - 30); // 30 days ago
+        startDate.setDate(startDate.getDate() - 365); // 1 year ago
         const startDateStr = startDate.toISOString().split('T')[0];
         
         const analyticsUrl = `https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
+        
+        console.log(`🔗 Analytics URL for pin ${pin.pinterest_pin_id}: ${analyticsUrl}`);
         
         const analyticsResponse = await fetch(analyticsUrl, {
           method: 'GET',
@@ -2609,6 +2612,103 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
     console.error('Error syncing Pinterest analytics:', error);
     return res.status(500).json({ 
       error: 'Failed to sync Pinterest analytics',
+      details: error.message 
+    });
+  }
+});
+
+// Test Pinterest Analytics API with any Pin ID (for debugging)
+app.post('/api/pinterest/test-analytics/:pinId', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { pinId } = req.params;
+
+  try {
+    const accessToken = await getPinterestAccessTokenForUser(user.id, null);
+    if (!accessToken) {
+      return res.status(400).json({ error: 'No Pinterest access token found' });
+    }
+
+    console.log(`🧪 Testing analytics for Pinterest Pin ID: ${pinId}`);
+
+    // Test multiple date ranges to see if that's the issue
+    const testRanges = [
+      { name: '30 days', days: 30 },
+      { name: '90 days', days: 90 },
+      { name: '1 year', days: 365 }
+    ];
+
+    const results = {};
+
+    for (const range of testRanges) {
+      const endDate = new Date().toISOString().split('T')[0];
+      const startDate = new Date();
+      startDate.setDate(startDate.getDate() - range.days);
+      const startDateStr = startDate.toISOString().split('T')[0];
+      
+      const analyticsUrl = `https://api.pinterest.com/v5/pins/${pinId}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
+      
+      console.log(`🔗 Testing ${range.name}: ${analyticsUrl}`);
+      
+      const analyticsResponse = await fetch(analyticsUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (analyticsResponse.ok) {
+        const analyticsData = await analyticsResponse.json();
+        
+        // Handle different Pinterest API response formats
+        let metrics = {};
+        if (analyticsData.all_time) {
+          metrics = analyticsData.all_time;
+        } else if (analyticsData.summary) {
+          metrics = analyticsData.summary;
+        } else if (analyticsData.all && analyticsData.all.summary_metrics) {
+          metrics = analyticsData.all.summary_metrics;
+        } else if (analyticsData.summary_metrics) {
+          metrics = analyticsData.summary_metrics;
+        } else {
+          metrics = analyticsData;
+        }
+
+        results[range.name] = {
+          impressions: metrics.IMPRESSION || 0,
+          saves: metrics.SAVE || 0,
+          pin_clicks: metrics.PIN_CLICK || 0,
+          outbound_clicks: metrics.OUTBOUND_CLICK || 0,
+          raw_response: analyticsData
+        };
+      } else {
+        const errorText = await analyticsResponse.text();
+        results[range.name] = {
+          error: `API Error: ${analyticsResponse.status}`,
+          details: errorText
+        };
+      }
+
+      // Small delay between requests
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    return res.json({
+      success: true,
+      pin_id: pinId,
+      pinterest_url: `https://pinterest.com/pin/${pinId}`,
+      test_results: results
+    });
+
+  } catch (error) {
+    console.error('Error testing Pinterest analytics:', error);
+    return res.status(500).json({ 
+      error: 'Failed to test Pinterest analytics',
       details: error.message 
     });
   }
