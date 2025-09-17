@@ -131,17 +131,24 @@ async function processScheduledPin(pin) {
     const pinData = await pinterestRes.json();
     
     if (pinterestRes.ok) {
-      // Success - update pin as posted
+      // Success - update pin as posted with analytics data
+      const postedAt = new Date();
+      const postedHour = postedAt.getHours();
+      const postedDayOfWeek = postedAt.getDay();
+      
       await supabaseAdmin
         .from('scheduled_pins')
         .update({ 
           status: 'posted',
-          posted_at: new Date().toISOString(),
+          posted_at: postedAt.toISOString(),
           pinterest_pin_id: pinData.id,
           error_message: null,
           retry_count: 0,
           next_retry_at: null,
-          updated_at: new Date().toISOString()
+          updated_at: postedAt.toISOString(),
+          posted_hour: postedHour,
+          posted_day_of_week: postedDayOfWeek,
+          posted_timezone: pin.timezone || 'UTC'
         })
         .eq('id', pin.id);
 
@@ -152,7 +159,10 @@ async function processScheduledPin(pin) {
           pinterest_uploaded: true,
           pinterest_pin_id: pinData.id,
           is_scheduled: false,
-          scheduled_for: null
+          scheduled_for: null,
+          posted_hour: postedHour,
+          posted_day_of_week: postedDayOfWeek,
+          posted_timezone: pin.timezone || 'UTC'
         })
         .eq('user_id', pin.user_id)
         .eq('image_url', pin.image_url);
@@ -2045,6 +2055,241 @@ app.delete('/api/pinterest/scheduled-pins/:id/permanent', async (req, res) => {
         message: `Failed to permanently delete scheduled pin: ${error.message}`, 
         status: 'failure' 
       } 
+    });
+  }
+});
+
+// Fetch Pinterest analytics for a specific pin
+app.get('/api/pinterest/pin-analytics/:pinId', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { pinId } = req.params;
+  const { account_id } = req.query;
+
+  try {
+    const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+    if (!accessToken) {
+      return res.status(400).json({ error: 'No Pinterest access token found' });
+    }
+
+    // Fetch analytics from Pinterest API
+    const analyticsResponse = await fetch(`https://api.pinterest.com/v5/pins/${pinId}/analytics`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!analyticsResponse.ok) {
+      const errorData = await analyticsResponse.json();
+      console.error('Pinterest Analytics API error:', errorData);
+      return res.status(400).json({ 
+        error: 'Failed to fetch Pinterest analytics',
+        details: errorData
+      });
+    }
+
+    const analyticsData = await analyticsResponse.json();
+    
+    // Pinterest API returns metrics in this format:
+    // {
+    //   "all_time": {
+    //     "IMPRESSION": 1234,
+    //     "OUTBOUND_CLICK": 56,
+    //     "SAVE": 78,
+    //     "PIN_CLICK": 90
+    //   }
+    // }
+
+    const metrics = analyticsData.all_time || {};
+    const impressions = metrics.IMPRESSION || 0;
+    const outboundClicks = metrics.OUTBOUND_CLICK || 0;
+    const saves = metrics.SAVE || 0;
+    const pinClicks = metrics.PIN_CLICK || 0;
+    const closeupViews = metrics.CLOSEUP || 0;
+
+    // Calculate engagement metrics
+    const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) * 100 : 0;
+    const clickThroughRate = impressions > 0 ? (outboundClicks / impressions) * 100 : 0;
+    const saveRate = impressions > 0 ? (saves / impressions) * 100 : 0;
+
+    const processedMetrics = {
+      impressions,
+      outbound_clicks: outboundClicks,
+      saves,
+      pin_clicks: pinClicks,
+      closeup_views: closeupViews,
+      engagement_rate: Math.round(engagementRate * 100) / 100,
+      click_through_rate: Math.round(clickThroughRate * 100) / 100,
+      save_rate: Math.round(saveRate * 100) / 100,
+      last_updated: new Date().toISOString()
+    };
+
+    return res.json({
+      success: true,
+      pin_id: pinId,
+      metrics: processedMetrics,
+      raw_data: analyticsData
+    });
+
+  } catch (error) {
+    console.error('Error fetching Pinterest analytics:', error);
+    return res.status(500).json({ 
+      error: 'Failed to fetch Pinterest analytics',
+      details: error.message 
+    });
+  }
+});
+
+// Sync Pinterest analytics for all user's posted pins
+app.post('/api/pinterest/sync-analytics', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { account_id } = req.body;
+
+  try {
+    const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+    if (!accessToken) {
+      return res.status(400).json({ error: 'No Pinterest access token found' });
+    }
+
+    // Get all posted pins for this user that have Pinterest pin IDs
+    const { data: postedPins, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('id, pinterest_pin_id, metrics_last_updated')
+      .eq('user_id', user.id)
+      .eq('status', 'posted')
+      .not('pinterest_pin_id', 'is', null)
+      .limit(50); // Limit to avoid rate limits
+
+    if (fetchError) {
+      console.error('Error fetching posted pins:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch posted pins' });
+    }
+
+    if (!postedPins || postedPins.length === 0) {
+      return res.json({ 
+        success: true, 
+        message: 'No posted pins found to sync analytics for',
+        synced_count: 0
+      });
+    }
+
+    let syncedCount = 0;
+    const errors = [];
+
+    // Process pins in batches to respect rate limits
+    for (const pin of postedPins) {
+      try {
+        // Skip if metrics were updated recently (within last 24 hours)
+        if (pin.metrics_last_updated) {
+          const lastUpdate = new Date(pin.metrics_last_updated);
+          const twentyFourHoursAgo = new Date();
+          twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+          
+          if (lastUpdate > twentyFourHoursAgo) {
+            console.log(`Skipping pin ${pin.pinterest_pin_id} - updated recently`);
+            continue;
+          }
+        }
+
+        // Fetch analytics for this pin
+        const analyticsResponse = await fetch(`https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        });
+
+        if (analyticsResponse.ok) {
+          const analyticsData = await analyticsResponse.json();
+          const metrics = analyticsData.all_time || {};
+          
+          const impressions = metrics.IMPRESSION || 0;
+          const outboundClicks = metrics.OUTBOUND_CLICK || 0;
+          const saves = metrics.SAVE || 0;
+          const pinClicks = metrics.PIN_CLICK || 0;
+          const closeupViews = metrics.CLOSEUP || 0;
+
+          // Calculate engagement metrics
+          const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) * 100 : 0;
+          const clickThroughRate = impressions > 0 ? (outboundClicks / impressions) * 100 : 0;
+          const saveRate = impressions > 0 ? (saves / impressions) * 100 : 0;
+
+          // Update scheduled_pins table
+          await supabaseAdmin
+            .from('scheduled_pins')
+            .update({
+              impressions,
+              outbound_clicks: outboundClicks,
+              saves,
+              pin_clicks: pinClicks,
+              closeup_views: closeupViews,
+              engagement_rate: Math.round(engagementRate * 100) / 100,
+              click_through_rate: Math.round(clickThroughRate * 100) / 100,
+              save_rate: Math.round(saveRate * 100) / 100,
+              metrics_last_updated: new Date().toISOString()
+            })
+            .eq('id', pin.id);
+
+          // Also update user_images table if there's a matching record
+          await supabaseAdmin
+            .from('user_images')
+            .update({
+              impressions,
+              outbound_clicks: outboundClicks,
+              saves,
+              pin_clicks: pinClicks,
+              closeup_views: closeupViews,
+              engagement_rate: Math.round(engagementRate * 100) / 100,
+              click_through_rate: Math.round(clickThroughRate * 100) / 100,
+              save_rate: Math.round(saveRate * 100) / 100,
+              metrics_last_updated: new Date().toISOString()
+            })
+            .eq('pinterest_pin_id', pin.pinterest_pin_id)
+            .eq('user_id', user.id);
+
+          syncedCount++;
+          console.log(`✅ Synced analytics for pin ${pin.pinterest_pin_id}`);
+          
+        } else {
+          const errorData = await analyticsResponse.json().catch(() => ({}));
+          errors.push(`Pin ${pin.pinterest_pin_id}: ${errorData.message || 'API error'}`);
+          console.error(`❌ Failed to fetch analytics for pin ${pin.pinterest_pin_id}:`, errorData);
+        }
+
+        // Add delay between requests to respect rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+
+      } catch (error) {
+        errors.push(`Pin ${pin.pinterest_pin_id}: ${error.message}`);
+        console.error(`❌ Error processing pin ${pin.pinterest_pin_id}:`, error);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: `Analytics synced for ${syncedCount} pins`,
+      synced_count: syncedCount,
+      total_pins: postedPins.length,
+      errors: errors.length > 0 ? errors : undefined
+    });
+
+  } catch (error) {
+    console.error('Error syncing Pinterest analytics:', error);
+    return res.status(500).json({ 
+      error: 'Failed to sync Pinterest analytics',
+      details: error.message 
     });
   }
 });
