@@ -352,9 +352,10 @@ async function syncUserAnalytics(userId, accessToken) {
       }
 
       // Fetch analytics from Pinterest API
+      // Pinterest API only allows data from the last 90 days
       const endDate = new Date().toISOString().split('T')[0];
       const startDate = new Date();
-      startDate.setDate(startDate.getDate() - 30);
+      startDate.setDate(startDate.getDate() - 89); // 89 days ago (to be safe)
       const startDateStr = startDate.toISOString().split('T')[0];
       
       const analyticsUrl = `https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
@@ -2460,10 +2461,10 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
         }
 
         // Fetch analytics for this pin with required date parameters
-        // Try a longer date range (1 year) to capture all historical data
+        // Pinterest API only allows data from the last 90 days
         const endDate = new Date().toISOString().split('T')[0]; // Today
         const startDate = new Date();
-        startDate.setDate(startDate.getDate() - 365); // 1 year ago
+        startDate.setDate(startDate.getDate() - 89); // 89 days ago (to be safe)
         const startDateStr = startDate.toISOString().split('T')[0];
         
         const analyticsUrl = `https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
@@ -2585,8 +2586,14 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           
         } else {
           const errorData = await analyticsResponse.json().catch(() => ({}));
-          errors.push(`Pin ${pin.pinterest_pin_id}: ${errorData.message || 'API error'}`);
+          const errorMsg = errorData.message || 'API error';
+          errors.push(`Pin ${pin.pinterest_pin_id}: ${errorMsg}`);
           console.error(`❌ Failed to fetch analytics for pin ${pin.pinterest_pin_id}:`, errorData);
+          
+          // If it's a date range error, log helpful info
+          if (errorMsg.includes('90 days')) {
+            console.log(`📅 Note: Pinterest API only allows data from the last 90 days for pin ${pin.pinterest_pin_id}`);
+          }
         }
 
         // Add delay between requests to respect rate limits
@@ -2635,11 +2642,11 @@ app.post('/api/pinterest/test-analytics/:pinId', async (req, res) => {
 
     console.log(`🧪 Testing analytics for Pinterest Pin ID: ${pinId}`);
 
-    // Test multiple date ranges to see if that's the issue
+    // Test multiple date ranges within Pinterest's 90-day limit
     const testRanges = [
+      { name: '7 days', days: 7 },
       { name: '30 days', days: 30 },
-      { name: '90 days', days: 90 },
-      { name: '1 year', days: 365 }
+      { name: '89 days', days: 89 } // Max allowed by Pinterest API
     ];
 
     const results = {};
