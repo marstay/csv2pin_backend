@@ -2660,6 +2660,7 @@ app.post('/api/pinterest/test-analytics/:pinId', async (req, res) => {
       const analyticsUrl = `https://api.pinterest.com/v5/pins/${pinId}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
       
       console.log(`🔗 Testing ${range.name}: ${analyticsUrl}`);
+      console.log(`📅 Date range: ${startDateStr} to ${endDate}`);
       
       const analyticsResponse = await fetch(analyticsUrl, {
         method: 'GET',
