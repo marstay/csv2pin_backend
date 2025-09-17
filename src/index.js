@@ -2076,8 +2076,15 @@ app.get('/api/pinterest/pin-analytics/:pinId', async (req, res) => {
       return res.status(400).json({ error: 'No Pinterest access token found' });
     }
 
-    // Fetch analytics from Pinterest API
-    const analyticsResponse = await fetch(`https://api.pinterest.com/v5/pins/${pinId}/analytics`, {
+    // Fetch analytics from Pinterest API with required date parameters
+    const endDate = new Date().toISOString().split('T')[0]; // Today
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - 30); // 30 days ago
+    const startDateStr = startDate.toISOString().split('T')[0];
+    
+    const analyticsUrl = `https://api.pinterest.com/v5/pins/${pinId}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
+    
+    const analyticsResponse = await fetch(analyticsUrl, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
@@ -2096,17 +2103,26 @@ app.get('/api/pinterest/pin-analytics/:pinId', async (req, res) => {
 
     const analyticsData = await analyticsResponse.json();
     
-    // Pinterest API returns metrics in this format:
+    // Pinterest API with date range returns metrics in this format:
     // {
     //   "all_time": {
     //     "IMPRESSION": 1234,
     //     "OUTBOUND_CLICK": 56,
     //     "SAVE": 78,
-    //     "PIN_CLICK": 90
+    //     "PIN_CLICK": 90,
+    //     "CLOSEUP": 45
+    //   }
+    // }
+    // OR for date ranges:
+    // {
+    //   "daily_metrics": [...],
+    //   "summary": {
+    //     "IMPRESSION": 1234,
+    //     ...
     //   }
     // }
 
-    const metrics = analyticsData.all_time || {};
+    const metrics = analyticsData.all_time || analyticsData.summary || analyticsData;
     const impressions = metrics.IMPRESSION || 0;
     const outboundClicks = metrics.OUTBOUND_CLICK || 0;
     const saves = metrics.SAVE || 0;
@@ -2202,8 +2218,15 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           }
         }
 
-        // Fetch analytics for this pin
-        const analyticsResponse = await fetch(`https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics`, {
+        // Fetch analytics for this pin with required date parameters
+        const endDate = new Date().toISOString().split('T')[0]; // Today
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 30); // 30 days ago
+        const startDateStr = startDate.toISOString().split('T')[0];
+        
+        const analyticsUrl = `https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
+        
+        const analyticsResponse = await fetch(analyticsUrl, {
           method: 'GET',
           headers: {
             'Authorization': `Bearer ${accessToken}`,
@@ -2213,7 +2236,7 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
 
         if (analyticsResponse.ok) {
           const analyticsData = await analyticsResponse.json();
-          const metrics = analyticsData.all_time || {};
+          const metrics = analyticsData.all_time || analyticsData.summary || analyticsData;
           
           const impressions = metrics.IMPRESSION || 0;
           const outboundClicks = metrics.OUTBOUND_CLICK || 0;
