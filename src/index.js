@@ -2380,16 +2380,60 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
       .not('pinterest_pin_id', 'is', null)
       .limit(50); // Limit to avoid rate limits
 
+    // Also get pins from user_images that might not be in scheduled_pins
+    const { data: userImagePins, error: userImagesError } = await supabaseAdmin
+      .from('user_images')
+      .select('id, pinterest_pin_id, metrics_last_updated')
+      .eq('user_id', user.id)
+      .eq('pinterest_uploaded', true)
+      .not('pinterest_pin_id', 'is', null)
+      .limit(50);
+
+    console.log(`📊 Found ${postedPins?.length || 0} pins in scheduled_pins table`);
+    console.log(`📊 Found ${userImagePins?.length || 0} pins in user_images table`);
+
     if (fetchError) {
       console.error('Error fetching posted pins:', fetchError);
       return res.status(500).json({ error: 'Failed to fetch posted pins' });
     }
 
-    if (!postedPins || postedPins.length === 0) {
+    if (userImagesError) {
+      console.error('Error fetching user image pins:', userImagesError);
+    }
+
+    // Combine both sources and deduplicate by pinterest_pin_id
+    const allPins = [];
+    const pinIdSet = new Set();
+
+    // Add scheduled pins
+    if (postedPins) {
+      postedPins.forEach(pin => {
+        if (!pinIdSet.has(pin.pinterest_pin_id)) {
+          pinIdSet.add(pin.pinterest_pin_id);
+          allPins.push({ ...pin, source: 'scheduled_pins' });
+        }
+      });
+    }
+
+    // Add user image pins (if not already added)
+    if (userImagePins) {
+      userImagePins.forEach(pin => {
+        if (!pinIdSet.has(pin.pinterest_pin_id)) {
+          pinIdSet.add(pin.pinterest_pin_id);
+          allPins.push({ ...pin, source: 'user_images' });
+        }
+      });
+    }
+
+    console.log(`📊 Total unique pins to sync: ${allPins.length}`);
+    console.log(`📊 Pinterest Pin IDs: ${Array.from(pinIdSet).join(', ')}`);
+
+    if (allPins.length === 0) {
       return res.json({ 
         success: true, 
         message: 'No posted pins found to sync analytics for',
-        synced_count: 0
+        synced_count: 0,
+        total_pins: 0
       });
     }
 
@@ -2397,7 +2441,7 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
     const errors = [];
 
     // Process pins in batches to respect rate limits
-    for (const pin of postedPins) {
+    for (const pin of allPins) {
       try {
         // Skip if metrics were updated recently (within last 24 hours) unless force sync
         if (!force_sync && pin.metrics_last_updated) {
@@ -2479,21 +2523,24 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
             metrics_last_updated: new Date().toISOString()
           };
           
-          console.log(`📊 Updating scheduled_pins for pin ${pin.pinterest_pin_id} with data:`, updateData);
+          console.log(`📊 Updating tables for pin ${pin.pinterest_pin_id} (source: ${pin.source}) with data:`, updateData);
           
-          const { error: scheduledPinsError } = await supabaseAdmin
-            .from('scheduled_pins')
-            .update(updateData)
-            .eq('id', pin.id);
-            
-          if (scheduledPinsError) {
-            console.error(`❌ Error updating scheduled_pins for pin ${pin.pinterest_pin_id}:`, scheduledPinsError);
-          } else {
-            console.log(`✅ Successfully updated scheduled_pins for pin ${pin.pinterest_pin_id}`);
+          // Update scheduled_pins table if pin came from there
+          if (pin.source === 'scheduled_pins') {
+            const { error: scheduledPinsError } = await supabaseAdmin
+              .from('scheduled_pins')
+              .update(updateData)
+              .eq('id', pin.id);
+              
+            if (scheduledPinsError) {
+              console.error(`❌ Error updating scheduled_pins for pin ${pin.pinterest_pin_id}:`, scheduledPinsError);
+            } else {
+              console.log(`✅ Successfully updated scheduled_pins for pin ${pin.pinterest_pin_id}`);
+            }
           }
 
-          // Also update user_images table if there's a matching record
-          console.log(`📊 Updating user_images for pin ${pin.pinterest_pin_id} with same data`);
+          // Always try to update user_images table (for both scheduled and direct uploads)
+          console.log(`📊 Updating user_images for pin ${pin.pinterest_pin_id}`);
           
           const { error: userImagesError } = await supabaseAdmin
             .from('user_images')
@@ -2515,6 +2562,19 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
             console.error(`❌ Error updating user_images for pin ${pin.pinterest_pin_id}:`, userImagesError);
           } else {
             console.log(`✅ Successfully updated user_images for pin ${pin.pinterest_pin_id}`);
+          }
+          
+          // If pin came from user_images but not scheduled_pins, also try to update scheduled_pins by pinterest_pin_id
+          if (pin.source === 'user_images') {
+            const { error: scheduledPinsError } = await supabaseAdmin
+              .from('scheduled_pins')
+              .update(updateData)
+              .eq('pinterest_pin_id', pin.pinterest_pin_id)
+              .eq('user_id', user.id);
+              
+            if (!scheduledPinsError) {
+              console.log(`✅ Also updated scheduled_pins for pin ${pin.pinterest_pin_id} (matched by pinterest_pin_id)`);
+            }
           }
 
           syncedCount++;
@@ -2539,7 +2599,9 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
       success: true,
       message: `Analytics synced for ${syncedCount} pins`,
       synced_count: syncedCount,
-      total_pins: postedPins.length,
+      total_pins: allPins.length,
+      scheduled_pins_found: postedPins?.length || 0,
+      user_images_found: userImagePins?.length || 0,
       errors: errors.length > 0 ? errors : undefined
     });
 
