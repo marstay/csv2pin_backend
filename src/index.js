@@ -373,7 +373,20 @@ async function syncUserAnalytics(userId, accessToken) {
       }
 
       const analyticsData = await analyticsResponse.json();
-      const metrics = analyticsData.all_time || analyticsData.summary || analyticsData;
+      
+      // Handle different Pinterest API response formats
+      let metrics = {};
+      if (analyticsData.all_time) {
+        metrics = analyticsData.all_time;
+      } else if (analyticsData.summary) {
+        metrics = analyticsData.summary;
+      } else if (analyticsData.all && analyticsData.all.summary_metrics) {
+        metrics = analyticsData.all.summary_metrics;
+      } else if (analyticsData.summary_metrics) {
+        metrics = analyticsData.summary_metrics;
+      } else {
+        metrics = analyticsData;
+      }
       
       const impressions = metrics.IMPRESSION || 0;
       const outboundClicks = metrics.OUTBOUND_CLICK || 0;
@@ -2422,7 +2435,20 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           const analyticsData = await analyticsResponse.json();
           console.log(`📊 Raw Pinterest API response for pin ${pin.pinterest_pin_id}:`, JSON.stringify(analyticsData, null, 2));
           
-          const metrics = analyticsData.all_time || analyticsData.summary || analyticsData;
+          // Handle different Pinterest API response formats
+          let metrics = {};
+          if (analyticsData.all_time) {
+            metrics = analyticsData.all_time;
+          } else if (analyticsData.summary) {
+            metrics = analyticsData.summary;
+          } else if (analyticsData.all && analyticsData.all.summary_metrics) {
+            metrics = analyticsData.all.summary_metrics;
+          } else if (analyticsData.summary_metrics) {
+            metrics = analyticsData.summary_metrics;
+          } else {
+            metrics = analyticsData;
+          }
+          
           console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, metrics);
           
           const impressions = metrics.IMPRESSION || 0;
