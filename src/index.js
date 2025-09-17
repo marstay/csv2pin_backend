@@ -382,9 +382,9 @@ async function syncUserAnalytics(userId, accessToken) {
       const closeupViews = metrics.CLOSEUP || 0;
       
       // Calculate engagement metrics
-      const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) : 0;
-      const clickThroughRate = impressions > 0 ? (outboundClicks / impressions) : 0;
-      const saveRate = impressions > 0 ? (saves / impressions) : 0;
+      const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) * 100 : 0;
+      const clickThroughRate = impressions > 0 ? (outboundClicks / impressions) * 100 : 0;
+      const saveRate = impressions > 0 ? (saves / impressions) * 100 : 0;
 
       // Update database
       const { error: updateError } = await supabaseAdmin
@@ -395,9 +395,9 @@ async function syncUserAnalytics(userId, accessToken) {
           saves,
           pin_clicks: pinClicks,
           closeup_views: closeupViews,
-          engagement_rate: parseFloat(engagementRate.toFixed(4)),
-          click_through_rate: parseFloat(clickThroughRate.toFixed(4)),
-          save_rate: parseFloat(saveRate.toFixed(4)),
+          engagement_rate: Math.round(engagementRate * 100) / 100,
+          click_through_rate: Math.round(clickThroughRate * 100) / 100,
+          save_rate: Math.round(saveRate * 100) / 100,
           metrics_last_updated: new Date().toISOString()
         })
         .eq('id', pin.id);
@@ -2420,13 +2420,20 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
 
         if (analyticsResponse.ok) {
           const analyticsData = await analyticsResponse.json();
+          console.log(`📊 Raw Pinterest API response for pin ${pin.pinterest_pin_id}:`, JSON.stringify(analyticsData, null, 2));
+          
           const metrics = analyticsData.all_time || analyticsData.summary || analyticsData;
+          console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, metrics);
           
           const impressions = metrics.IMPRESSION || 0;
           const outboundClicks = metrics.OUTBOUND_CLICK || 0;
           const saves = metrics.SAVE || 0;
           const pinClicks = metrics.PIN_CLICK || 0;
           const closeupViews = metrics.CLOSEUP || 0;
+          
+          console.log(`📊 Parsed values for pin ${pin.pinterest_pin_id}:`, {
+            impressions, outboundClicks, saves, pinClicks, closeupViews
+          });
 
           // Calculate engagement metrics
           const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) * 100 : 0;
@@ -2434,23 +2441,35 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           const saveRate = impressions > 0 ? (saves / impressions) * 100 : 0;
 
           // Update scheduled_pins table
-          await supabaseAdmin
+          const updateData = {
+            impressions,
+            outbound_clicks: outboundClicks,
+            saves,
+            pin_clicks: pinClicks,
+            closeup_views: closeupViews,
+            engagement_rate: Math.round(engagementRate * 100) / 100,
+            click_through_rate: Math.round(clickThroughRate * 100) / 100,
+            save_rate: Math.round(saveRate * 100) / 100,
+            metrics_last_updated: new Date().toISOString()
+          };
+          
+          console.log(`📊 Updating scheduled_pins for pin ${pin.pinterest_pin_id} with data:`, updateData);
+          
+          const { error: scheduledPinsError } = await supabaseAdmin
             .from('scheduled_pins')
-            .update({
-              impressions,
-              outbound_clicks: outboundClicks,
-              saves,
-              pin_clicks: pinClicks,
-              closeup_views: closeupViews,
-              engagement_rate: Math.round(engagementRate * 100) / 100,
-              click_through_rate: Math.round(clickThroughRate * 100) / 100,
-              save_rate: Math.round(saveRate * 100) / 100,
-              metrics_last_updated: new Date().toISOString()
-            })
+            .update(updateData)
             .eq('id', pin.id);
+            
+          if (scheduledPinsError) {
+            console.error(`❌ Error updating scheduled_pins for pin ${pin.pinterest_pin_id}:`, scheduledPinsError);
+          } else {
+            console.log(`✅ Successfully updated scheduled_pins for pin ${pin.pinterest_pin_id}`);
+          }
 
           // Also update user_images table if there's a matching record
-          await supabaseAdmin
+          console.log(`📊 Updating user_images for pin ${pin.pinterest_pin_id} with same data`);
+          
+          const { error: userImagesError } = await supabaseAdmin
             .from('user_images')
             .update({
               impressions,
@@ -2465,6 +2484,12 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
             })
             .eq('pinterest_pin_id', pin.pinterest_pin_id)
             .eq('user_id', user.id);
+            
+          if (userImagesError) {
+            console.error(`❌ Error updating user_images for pin ${pin.pinterest_pin_id}:`, userImagesError);
+          } else {
+            console.log(`✅ Successfully updated user_images for pin ${pin.pinterest_pin_id}`);
+          }
 
           syncedCount++;
           console.log(`✅ Synced analytics for pin ${pin.pinterest_pin_id}`);
