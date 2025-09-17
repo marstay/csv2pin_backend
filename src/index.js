@@ -260,8 +260,169 @@ async function deductUserCredits(userId, amount) {
   }
 }
 
+// Background job processor for Pinterest analytics sync
+async function processAnalyticsSync() {
+  console.log('📊 Processing automatic Pinterest analytics sync...');
+  
+  try {
+    // Get all unique users who have posted pins with Pinterest pin IDs
+    const { data: allPostedPins, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select(`
+        user_id,
+        pinterest_accounts(access_token)
+      `)
+      .eq('status', 'posted')
+      .not('pinterest_pin_id', 'is', null);
+
+    if (fetchError) {
+      console.error('❌ Error fetching posted pins for analytics sync:', fetchError);
+      return;
+    }
+
+    // Get unique users
+    const usersMap = new Map();
+    allPostedPins?.forEach(pin => {
+      if (!usersMap.has(pin.user_id)) {
+        usersMap.set(pin.user_id, pin.pinterest_accounts);
+      }
+    });
+
+    const usersWithPins = Array.from(usersMap.entries()).map(([user_id, pinterest_accounts]) => ({
+      user_id,
+      pinterest_accounts
+    }));
+
+    if (!usersWithPins || usersWithPins.length === 0) {
+      console.log('✅ No users with posted pins found for analytics sync');
+      return;
+    }
+
+    console.log(`📊 Found ${usersWithPins.length} users for analytics sync`);
+
+    // Process each user's analytics
+    for (const userPin of usersWithPins) {
+      try {
+        await syncUserAnalytics(userPin.user_id, userPin.pinterest_accounts?.access_token);
+        // Add delay between users to respect rate limits
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (error) {
+        console.error(`❌ Error syncing analytics for user ${userPin.user_id}:`, error);
+      }
+    }
+
+    console.log('✅ Automatic analytics sync completed');
+
+  } catch (error) {
+    console.error('❌ Error in processAnalyticsSync:', error);
+  }
+}
+
+async function syncUserAnalytics(userId, accessToken) {
+  if (!accessToken) {
+    console.log(`⚠️ No access token found for user ${userId}, skipping`);
+    return;
+  }
+
+  // Get all posted pins for this user that haven't been updated in 12+ hours
+  const { data: postedPins, error: fetchError } = await supabaseAdmin
+    .from('scheduled_pins')
+    .select('id, pinterest_pin_id, metrics_last_updated')
+    .eq('user_id', userId)
+    .eq('status', 'posted')
+    .not('pinterest_pin_id', 'is', null)
+    .limit(20); // Limit per user to avoid rate limits
+
+  if (fetchError || !postedPins || postedPins.length === 0) {
+    return;
+  }
+
+  let syncedCount = 0;
+  const twelveHoursAgo = new Date();
+  twelveHoursAgo.setHours(twelveHoursAgo.getHours() - 12);
+
+  for (const pin of postedPins) {
+    try {
+      // Skip if updated recently (within 12 hours)
+      if (pin.metrics_last_updated) {
+        const lastUpdate = new Date(pin.metrics_last_updated);
+        if (lastUpdate > twelveHoursAgo) {
+          continue;
+        }
+      }
+
+      // Fetch analytics from Pinterest API
+      const endDate = new Date().toISOString().split('T')[0];
+      const startDate = new Date();
+      startDate.setDate(startDate.getDate() - 30);
+      const startDateStr = startDate.toISOString().split('T')[0];
+      
+      const analyticsUrl = `https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
+      
+      const analyticsResponse = await fetch(analyticsUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!analyticsResponse.ok) {
+        console.error(`❌ Pinterest API error for pin ${pin.pinterest_pin_id}`);
+        continue;
+      }
+
+      const analyticsData = await analyticsResponse.json();
+      const metrics = analyticsData.all_time || analyticsData.summary || analyticsData;
+      
+      const impressions = metrics.IMPRESSION || 0;
+      const outboundClicks = metrics.OUTBOUND_CLICK || 0;
+      const saves = metrics.SAVE || 0;
+      const pinClicks = metrics.PIN_CLICK || 0;
+      const closeupViews = metrics.CLOSEUP || 0;
+      
+      // Calculate engagement metrics
+      const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) : 0;
+      const clickThroughRate = impressions > 0 ? (outboundClicks / impressions) : 0;
+      const saveRate = impressions > 0 ? (saves / impressions) : 0;
+
+      // Update database
+      const { error: updateError } = await supabaseAdmin
+        .from('scheduled_pins')
+        .update({
+          impressions,
+          outbound_clicks: outboundClicks,
+          saves,
+          pin_clicks: pinClicks,
+          closeup_views: closeupViews,
+          engagement_rate: parseFloat(engagementRate.toFixed(4)),
+          click_through_rate: parseFloat(clickThroughRate.toFixed(4)),
+          save_rate: parseFloat(saveRate.toFixed(4)),
+          metrics_last_updated: new Date().toISOString()
+        })
+        .eq('id', pin.id);
+
+      if (!updateError) {
+        syncedCount++;
+        console.log(`📊 Auto-synced analytics for pin ${pin.pinterest_pin_id}`);
+      }
+
+      // Rate limit: 1 second between requests
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+    } catch (error) {
+      console.error(`❌ Error syncing pin ${pin.pinterest_pin_id}:`, error);
+    }
+  }
+
+  if (syncedCount > 0) {
+    console.log(`✅ Auto-synced ${syncedCount} pins for user ${userId}`);
+  }
+}
+
 // Start background job processor
 let schedulerInterval;
+let analyticsInterval;
 
 function startScheduler() {
   if (schedulerInterval) {
@@ -277,11 +438,30 @@ function startScheduler() {
   console.log('📅 Scheduled pin processor started (runs every 1 minute)');
 }
 
+function startAnalyticsSync() {
+  if (analyticsInterval) {
+    clearInterval(analyticsInterval);
+  }
+  
+  // Process analytics sync every 12 hours (12 * 60 * 60 * 1000 ms)
+  analyticsInterval = setInterval(processAnalyticsSync, 12 * 60 * 60 * 1000);
+  
+  // Process immediately on startup (after 30 seconds to let server settle)
+  setTimeout(processAnalyticsSync, 30000);
+  
+  console.log('📊 Analytics sync processor started (runs every 12 hours)');
+}
+
 function stopScheduler() {
   if (schedulerInterval) {
     clearInterval(schedulerInterval);
     schedulerInterval = null;
     console.log('📅 Scheduled pin processor stopped');
+  }
+  if (analyticsInterval) {
+    clearInterval(analyticsInterval);
+    analyticsInterval = null;
+    console.log('📊 Analytics sync processor stopped');
   }
 }
 
@@ -2170,7 +2350,7 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { account_id } = req.body;
+  const { account_id, force_sync = false } = req.body;
 
   try {
     const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
@@ -2206,16 +2386,20 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
     // Process pins in batches to respect rate limits
     for (const pin of postedPins) {
       try {
-        // Skip if metrics were updated recently (within last 24 hours)
-        if (pin.metrics_last_updated) {
+        // Skip if metrics were updated recently (within last 24 hours) unless force sync
+        if (!force_sync && pin.metrics_last_updated) {
           const lastUpdate = new Date(pin.metrics_last_updated);
           const twentyFourHoursAgo = new Date();
           twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
           
           if (lastUpdate > twentyFourHoursAgo) {
-            console.log(`Skipping pin ${pin.pinterest_pin_id} - updated recently`);
+            console.log(`Skipping pin ${pin.pinterest_pin_id} - updated recently (use force sync to override)`);
             continue;
           }
+        }
+        
+        if (force_sync) {
+          console.log(`🔄 Force syncing pin ${pin.pinterest_pin_id}`);
         }
 
         // Fetch analytics for this pin with required date parameters
@@ -2360,4 +2544,5 @@ app.listen(PORT, () => {
   
   // Start the scheduled pin processor
   startScheduler();
+  startAnalyticsSync();
 }); 
