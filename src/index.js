@@ -364,8 +364,8 @@ async function processAnalyticsSync() {
   console.log('📊 Processing automatic Pinterest analytics sync...');
   
   try {
-    // Get all unique users who have posted pins with Pinterest pin IDs
-    const { data: allPostedPins, error: fetchError } = await supabaseAdmin
+    // Get all unique users who have posted pins with Pinterest pin IDs from scheduled_pins
+    const { data: scheduledPostedPins, error: scheduledFetchError } = await supabaseAdmin
       .from('scheduled_pins')
       .select(`
         user_id,
@@ -374,8 +374,26 @@ async function processAnalyticsSync() {
       .eq('status', 'posted')
       .not('pinterest_pin_id', 'is', null);
 
-    if (fetchError) {
-      console.error('❌ Error fetching posted pins for analytics sync:', fetchError);
+    // Also get users who have uploaded pins directly (Images mode) from user_images
+    const { data: directUploadPins, error: directFetchError } = await supabaseAdmin
+      .from('user_images')
+      .select(`
+        user_id,
+        profiles(pinterest_access_token)
+      `)
+      .eq('pinterest_uploaded', true)
+      .not('pinterest_pin_id', 'is', null);
+
+    const allPostedPins = [...(scheduledPostedPins || []), ...(directUploadPins || [])];
+
+    if (scheduledFetchError) {
+      console.error('❌ Error fetching scheduled posted pins for analytics sync:', scheduledFetchError);
+    }
+    if (directFetchError) {
+      console.error('❌ Error fetching direct upload pins for analytics sync:', directFetchError);
+    }
+    if (scheduledFetchError && directFetchError) {
+      console.error('❌ Both queries failed, aborting analytics sync');
       return;
     }
 
@@ -383,7 +401,9 @@ async function processAnalyticsSync() {
     const usersMap = new Map();
     allPostedPins?.forEach(pin => {
       if (!usersMap.has(pin.user_id)) {
-        usersMap.set(pin.user_id, pin.pinterest_accounts);
+        // Handle both pinterest_accounts (from scheduled_pins) and profiles (from user_images)
+        const accessToken = pin.pinterest_accounts?.access_token || pin.profiles?.pinterest_access_token;
+        usersMap.set(pin.user_id, { access_token: accessToken });
       }
     });
 
@@ -424,15 +444,49 @@ async function syncUserAnalytics(userId, accessToken) {
   }
 
   // Get all posted pins for this user that haven't been updated in 12+ hours
-  const { data: postedPins, error: fetchError } = await supabaseAdmin
+  const { data: scheduledPins, error: scheduledError } = await supabaseAdmin
     .from('scheduled_pins')
     .select('id, pinterest_pin_id, metrics_last_updated')
     .eq('user_id', userId)
     .eq('status', 'posted')
     .not('pinterest_pin_id', 'is', null)
-    .limit(20); // Limit per user to avoid rate limits
+    .limit(10); // Limit per user to avoid rate limits
 
-  if (fetchError || !postedPins || postedPins.length === 0) {
+  // Also get direct uploads from user_images
+  const { data: userImagePins, error: userImagesError } = await supabaseAdmin
+    .from('user_images')
+    .select('id, pinterest_pin_id, metrics_last_updated')
+    .eq('user_id', userId)
+    .eq('pinterest_uploaded', true)
+    .not('pinterest_pin_id', 'is', null)
+    .limit(10);
+
+  // Combine both sources and deduplicate by pinterest_pin_id
+  const allPins = [];
+  const pinIdSet = new Set();
+
+  // Add scheduled pins
+  if (scheduledPins) {
+    scheduledPins.forEach(pin => {
+      if (!pinIdSet.has(pin.pinterest_pin_id)) {
+        pinIdSet.add(pin.pinterest_pin_id);
+        allPins.push({ ...pin, source: 'scheduled_pins' });
+      }
+    });
+  }
+
+  // Add user image pins (if not already added)
+  if (userImagePins) {
+    userImagePins.forEach(pin => {
+      if (!pinIdSet.has(pin.pinterest_pin_id)) {
+        pinIdSet.add(pin.pinterest_pin_id);
+        allPins.push({ ...pin, source: 'user_images' });
+      }
+    });
+  }
+
+  if (allPins.length === 0) {
+    console.log(`📊 No pins found for user ${userId} to sync analytics`);
     return;
   }
 
@@ -440,7 +494,7 @@ async function syncUserAnalytics(userId, accessToken) {
   const twelveHoursAgo = new Date();
   twelveHoursAgo.setHours(twelveHoursAgo.getHours() - 12);
 
-  for (const pin of postedPins) {
+  for (const pin of allPins) {
     try {
       // Skip if updated recently (within 12 hours)
       if (pin.metrics_last_updated) {
@@ -499,25 +553,52 @@ async function syncUserAnalytics(userId, accessToken) {
       const clickThroughRate = impressions > 0 ? (outboundClicks / impressions) * 100 : 0;
       const saveRate = impressions > 0 ? (saves / impressions) * 100 : 0;
 
-      // Update database
-      const { error: updateError } = await supabaseAdmin
-        .from('scheduled_pins')
-        .update({
-          impressions,
-          outbound_clicks: outboundClicks,
-          saves,
-          pin_clicks: pinClicks,
-          closeup_views: closeupViews,
-          engagement_rate: Math.round(engagementRate * 100) / 100,
-          click_through_rate: Math.round(clickThroughRate * 100) / 100,
-          save_rate: Math.round(saveRate * 100) / 100,
-          metrics_last_updated: new Date().toISOString()
-        })
-        .eq('id', pin.id);
+      // Update database based on source
+      const updateData = {
+        impressions,
+        outbound_clicks: outboundClicks,
+        saves,
+        pin_clicks: pinClicks,
+        closeup_views: closeupViews,
+        engagement_rate: Math.round(engagementRate * 100) / 100,
+        click_through_rate: Math.round(clickThroughRate * 100) / 100,
+        save_rate: Math.round(saveRate * 100) / 100,
+        metrics_last_updated: new Date().toISOString()
+      };
 
-      if (!updateError) {
+      let updateError = null;
+
+      // Update scheduled_pins table if pin came from there
+      if (pin.source === 'scheduled_pins') {
+        const { error: scheduledPinsError } = await supabaseAdmin
+          .from('scheduled_pins')
+          .update(updateData)
+          .eq('id', pin.id);
+        updateError = scheduledPinsError;
+      }
+
+      // Always try to update user_images table (for both scheduled and direct uploads)
+      const { error: userImagesError } = await supabaseAdmin
+        .from('user_images')
+        .update(updateData)
+        .eq('pinterest_pin_id', pin.pinterest_pin_id)
+        .eq('user_id', userId);
+
+      // If pin came from user_images but not scheduled_pins, also try to update scheduled_pins by pinterest_pin_id
+      if (pin.source === 'user_images') {
+        const { error: scheduledPinsError } = await supabaseAdmin
+          .from('scheduled_pins')
+          .update(updateData)
+          .eq('pinterest_pin_id', pin.pinterest_pin_id)
+          .eq('user_id', userId);
+        updateError = scheduledPinsError;
+      }
+
+      if (!updateError && !userImagesError) {
         syncedCount++;
-        console.log(`📊 Auto-synced analytics for pin ${pin.pinterest_pin_id}`);
+        console.log(`📊 Auto-synced analytics for pin ${pin.pinterest_pin_id} (source: ${pin.source})`);
+      } else if (updateError || userImagesError) {
+        console.error(`❌ Error updating analytics for pin ${pin.pinterest_pin_id}:`, updateError || userImagesError);
       }
 
       // Rate limit: 1 second between requests
