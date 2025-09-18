@@ -71,8 +71,32 @@ async function processScheduledPins() {
 
     console.log(`📌 Found ${pinsToPost.length} pins to process`);
 
+    // Group pins by link to detect potential spam patterns
+    const linkGroups = {};
+    pinsToPost.forEach(pin => {
+      const link = pin.link || 'no-link';
+      if (!linkGroups[link]) linkGroups[link] = [];
+      linkGroups[link].push(pin);
+    });
+
+    // Process pins with anti-spam delays
     for (const pin of pinsToPost) {
       await processScheduledPin(pin);
+      
+      // Add delay between pins with the same link to avoid spam detection
+      const link = pin.link || 'no-link';
+      const pinsWithSameLink = linkGroups[link];
+      
+      if (pinsWithSameLink && pinsWithSameLink.length > 1) {
+        // If multiple pins have the same link, add extra delay
+        const delayMinutes = Math.min(5, pinsWithSameLink.length); // 1-5 minutes based on count
+        console.log(`⏱️ Adding ${delayMinutes} minute delay to avoid spam detection for link: ${link}`);
+        await new Promise(resolve => setTimeout(resolve, delayMinutes * 60 * 1000));
+      } else {
+        // Standard delay between different pins
+        console.log('⏱️ Adding 30 second delay between pins');
+        await new Promise(resolve => setTimeout(resolve, 30 * 1000));
+      }
     }
 
   } catch (error) {
@@ -196,9 +220,23 @@ async function handlePinError(pinId, errorMessage, currentRetryCount = 0) {
   const maxRetries = 3;
   const nextRetryCount = currentRetryCount + 1;
   
+  // Check if this is a spam-related error
+  const isSpamError = errorMessage.toLowerCase().includes('spam') || 
+                      errorMessage.toLowerCase().includes('blocked') ||
+                      errorMessage.toLowerCase().includes('redirect');
+  
   if (nextRetryCount <= maxRetries) {
-    // Calculate exponential backoff: 5min, 15min, 45min
-    const backoffMinutes = 5 * Math.pow(3, currentRetryCount);
+    // Calculate backoff based on error type
+    let backoffMinutes;
+    if (isSpamError) {
+      // Longer delays for spam errors: 30min, 90min, 270min (4.5 hours)
+      backoffMinutes = 30 * Math.pow(3, currentRetryCount);
+      console.log(`🚫 Spam-related error detected for pin ${pinId}, using extended retry delay`);
+    } else {
+      // Standard exponential backoff: 5min, 15min, 45min
+      backoffMinutes = 5 * Math.pow(3, currentRetryCount);
+    }
+    
     const nextRetryAt = new Date();
     nextRetryAt.setMinutes(nextRetryAt.getMinutes() + backoffMinutes);
     
@@ -213,7 +251,7 @@ async function handlePinError(pinId, errorMessage, currentRetryCount = 0) {
       })
       .eq('id', pinId);
       
-    console.log(`🔄 Pin ${pinId} will retry in ${backoffMinutes} minutes (attempt ${nextRetryCount}/${maxRetries})`);
+    console.log(`🔄 Pin ${pinId} will retry in ${backoffMinutes} minutes (attempt ${nextRetryCount}/${maxRetries}) - ${isSpamError ? 'SPAM ERROR' : 'STANDARD ERROR'}`);
   } else {
     // Max retries reached
     await supabaseAdmin
@@ -257,6 +295,67 @@ async function deductUserCredits(userId, amount) {
     }
   } catch (error) {
     console.error('Error in deductUserCredits:', error);
+  }
+}
+
+// Function to reschedule spam-blocked pins with better spacing
+async function rescheduleSpamBlockedPins(userId) {
+  try {
+    console.log(`🔄 Checking for spam-blocked pins to reschedule for user ${userId}`);
+    
+    // Get pins that failed due to spam
+    const { data: spamBlockedPins, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('status', 'failed')
+      .ilike('error_message', '%spam%')
+      .or('error_message.ilike.%blocked%,error_message.ilike.%redirect%')
+      .order('scheduled_for', { ascending: true });
+
+    if (fetchError || !spamBlockedPins || spamBlockedPins.length === 0) {
+      return;
+    }
+
+    console.log(`📌 Found ${spamBlockedPins.length} spam-blocked pins to reschedule`);
+
+    // Group by link to space them out properly
+    const linkGroups = {};
+    spamBlockedPins.forEach(pin => {
+      const link = pin.link || 'no-link';
+      if (!linkGroups[link]) linkGroups[link] = [];
+      linkGroups[link].push(pin);
+    });
+
+    // Reschedule with proper spacing
+    for (const [link, pins] of Object.entries(linkGroups)) {
+      if (pins.length > 1) {
+        console.log(`🔄 Rescheduling ${pins.length} pins with link: ${link}`);
+        
+        for (let i = 0; i < pins.length; i++) {
+          const pin = pins[i];
+          const newScheduleTime = new Date();
+          // Space pins with same link 2-6 hours apart
+          newScheduleTime.setHours(newScheduleTime.getHours() + 2 + (i * 2));
+          
+          await supabaseAdmin
+            .from('scheduled_pins')
+            .update({
+              status: 'scheduled',
+              scheduled_for: newScheduleTime.toISOString(),
+              error_message: null,
+              retry_count: 0,
+              next_retry_at: null,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', pin.id);
+            
+          console.log(`⏰ Rescheduled pin ${pin.id} for ${newScheduleTime.toLocaleString()}`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error rescheduling spam-blocked pins:', error);
   }
 }
 
@@ -2717,6 +2816,30 @@ app.post('/api/pinterest/test-analytics/:pinId', async (req, res) => {
     console.error('Error testing Pinterest analytics:', error);
     return res.status(500).json({ 
       error: 'Failed to test Pinterest analytics',
+      details: error.message 
+    });
+  }
+});
+
+// Reschedule spam-blocked pins with better spacing
+app.post('/api/pinterest/reschedule-spam-blocked', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    await rescheduleSpamBlockedPins(user.id);
+    
+    return res.json({
+      success: true,
+      message: 'Spam-blocked pins have been rescheduled with better spacing'
+    });
+  } catch (error) {
+    console.error('Error rescheduling spam-blocked pins:', error);
+    return res.status(500).json({ 
+      error: 'Failed to reschedule spam-blocked pins',
       details: error.message 
     });
   }
