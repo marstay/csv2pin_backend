@@ -2545,6 +2545,8 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
   const { account_id, force_sync = false } = req.body;
+  
+  console.log(`📊 Manual sync requested by user ${user.id} with force_sync: ${force_sync}`);
 
   try {
     const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
