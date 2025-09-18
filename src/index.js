@@ -56,6 +56,7 @@ async function processScheduledPins() {
       .in('status', ['scheduled', 'failed'])
       .lte('scheduled_for', new Date().toISOString())
       .or('next_retry_at.is.null,next_retry_at.lte.' + new Date().toISOString())
+      .is('deleted_at', null)
       .order('scheduled_for', { ascending: true })
       .limit(10); // Process 10 pins at a time
 
@@ -1614,6 +1615,7 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
         pinterest_accounts(account_name)
       `)
       .eq('user_id', user.id)
+      .is('deleted_at', null)
       .order('scheduled_for', { ascending: true });
 
     if (status) {
@@ -1659,12 +1661,13 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   } = req.body;
 
   try {
-    // First check if pin exists and belongs to user
+    // First check if pin exists and belongs to user (only active pins)
     const { data: existingPin, error: fetchError } = await supabaseAdmin
       .from('scheduled_pins')
       .select('*')
       .eq('id', id)
       .eq('user_id', user.id)
+      .is('deleted_at', null)
       .single();
 
     if (fetchError || !existingPin) {
@@ -1736,12 +1739,13 @@ app.delete('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Check if pin exists and belongs to user
+    // Check if pin exists and belongs to user (only active pins)
     const { data: existingPin, error: fetchError } = await supabaseAdmin
       .from('scheduled_pins')
       .select('*')
       .eq('id', id)
       .eq('user_id', user.id)
+      .is('deleted_at', null)
       .single();
 
     if (fetchError || !existingPin) {
@@ -2438,10 +2442,13 @@ app.delete('/api/pinterest/scheduled-pins/:id/permanent', async (req, res) => {
       return res.status(400).json({ error: 'Can only permanently delete cancelled or posted pins' });
     }
 
-    // Permanently delete the pin
+    // Soft delete the pin (preserve for analytics)
     const { error: deleteError } = await supabaseAdmin
       .from('scheduled_pins')
-      .delete()
+      .update({ 
+        deleted_at: new Date().toISOString(),
+        deleted_by: user.id 
+      })
       .eq('id', id)
       .eq('user_id', user.id);
 
