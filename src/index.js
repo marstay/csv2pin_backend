@@ -530,16 +530,45 @@ async function syncUserAnalytics(userId, accessToken) {
       
       // Handle different Pinterest API response formats
       let metrics = {};
+      console.log(`📊 Raw Pinterest API response for pin ${pin.pinterest_pin_id}:`, JSON.stringify(analyticsData, null, 2));
+      
+      // Try different response structures Pinterest might use
       if (analyticsData.all_time) {
         metrics = analyticsData.all_time;
+        console.log(`📊 Using all_time structure for pin ${pin.pinterest_pin_id}:`, metrics);
       } else if (analyticsData.summary) {
         metrics = analyticsData.summary;
+        console.log(`📊 Using summary structure for pin ${pin.pinterest_pin_id}:`, metrics);
       } else if (analyticsData.all && analyticsData.all.summary_metrics) {
         metrics = analyticsData.all.summary_metrics;
+        console.log(`📊 Using all.summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
+      } else if (analyticsData.all && analyticsData.all.daily_metrics) {
+        // Try daily metrics if summary_metrics is empty
+        const dailyMetrics = analyticsData.all.daily_metrics;
+        if (Array.isArray(dailyMetrics) && dailyMetrics.length > 0) {
+          // Sum up daily metrics
+          metrics = dailyMetrics.reduce((acc, day) => {
+            if (day.data_status === 'READY') {
+              acc.IMPRESSION = (acc.IMPRESSION || 0) + (day.metrics?.IMPRESSION || 0);
+              acc.SAVE = (acc.SAVE || 0) + (day.metrics?.SAVE || 0);
+              acc.PIN_CLICK = (acc.PIN_CLICK || 0) + (day.metrics?.PIN_CLICK || 0);
+              acc.OUTBOUND_CLICK = (acc.OUTBOUND_CLICK || 0) + (day.metrics?.OUTBOUND_CLICK || 0);
+              acc.CLOSEUP = (acc.CLOSEUP || 0) + (day.metrics?.CLOSEUP || 0);
+            }
+            return acc;
+          }, {});
+          console.log(`📊 Using summed daily_metrics for pin ${pin.pinterest_pin_id}:`, metrics);
+        }
+      } else if (analyticsData.all) {
+        // Try the all object directly
+        metrics = analyticsData.all;
+        console.log(`📊 Using all structure directly for pin ${pin.pinterest_pin_id}:`, metrics);
       } else if (analyticsData.summary_metrics) {
         metrics = analyticsData.summary_metrics;
+        console.log(`📊 Using summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
       } else {
         metrics = analyticsData;
+        console.log(`📊 Using root structure for pin ${pin.pinterest_pin_id}:`, metrics);
       }
       
       const impressions = metrics.IMPRESSION || 0;
@@ -547,6 +576,10 @@ async function syncUserAnalytics(userId, accessToken) {
       const saves = metrics.SAVE || 0;
       const pinClicks = metrics.PIN_CLICK || 0;
       const closeupViews = metrics.CLOSEUP || 0;
+      
+      console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, {
+        impressions, outboundClicks, saves, pinClicks, closeupViews, rawMetrics: metrics
+      });
       
       // Calculate engagement metrics
       const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) * 100 : 0;
@@ -2667,19 +2700,45 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           
           // Handle different Pinterest API response formats
           let metrics = {};
+          
+          // Try different response structures Pinterest might use
           if (analyticsData.all_time) {
             metrics = analyticsData.all_time;
+            console.log(`📊 Using all_time structure for pin ${pin.pinterest_pin_id}:`, metrics);
           } else if (analyticsData.summary) {
             metrics = analyticsData.summary;
+            console.log(`📊 Using summary structure for pin ${pin.pinterest_pin_id}:`, metrics);
           } else if (analyticsData.all && analyticsData.all.summary_metrics) {
             metrics = analyticsData.all.summary_metrics;
+            console.log(`📊 Using all.summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
+          } else if (analyticsData.all && analyticsData.all.daily_metrics) {
+            // Try daily metrics if summary_metrics is empty
+            const dailyMetrics = analyticsData.all.daily_metrics;
+            if (Array.isArray(dailyMetrics) && dailyMetrics.length > 0) {
+              // Sum up daily metrics
+              metrics = dailyMetrics.reduce((acc, day) => {
+                if (day.data_status === 'READY') {
+                  acc.IMPRESSION = (acc.IMPRESSION || 0) + (day.metrics?.IMPRESSION || 0);
+                  acc.SAVE = (acc.SAVE || 0) + (day.metrics?.SAVE || 0);
+                  acc.PIN_CLICK = (acc.PIN_CLICK || 0) + (day.metrics?.PIN_CLICK || 0);
+                  acc.OUTBOUND_CLICK = (acc.OUTBOUND_CLICK || 0) + (day.metrics?.OUTBOUND_CLICK || 0);
+                  acc.CLOSEUP = (acc.CLOSEUP || 0) + (day.metrics?.CLOSEUP || 0);
+                }
+                return acc;
+              }, {});
+              console.log(`📊 Using summed daily_metrics for pin ${pin.pinterest_pin_id}:`, metrics);
+            }
+          } else if (analyticsData.all) {
+            // Try the all object directly
+            metrics = analyticsData.all;
+            console.log(`📊 Using all structure directly for pin ${pin.pinterest_pin_id}:`, metrics);
           } else if (analyticsData.summary_metrics) {
             metrics = analyticsData.summary_metrics;
+            console.log(`📊 Using summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
           } else {
             metrics = analyticsData;
+            console.log(`📊 Using root structure for pin ${pin.pinterest_pin_id}:`, metrics);
           }
-          
-          console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, metrics);
           
           const impressions = metrics.IMPRESSION || 0;
           const outboundClicks = metrics.OUTBOUND_CLICK || 0;
@@ -2687,8 +2746,8 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           const pinClicks = metrics.PIN_CLICK || 0;
           const closeupViews = metrics.CLOSEUP || 0;
           
-          console.log(`📊 Parsed values for pin ${pin.pinterest_pin_id}:`, {
-            impressions, outboundClicks, saves, pinClicks, closeupViews
+          console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, {
+            impressions, outboundClicks, saves, pinClicks, closeupViews, rawMetrics: metrics
           });
 
           // Calculate engagement metrics
@@ -2857,23 +2916,61 @@ app.post('/api/pinterest/test-analytics/:pinId', async (req, res) => {
         
         // Handle different Pinterest API response formats
         let metrics = {};
+        console.log(`📊 Raw Pinterest API response for ${range.name}:`, JSON.stringify(analyticsData, null, 2));
+        
+        // Try different response structures Pinterest might use
         if (analyticsData.all_time) {
           metrics = analyticsData.all_time;
+          console.log(`📊 Using all_time structure:`, metrics);
         } else if (analyticsData.summary) {
           metrics = analyticsData.summary;
+          console.log(`📊 Using summary structure:`, metrics);
         } else if (analyticsData.all && analyticsData.all.summary_metrics) {
           metrics = analyticsData.all.summary_metrics;
+          console.log(`📊 Using all.summary_metrics structure:`, metrics);
+        } else if (analyticsData.all && analyticsData.all.daily_metrics) {
+          // Try daily metrics if summary_metrics is empty
+          const dailyMetrics = analyticsData.all.daily_metrics;
+          if (Array.isArray(dailyMetrics) && dailyMetrics.length > 0) {
+            // Sum up daily metrics
+            metrics = dailyMetrics.reduce((acc, day) => {
+              if (day.data_status === 'READY') {
+                acc.IMPRESSION = (acc.IMPRESSION || 0) + (day.metrics?.IMPRESSION || 0);
+                acc.SAVE = (acc.SAVE || 0) + (day.metrics?.SAVE || 0);
+                acc.PIN_CLICK = (acc.PIN_CLICK || 0) + (day.metrics?.PIN_CLICK || 0);
+                acc.OUTBOUND_CLICK = (acc.OUTBOUND_CLICK || 0) + (day.metrics?.OUTBOUND_CLICK || 0);
+                acc.CLOSEUP = (acc.CLOSEUP || 0) + (day.metrics?.CLOSEUP || 0);
+              }
+              return acc;
+            }, {});
+            console.log(`📊 Using summed daily_metrics:`, metrics);
+          }
+        } else if (analyticsData.all) {
+          // Try the all object directly
+          metrics = analyticsData.all;
+          console.log(`📊 Using all structure directly:`, metrics);
         } else if (analyticsData.summary_metrics) {
           metrics = analyticsData.summary_metrics;
+          console.log(`📊 Using summary_metrics structure:`, metrics);
         } else {
           metrics = analyticsData;
+          console.log(`📊 Using root structure:`, metrics);
         }
 
+        const impressions = metrics.IMPRESSION || 0;
+        const saves = metrics.SAVE || 0;
+        const pinClicks = metrics.PIN_CLICK || 0;
+        const outboundClicks = metrics.OUTBOUND_CLICK || 0;
+        
+        console.log(`📊 Extracted metrics for ${range.name}:`, {
+          impressions, saves, pinClicks, outboundClicks, rawMetrics: metrics
+        });
+
         results[range.name] = {
-          impressions: metrics.IMPRESSION || 0,
-          saves: metrics.SAVE || 0,
-          pin_clicks: metrics.PIN_CLICK || 0,
-          outbound_clicks: metrics.OUTBOUND_CLICK || 0,
+          impressions,
+          saves,
+          pin_clicks: pinClicks,
+          outbound_clicks: outboundClicks,
           raw_response: analyticsData
         };
       } else {
