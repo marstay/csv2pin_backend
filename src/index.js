@@ -1058,7 +1058,7 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
   const { content, type } = req.body; // type: 'title' or 'description'
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
   const prompt = type === 'title'
-    ? `Write a concise, curiosity-driven Pinterest pin title (max 100 characters) for this content. The title should make people want to click to learn more. It should include emotional triggers, urgency, or questions where possible. Avoid generic phrases and focus on being unique and compelling. Only return the title, nothing else. Do not include any quotes or special characters in your response:\n${content}`
+    ? `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Include emotional triggers, urgency, numbers, or questions where possible. Make it descriptive and specific rather than generic. Use engaging words that create intrigue. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:\n${content}`
     : `Write an engaging Pinterest pin description (max 450 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Avoid phrases like "+visit site+", "+click the link+", or adding URLs. Include 4–6 relevant hashtags at the end. Only return the description, nothing else:\n${content}`;
   try {
     const completion = await openai.chat.completions.create({
@@ -1069,8 +1069,8 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
     });
     let result = completion.choices[0].message.content.trim();
     if (type === 'title') {
-      // Remove quotes and special characters except basic punctuation
-      result = result.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>\/?]+/g, '').slice(0, 100);
+      // Remove only problematic characters, keep basic punctuation like . , ! ? -
+      result = result.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '').slice(0, 100);
     }
     if (type === 'description') result = sanitizeDescription(result);
     res.json({ result });
@@ -1085,7 +1085,7 @@ app.post('/api/analyze-image', requireUser, async (req, res) => {
     const { imageUrl, urlHint } = req.body;
     if (!imageUrl) return res.status(400).json({ error: 'Missing imageUrl' });
 
-    const systemPrompt = `You are helping generate Pinterest pin metadata. First, read any visible text in the image (OCR). Then propose a compelling title (<=100 chars) and an engaging description (<=450 chars) suitable for Pinterest. The description must include 4–6 relevant hashtags at the end. Do not include URLs or phrases like \"visit example.com\", \"click the link\", or similar calls to visit a site. If a destination URL context is provided, use it only to infer keywords, but never include the URL or a CTA. Return JSON with keys: extractedText, title, description. Do not include markdown, code fences, or commentary.`;
+    const systemPrompt = `You are helping generate Pinterest pin metadata. First, read any visible text in the image (OCR). Then propose a compelling title (aim for 80-100 characters, maximum 100) and an engaging description (<=450 chars) suitable for Pinterest. The title should be curiosity-driven, descriptive, and use emotional triggers or questions to make people want to click. The description must include 4–6 relevant hashtags at the end. Do not include URLs or phrases like \"visit example.com\", \"click the link\", or similar calls to visit a site. If a destination URL context is provided, use it only to infer keywords, but never include the URL or a CTA. Return JSON with keys: extractedText, title, description. Do not include markdown, code fences, or commentary.`;
 
     const userPrompt = `Image URL: ${imageUrl}\n${urlHint ? `Destination URL (context): ${urlHint}` : ''}`;
 
@@ -1122,8 +1122,8 @@ app.post('/api/analyze-image', requireUser, async (req, res) => {
       extracted.description = sanitizeDescription(lines.slice(1).join(' '));
     }
 
-    // Final cleanup for title
-    extracted.title = extracted.title.replace(/["'`~!@#$%^&*()_+=\[\]{}|;:<>\/?]+/g, '').slice(0, 100);
+    // Final cleanup for title - keep basic punctuation like . , ! ? -
+    extracted.title = extracted.title.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '').slice(0, 100);
 
     return res.json(extracted);
   } catch (err) {
