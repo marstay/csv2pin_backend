@@ -1055,10 +1055,15 @@ app.post('/api/export-pin', async (req, res) => {
 
 // POST /api/generate-field (requires login; credits handled on frontend)
 app.post('/api/generate-field', requireUser, async (req, res) => {
-  const { content, type } = req.body; // type: 'title' or 'description'
+  const { content, type, style } = req.body; // type: 'title' or 'description'; style: optional hint
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
+  const isShortTitle = type === 'title' && style === 'short_50';
   const prompt = type === 'title'
-    ? `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Include emotional triggers, urgency, numbers, or questions where possible. Make it descriptive and specific rather than generic. Use engaging words that create intrigue. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:\n${content}`
+    ? (
+      isShortTitle
+        ? `Write a concise Pinterest pin title (max 50 characters). Focus on the main keyword and benefit. No quotes or hashtags. Return only the title.\n${content}`
+        : `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Include emotional triggers, urgency, numbers, or questions where possible. Make it descriptive and specific rather than generic. Use engaging words that create intrigue. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:\n${content}`
+    )
     : `Write an engaging Pinterest pin description (max 450 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Avoid phrases like "+visit site+", "+click the link+", or adding URLs. Include 4–6 relevant hashtags at the end. Only return the description, nothing else:\n${content}`;
   try {
     const completion = await openai.chat.completions.create({
@@ -1070,7 +1075,16 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
     let result = completion.choices[0].message.content.trim();
     if (type === 'title') {
       // Remove only problematic characters, keep basic punctuation like . , ! ? -
-      result = result.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '').slice(0, 100);
+      result = result.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '');
+      // Enforce 50 chars hard cap for short_50 style
+      if (isShortTitle && result.length > 50) {
+        const cut = result.lastIndexOf(' ', 49);
+        result = (cut > 20 ? result.slice(0, cut) : result.slice(0, 50)).trim();
+      }
+      // Otherwise keep previous 100-char soft cap
+      if (!isShortTitle && result.length > 100) {
+        result = result.slice(0, 100);
+      }
     }
     if (type === 'description') result = sanitizeDescription(result);
     res.json({ result });
