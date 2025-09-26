@@ -2608,23 +2608,65 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
       return res.status(400).json({ error: 'No Pinterest access token found' });
     }
 
-    // Get all posted pins for this user that have Pinterest pin IDs
-    const { data: postedPins, error: fetchError } = await supabaseAdmin
-      .from('scheduled_pins')
-      .select('id, pinterest_pin_id, metrics_last_updated')
-      .eq('user_id', user.id)
-      .eq('status', 'posted')
-      .not('pinterest_pin_id', 'is', null)
-      .limit(50); // Limit to avoid rate limits
+    // Get posted pins with pagination when force_sync is requested
+    let postedPins = [];
+    let userImagePins = [];
+    let fetchError = null;
+    let userImagesError = null;
 
-    // Also get pins from user_images that might not be in scheduled_pins
-    const { data: userImagePins, error: userImagesError } = await supabaseAdmin
-      .from('user_images')
-      .select('id, pinterest_pin_id, metrics_last_updated')
-      .eq('user_id', user.id)
-      .eq('pinterest_uploaded', true)
-      .not('pinterest_pin_id', 'is', null)
-      .limit(50);
+    if (force_sync) {
+      const pageSize = 200; // fetch in batches to avoid memory spikes
+      let from = 0;
+      while (true) {
+        const { data, error } = await supabaseAdmin
+          .from('scheduled_pins')
+          .select('id, pinterest_pin_id, metrics_last_updated')
+          .eq('user_id', user.id)
+          .eq('status', 'posted')
+          .not('pinterest_pin_id', 'is', null)
+          .range(from, from + pageSize - 1);
+        if (error) { fetchError = error; break; }
+        if (!data || data.length === 0) break;
+        postedPins = postedPins.concat(data);
+        from += pageSize;
+      }
+
+      from = 0;
+      while (true) {
+        const { data, error } = await supabaseAdmin
+          .from('user_images')
+          .select('id, pinterest_pin_id, metrics_last_updated')
+          .eq('user_id', user.id)
+          .eq('pinterest_uploaded', true)
+          .not('pinterest_pin_id', 'is', null)
+          .range(from, from + pageSize - 1);
+        if (error) { userImagesError = error; break; }
+        if (!data || data.length === 0) break;
+        userImagePins = userImagePins.concat(data);
+        from += pageSize;
+      }
+    } else {
+      // Non-force path keeps a conservative limit to respect rate limits
+      const postedResp = await supabaseAdmin
+        .from('scheduled_pins')
+        .select('id, pinterest_pin_id, metrics_last_updated')
+        .eq('user_id', user.id)
+        .eq('status', 'posted')
+        .not('pinterest_pin_id', 'is', null)
+        .limit(50);
+      postedPins = postedResp.data || [];
+      fetchError = postedResp.error;
+
+      const userImgResp = await supabaseAdmin
+        .from('user_images')
+        .select('id, pinterest_pin_id, metrics_last_updated')
+        .eq('user_id', user.id)
+        .eq('pinterest_uploaded', true)
+        .not('pinterest_pin_id', 'is', null)
+        .limit(50);
+      userImagePins = userImgResp.data || [];
+      userImagesError = userImgResp.error;
+    }
 
     console.log(`📊 Found ${postedPins?.length || 0} pins in scheduled_pins table`);
     console.log(`📊 Found ${userImagePins?.length || 0} pins in user_images table`);
