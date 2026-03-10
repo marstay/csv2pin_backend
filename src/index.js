@@ -41,6 +41,46 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+function extractMetaFromHtml(html, url) {
+  let title = '';
+  let description = '';
+  try {
+    const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+    if (titleMatch && titleMatch[1]) {
+      title = titleMatch[1].trim();
+    }
+    const ogTitleMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']*)["'][^>]*>/i);
+    if (ogTitleMatch && ogTitleMatch[1]) {
+      title = ogTitleMatch[1].trim();
+    }
+    const descMatch = html.match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']*)["'][^>]*>/i);
+    if (descMatch && descMatch[1]) {
+      description = descMatch[1].trim();
+    }
+    const ogDescMatch = html.match(/<meta[^>]+property=["']og:description["'][^>]*content=["']([^"']*)["'][^>]*>/i);
+    if (ogDescMatch && ogDescMatch[1]) {
+      description = ogDescMatch[1].trim();
+    }
+  } catch (_) {
+    // best-effort only
+  }
+
+  let domain = '';
+  let keyword = '';
+  try {
+    const u = new URL(url);
+    domain = u.hostname;
+    const parts = (u.pathname || '').split('/').filter(Boolean);
+    const last = parts[parts.length - 1] || '';
+    keyword = last.replace(/[-_]/g, ' ').replace(/\.[a-zA-Z0-9]+$/, '').trim();
+  } catch (_) {
+    domain = '';
+    keyword = '';
+  }
+
+  return { title, description, domain, keyword };
+}
+
 // Background job processor for scheduled pins
 async function processScheduledPins() {
   console.log('🔄 Processing scheduled pins...');
@@ -723,6 +763,102 @@ function sanitizeDescription(input) {
 }
 
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
+const NANO_BANANA_API_URL = process.env.NANO_BANANA_API_URL;
+const NANO_BANANA_API_KEY = process.env.NANO_BANANA_API_KEY;
+
+async function generateImageWithNanoBanana(prompt) {
+  if (!NANO_BANANA_API_URL || !NANO_BANANA_API_KEY) {
+    console.warn('Nano Banana 2 API not configured (NANO_BANANA_API_URL / NANO_BANANA_API_KEY missing)');
+    return null;
+  }
+
+  const baseUrl = NANO_BANANA_API_URL.replace(/\/$/, ''); // e.g. https://api.kie.ai/api/v1/jobs
+
+  try {
+    // 1) Create async generation task
+    const createRes = await fetch(`${baseUrl}/createTask`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${NANO_BANANA_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'nano-banana-2',
+        // We don't strictly need a callback for this flow; we will poll instead.
+        input: {
+          prompt,
+          aspect_ratio: '9:16',
+          google_search: false,
+          resolution: '1K',
+          output_format: 'png',
+        },
+      }),
+    });
+
+    const createJson = await createRes.json().catch(() => ({}));
+    if (!createRes.ok || createJson.code !== 200 || !createJson.data?.taskId) {
+      console.error('Nano Banana 2 createTask error:', createRes.status, createJson);
+      return null;
+    }
+
+    const taskId = createJson.data.taskId;
+
+    // 2) Poll recordInfo until success / fail / timeout
+    const maxAttempts = 20; // e.g. up to ~40s (20 * 2s)
+    const delayMs = 2000;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise((r) => setTimeout(r, delayMs));
+
+      const infoRes = await fetch(
+        `${baseUrl}/recordInfo?taskId=${encodeURIComponent(taskId)}`,
+        {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${NANO_BANANA_API_KEY}`,
+          },
+        }
+      );
+
+      const infoJson = await infoRes.json().catch(() => ({}));
+      if (!infoRes.ok || infoJson.code !== 200 || !infoJson.data) {
+        console.warn('Nano Banana 2 recordInfo error:', infoRes.status, infoJson);
+        continue;
+      }
+
+      const state = infoJson.data.state;
+      if (state === 'waiting' || state === 'queuing' || state === 'generating') {
+        continue;
+      }
+
+      if (state === 'fail') {
+        console.error('Nano Banana 2 generation failed:', infoJson.data.failCode, infoJson.data.failMsg);
+        return null;
+      }
+
+      if (state === 'success') {
+        try {
+          const resultJsonStr = infoJson.data.resultJson || '{}';
+          const parsed = JSON.parse(resultJsonStr);
+          const urls = parsed.resultUrls;
+          if (Array.isArray(urls) && urls.length > 0 && typeof urls[0] === 'string') {
+            return urls[0];
+          }
+        } catch (e) {
+          console.error('Nano Banana 2 resultJson parse error:', e);
+        }
+        console.warn('Nano Banana 2 success but no resultUrls found');
+        return null;
+      }
+    }
+
+    console.warn('Nano Banana 2 generation timed out for prompt');
+    return null;
+  } catch (err) {
+    console.error('Nano Banana 2 API flow failed:', err);
+    return null;
+  }
+}
 
 // POST /api/generate-image
 app.post('/api/generate-image', async (req, res) => {
@@ -801,6 +937,198 @@ app.post('/api/generate-image', async (req, res) => {
     }
   } catch (err) {
     return res.status(500).json({ error: 'Error calling Replicate API', details: err.message });
+  }
+});
+
+// --- URL → Pin helper endpoints ---
+
+app.post('/api/urltopin/scrape', async (req, res) => {
+  try {
+    const { url } = req.body || {};
+    if (!url) return res.status(400).json({ error: 'Missing url' });
+
+    const response = await fetch(url, { redirect: 'follow' });
+    if (!response.ok) {
+      return res.status(500).json({ error: `Failed to fetch URL: ${response.status}` });
+    }
+    const html = await response.text();
+    const meta = extractMetaFromHtml(html, url);
+    return res.json(meta);
+  } catch (err) {
+    console.error('urltopin scrape error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/urltopin/generate', requireUser, async (req, res) => {
+  try {
+    const { url, styles, articleData } = req.body || {};
+    if (!url || !Array.isArray(styles) || styles.length === 0) {
+      return res.status(400).json({ error: 'Missing url or styles' });
+    }
+
+    const base = articleData || extractMetaFromHtml('', url);
+    const year = new Date().getFullYear();
+    const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
+    const keyword = base.keyword || '';
+    const topic = base.title || 'Does Brown Sugar Expire?';
+
+    const styleMeta = {
+      clean_appetizing: 'Clean & appetizing food photography, soft beige background, warm natural light, premium blog style. Include a bold, legible Pinterest headline, a small subheadline, and small source text with the website URL at the bottom.',
+      curiosity_shock: 'Bold, dramatic, high-contrast image that creates shock and curiosity, strong focal point. Use large, high-contrast headline text that feels urgent or surprising, plus bottom source text with the website URL.',
+      money_saving: 'Visual money-saving angle, dollar bills or savings motif combined with the main ingredient. Add punchy text that emphasizes saving money or not wasting food, and include small source text with the website URL at the bottom.',
+      minimal_typography: 'Minimal, elegant layout with lots of whitespace and a single strong visual object. Use clean, modern typography with a short, bold statement, and subtle bottom text showing the website URL.',
+      question_style: 'Image that visually represents a question or dilemma, with subtle question-mark elements. Headline text should be a direct question that invites clicks, plus bottom source text with the website URL.',
+      before_after: 'Split before/after layout with clear visual contrast between “wrong” and “right” or “old” and “fresh”. Overlay short text on each side to label before vs after, and include small source text with the website URL at the bottom.',
+      cozy_baking: 'Cozy kitchen scene, warm tones, lifestyle baking props like bowls, spoons, and ingredients. Friendly, welcoming text that matches recipe or kitchen content, with subtle bottom text showing the website URL.',
+      viral_curiosity: 'Dramatic, story-like composition that feels like a personal experiment or confession. Use story-style text like “I tried X for Y days…” to drive curiosity, and add bottom source text with the website URL.',
+      clumpy_fix: 'Practical, how-to style with clumpy vs fixed ingredient shown clearly. Add clear how-to text that promises a fix or simple method, plus small bottom text with the website URL.',
+      minimal_elegant: 'Soft, premium, editorial-style image with simple composition and elegant lighting. Elegant, refined typography suitable for a premium brand or blog, with discreet bottom text showing the website URL.',
+    };
+
+    const stylePrompts = [];
+
+    for (const id of styles) {
+      const styleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
+      try {
+        const systemPrompt =
+          'You create detailed text-to-image prompts that generate full Pinterest pin images, including BOTH background visuals and on-image text. ' +
+          'Each prompt must clearly state at the beginning: "Vertical Pinterest pin 1000x1500 px". ' +
+          'Describe a 9:16 Pinterest pin: eye-catching background, clear focal point, and bold, highly readable typography. ' +
+          'Explicitly describe the main headline text, any subheadline, and small branding or source text that includes the website URL at the bottom of the pin (e.g. bottom center). ' +
+          'The entire design must remain readable on mobile screens and feel like a high-performing Pinterest pin. ' +
+          'The prompt should be 2–5 sentences, plain text only.';
+
+        const userPrompt =
+          `Article title: ${topic}\n` +
+          (base.description ? `Article description: ${base.description}\n` : '') +
+          (keyword ? `Main keyword or ingredient: ${keyword}\n` : '') +
+          `Domain / branding: ${domain}\n` +
+          `Year/context: ${year}\n` +
+          `Desired visual style for the Pinterest pin: ${styleDescription}\n\n` +
+          'Write a single, self-contained text-to-image prompt for a complete Pinterest pin (background plus on-image text). ' +
+          'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
+          'Describe the background scene, the exact headline and subheadline text to show, their position on the pin, and how the typography should look. ' +
+          'Also describe small source text at the bottom that displays the website URL (use the domain provided above).';
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.8,
+          max_tokens: 260,
+        });
+
+        const imagePrompt =
+          completion.choices?.[0]?.message?.content?.trim() ||
+          `Vertical Pinterest pin 1000x1500 px, ${styleDescription} about "${topic}". Main concept: ${keyword ||
+            'blog article'}. No text in the image.`;
+
+        stylePrompts.push({
+          id,
+          label: id,
+          prompt: imagePrompt,
+        });
+      } catch (promptErr) {
+        console.warn('urltopin prompt generation error:', promptErr.message || promptErr);
+        stylePrompts.push({
+          id,
+          label: id,
+          prompt: `Vertical Pinterest pin 1000x1500 px. High quality, modern design about "${topic}". Domain text: ${domain}. Year: ${year}. Main concept keyword: ${keyword ||
+            'blog article'}. No text baked into the image, only background photography and design.`,
+        });
+      }
+    }
+
+    const pins = [];
+
+    for (const sp of stylePrompts) {
+      // First, try Nano Banana 2 with the AI-generated image prompt
+      let imageUrl = '';
+      try {
+        imageUrl = await generateImageWithNanoBanana(sp.prompt);
+      } catch (e) {
+        console.warn('urltopin nano-banana image generation error:', e.message || e);
+      }
+
+      // Fallback to existing Replicate-based generator if Nano Banana is not configured or fails
+      if (!imageUrl) {
+        try {
+          const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: topic }),
+          });
+          if (imgRes.ok) {
+            const imgJson = await imgRes.json();
+            imageUrl = imgJson.imageUrl || '';
+          }
+        } catch (e) {
+          console.warn('urltopin replicate image generation error:', e.message || e);
+        }
+      }
+
+      // Generate title and description using existing /api/generate-field
+      let pinTitle = topic;
+      let pinDescription = base.description || '';
+      let hashtags = [];
+
+      try {
+        const tokenHeader = req.headers.authorization || '';
+
+        const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
+        const titleRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': tokenHeader,
+          },
+          body: JSON.stringify({ content: titlePrompt, type: 'title' }),
+        });
+        if (titleRes.ok) {
+          const titleJson = await titleRes.json();
+          if (titleJson.result) pinTitle = titleJson.result;
+        }
+
+        const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
+        const descRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': tokenHeader,
+          },
+          body: JSON.stringify({ content: descPrompt, type: 'description' }),
+        });
+        if (descRes.ok) {
+          const descJson = await descRes.json();
+          if (descJson.result) {
+            pinDescription = descJson.result;
+            const tagMatches = pinDescription.match(/#[\w-]+/g);
+            if (tagMatches) hashtags = tagMatches.slice(0, 10);
+          }
+        }
+      } catch (e) {
+        console.warn('urltopin metadata generation error:', e.message || e);
+      }
+
+      pins.push({
+        styleId: sp.id,
+        styleLabel: sp.label,
+        imagePrompt: sp.prompt,
+        imageUrl,
+        title: pinTitle,
+        description: pinDescription,
+        hashtags,
+        link: url,
+      });
+    }
+
+    return res.json({ pins });
+  } catch (err) {
+    console.error('urltopin generate error:', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
