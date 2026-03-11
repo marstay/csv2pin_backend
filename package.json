@@ -102,6 +102,7 @@
     "js-yaml": "^4.1.0",
     "jsbn": "^1.1.0",
     "json-parse-even-better-errors": "^2.3.1",
+    "jszip": "^3.10.1",
     "lines-and-columns": "^1.2.4",
     "lru-cache": "^7.18.3",
     "math-intrinsics": "^1.1.0",

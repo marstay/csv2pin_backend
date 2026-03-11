@@ -5,7 +5,7 @@ import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
-import Stripe from 'stripe';
+import JSZip from 'jszip';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -13,9 +13,282 @@ console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: '2022-11-15',
-}) : null;
+
+// Dodo Payments config
+const DODO_BASE_URL = (process.env.DODO_BASE_URL || 'https://test.dodopayments.com').replace(/\/$/, '');
+const DODO_API_KEY = process.env.DODO_API_KEY || process.env.DODO_PAYMENTS_API_KEY || '';
+
+// --- Plan & usage helpers (pin_usage / metadata_usage) ---
+
+const PLAN_PIN_LIMITS = {
+  free: 10,
+  creator: 100,
+  pro: 400,
+  agency: 1000,
+};
+
+const PLAN_METADATA_LIMITS = {
+  free: 500,
+  creator: 5000,
+  pro: 20000,
+  agency: 100000,
+};
+
+function currentYearMonthDate() {
+  const now = new Date();
+  // Use UTC month start to avoid timezone edge cases with Postgres date
+  const monthStartUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  return monthStartUtc.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+}
+
+async function getActiveSubscriptionForUser(userId) {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('plan_type, pins_limit_per_month')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      console.warn('billing_subscriptions fetch error:', error.message || error);
+      return null;
+    }
+
+    if (!data || data.length === 0) return null;
+    return data[0];
+  } catch (err) {
+    console.warn('getActiveSubscriptionForUser error:', err.message || err);
+    return null;
+  }
+}
+
+// Serialize pin consumption per user so concurrent requests (e.g. 2+ styles in URL→Pin)
+// don't all read the same pins_used and only write one increment.
+const pinUsageLocks = new Map();
+
+async function consumePinUsage(userId, pinsToConsume) {
+  const key = String(userId);
+  let promise = pinUsageLocks.get(key);
+  const run = async () => {
+    const yearMonth = currentYearMonthDate();
+
+    const sub = await getActiveSubscriptionForUser(userId);
+    const planType = sub?.plan_type || 'free';
+    const planPinsLimit =
+      typeof sub?.pins_limit_per_month === 'number' && sub.pins_limit_per_month > 0
+        ? sub.pins_limit_per_month
+        : PLAN_PIN_LIMITS[planType] || PLAN_PIN_LIMITS.free;
+
+    try {
+      const { data: usageRows, error: usageError } = await supabaseAdmin
+        .from('pin_usage')
+        .select('pins_used')
+        .eq('user_id', userId)
+        .eq('year_month', yearMonth)
+        .limit(1);
+
+      if (usageError) {
+        console.warn('pin_usage fetch error:', usageError.message || usageError);
+      }
+
+      const currentUsed = usageRows && usageRows.length ? usageRows[0].pins_used || 0 : 0;
+      const newUsed = currentUsed + pinsToConsume;
+
+      if (newUsed > planPinsLimit) {
+        return {
+          allowed: false,
+          planType,
+          planPinsLimit,
+          currentUsed,
+          wouldUse: pinsToConsume,
+        };
+      }
+
+      const { error: upsertError } = await supabaseAdmin
+        .from('pin_usage')
+        .upsert(
+          {
+            user_id: userId,
+            year_month: yearMonth,
+            pins_used: newUsed,
+          },
+          { onConflict: 'user_id,year_month' }
+        );
+
+      if (upsertError) {
+        console.warn('pin_usage upsert error:', upsertError.message || upsertError);
+      }
+
+      return {
+        allowed: true,
+        planType,
+        planPinsLimit,
+        previousUsed: currentUsed,
+        newUsed,
+      };
+    } catch (err) {
+      console.warn('consumePinUsage error (falling back to allow):', err.message || err);
+      return {
+        allowed: true,
+        planType,
+        planPinsLimit,
+        previousUsed: 0,
+        newUsed: pinsToConsume,
+      };
+    }
+  };
+
+  promise = promise ? promise.then(() => run()) : run();
+  pinUsageLocks.set(key, promise);
+  const result = await promise;
+  // Only remove the lock if no one else chained after us (same promise still in map)
+  if (pinUsageLocks.get(key) === promise) {
+    pinUsageLocks.delete(key);
+  }
+  return result;
+}
+
+async function recordMetadataUsage(userId, calls = 1) {
+  const yearMonth = currentYearMonthDate();
+
+  const sub = await getActiveSubscriptionForUser(userId);
+  const planType = sub?.plan_type || 'free';
+  const planMetaLimit = PLAN_METADATA_LIMITS[planType] || PLAN_METADATA_LIMITS.free;
+
+  try {
+    const { data: usageRows, error: usageError } = await supabaseAdmin
+      .from('metadata_usage')
+      .select('metadata_calls')
+      .eq('user_id', userId)
+      .eq('year_month', yearMonth)
+      .limit(1);
+
+    if (usageError) {
+      console.warn('metadata_usage fetch error:', usageError.message || usageError);
+    }
+
+    const currentCalls = usageRows && usageRows.length ? usageRows[0].metadata_calls || 0 : 0;
+    const newCalls = currentCalls + calls;
+
+    const { error: upsertError } = await supabaseAdmin
+      .from('metadata_usage')
+      .upsert(
+        {
+          user_id: userId,
+          year_month: yearMonth,
+          metadata_calls: newCalls,
+        },
+        { onConflict: 'user_id,year_month' }
+      );
+
+    if (upsertError) {
+      console.warn('metadata_usage upsert error:', upsertError.message || upsertError);
+    }
+
+    if (newCalls > planMetaLimit) {
+      console.warn(
+        `User ${userId} exceeded soft metadata limit: ${newCalls}/${planMetaLimit} calls for plan ${planType}`
+      );
+    }
+
+    return {
+      planType,
+      planMetaLimit,
+      previousCalls: currentCalls,
+      newCalls,
+    };
+  } catch (err) {
+    console.warn('recordMetadataUsage error:', err.message || err);
+    return {
+      planType,
+      planMetaLimit,
+      previousCalls: 0,
+      newCalls: calls,
+    };
+  }
+}
+
+async function getCurrentUsageSnapshot(userId) {
+  const yearMonth = currentYearMonthDate();
+
+  // Active subscription row (if any)
+  const subscription = await getActiveSubscriptionForUser(userId);
+  const planType = subscription?.plan_type || 'free';
+  const planPinsLimit =
+    typeof subscription?.pins_limit_per_month === 'number' && subscription.pins_limit_per_month > 0
+      ? subscription.pins_limit_per_month
+      : PLAN_PIN_LIMITS[planType] || PLAN_PIN_LIMITS.free;
+
+  // Profile info (for email, created_at, etc.)
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('id, email, plan_type')
+    .eq('id', userId)
+    .single();
+
+  // Pin usage for current month
+  let pinsUsed = 0;
+  try {
+    const { data: pinUsageRow, error: pinError } = await supabaseAdmin
+      .from('pin_usage')
+      .select('pins_used')
+      .eq('user_id', userId)
+      .eq('year_month', yearMonth)
+      .single();
+    if (pinError) {
+      // Ignore "no rows" error, log others
+      if (pinError.code !== 'PGRST116') {
+        console.warn('pin_usage single error:', pinError.message || pinError);
+      }
+    } else if (pinUsageRow) {
+      pinsUsed = pinUsageRow.pins_used || 0;
+    }
+  } catch (e) {
+    console.warn('pin_usage fetch unexpected error:', e.message || e);
+  }
+
+  // Metadata usage for current month
+  let metadataCalls = 0;
+  try {
+    const { data: metaUsageRow, error: metaError } = await supabaseAdmin
+      .from('metadata_usage')
+      .select('metadata_calls')
+      .eq('user_id', userId)
+      .eq('year_month', yearMonth)
+      .single();
+    if (metaError) {
+      if (metaError.code !== 'PGRST116') {
+        console.warn('metadata_usage single error:', metaError.message || metaError);
+      }
+    } else if (metaUsageRow) {
+      metadataCalls = metaUsageRow.metadata_calls || 0;
+    }
+  } catch (e) {
+    console.warn('metadata_usage fetch unexpected error:', e.message || e);
+  }
+  const planMetaLimit = PLAN_METADATA_LIMITS[planType] || PLAN_METADATA_LIMITS.free;
+
+  return {
+    user: {
+      id: profile?.id || userId,
+      email: profile?.email || null,
+    },
+    plan: {
+      type: planType,
+      pins_limit_per_month: planPinsLimit,
+      metadata_limit_per_month: planMetaLimit,
+    },
+    usage: {
+      year_month: yearMonth,
+      pins_used: pinsUsed,
+      pins_remaining: Math.max(0, planPinsLimit - pinsUsed),
+      metadata_calls: metadataCalls,
+      metadata_soft_limit: planMetaLimit,
+    },
+  };
+}
 
 async function requirePro(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -787,7 +1060,7 @@ async function generateImageWithNanoBanana(prompt) {
         // We don't strictly need a callback for this flow; we will poll instead.
         input: {
           prompt,
-          aspect_ratio: '9:16',
+          aspect_ratio: '2:3',
           google_search: false,
           resolution: '1K',
           output_format: 'png',
@@ -804,8 +1077,11 @@ async function generateImageWithNanoBanana(prompt) {
     const taskId = createJson.data.taskId;
 
     // 2) Poll recordInfo until success / fail / timeout
-    const maxAttempts = 20; // e.g. up to ~40s (20 * 2s)
-    const delayMs = 2000;
+    // KIE/Nano Banana can take up to ~50s to finish, so we allow a longer
+    // polling window here. Make sure your backend/proxy request timeout is
+    // configured high enough (e.g. 70–90s) so the request isn't cut off.
+    const maxAttempts = 35; // ~52.5s (35 * 1.5s), then fallback
+    const delayMs = 1500;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       await new Promise((r) => setTimeout(r, delayMs));
@@ -962,9 +1238,20 @@ app.post('/api/urltopin/scrape', async (req, res) => {
 
 app.post('/api/urltopin/generate', requireUser, async (req, res) => {
   try {
-    const { url, styles, articleData } = req.body || {};
+    const { url, styles, articleData, brand } = req.body || {};
     if (!url || !Array.isArray(styles) || styles.length === 0) {
       return res.status(400).json({ error: 'Missing url or styles' });
+    }
+
+    // Enforce plan-based pin limits using pin_usage
+    const pinsToGenerate = styles.length;
+    const usageResult = await consumePinUsage(req.user.id, pinsToGenerate);
+    if (!usageResult.allowed) {
+      return res.status(402).json({
+        error: 'pin_limit_reached',
+        message: `Your current plan allows ${usageResult.planPinsLimit} pins per month. You have already used ${usageResult.currentUsed} pins this month, so generating ${pinsToGenerate} more would exceed your limit.`,
+        details: usageResult,
+      });
     }
 
     const base = articleData || extractMetaFromHtml('', url);
@@ -973,43 +1260,119 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
+    const brandPrimary = brand?.primaryColor || null;
+    const brandSecondary = brand?.secondaryColor || null;
+    const brandAccent = brand?.accentColor || null;
+    const brandName = brand?.brandName || null;
+    const brandLogoUrl = brand?.logoUrl || null;
+
     const styleMeta = {
-      clean_appetizing: 'Clean & appetizing food photography, soft beige background, warm natural light, premium blog style. Include a bold, legible Pinterest headline, a small subheadline, and small source text with the website URL at the bottom.',
-      curiosity_shock: 'Bold, dramatic, high-contrast image that creates shock and curiosity, strong focal point. Use large, high-contrast headline text that feels urgent or surprising, plus bottom source text with the website URL.',
-      money_saving: 'Visual money-saving angle, dollar bills or savings motif combined with the main ingredient. Add punchy text that emphasizes saving money or not wasting food, and include small source text with the website URL at the bottom.',
-      minimal_typography: 'Minimal, elegant layout with lots of whitespace and a single strong visual object. Use clean, modern typography with a short, bold statement, and subtle bottom text showing the website URL.',
-      question_style: 'Image that visually represents a question or dilemma, with subtle question-mark elements. Headline text should be a direct question that invites clicks, plus bottom source text with the website URL.',
-      before_after: 'Split before/after layout with clear visual contrast between “wrong” and “right” or “old” and “fresh”. Overlay short text on each side to label before vs after, and include small source text with the website URL at the bottom.',
-      cozy_baking: 'Cozy kitchen scene, warm tones, lifestyle baking props like bowls, spoons, and ingredients. Friendly, welcoming text that matches recipe or kitchen content, with subtle bottom text showing the website URL.',
-      viral_curiosity: 'Dramatic, story-like composition that feels like a personal experiment or confession. Use story-style text like “I tried X for Y days…” to drive curiosity, and add bottom source text with the website URL.',
-      clumpy_fix: 'Practical, how-to style with clumpy vs fixed ingredient shown clearly. Add clear how-to text that promises a fix or simple method, plus small bottom text with the website URL.',
-      minimal_elegant: 'Soft, premium, editorial-style image with simple composition and elegant lighting. Elegant, refined typography suitable for a premium brand or blog, with discreet bottom text showing the website URL.',
+      clean_appetizing:
+        'Clean, soft layout with a clear focal object related to the topic on a neutral background. Include a bold, legible Pinterest headline, a small subheadline, and small source text with the website URL at the bottom.',
+      curiosity_shock:
+        'Bold, dramatic, high-contrast image that creates shock and curiosity with a strong central subject. Use large, high-contrast headline text that feels urgent or surprising, plus bottom source text with the website URL.',
+      money_saving:
+        'Visual value or money-saving angle, using simple icons or motifs for money, time, and checkmarks alongside the main concept. Add punchy text that emphasizes saving time or money, and include small source text with the website URL at the bottom.',
+      minimal_typography:
+        'Minimal, elegant layout with lots of whitespace and a single strong visual object. Use clean, modern typography with a short, bold statement, and subtle bottom text showing the website URL.',
+      question_style:
+        'Image that visually represents a question or dilemma, with subtle question-mark elements or split choices. Headline text should be a direct question that invites clicks, plus bottom source text with the website URL.',
+      before_after:
+        'Split “before vs after” layout with very clear visual contrast between the problem state and the improved state for this topic. Left side labelled “Before” shows confusion, mess or inefficiency; right side labelled “After” shows clarity, organization or success. Overlay short, readable text on each side and include small source text with the website URL at the bottom.',
+      timeline_infographic:
+        'Vertical infographic-style timeline made of 4–6 steps or milestones that walk the reader through the key stages of this topic (for example: Discover → Decide → Act → Maintain). Each step has a short label and simple icon. Arrange steps from top to bottom with clear arrows or connectors, and include a concise headline at the top plus small source text with the website URL at the bottom.',
+      cozy_baking:
+        'Lifestyle context scene where someone interacts with the topic in everyday life (for example at a desk, with a laptop, or using a product). Warm, welcoming lighting and environment, friendly headline text, and subtle bottom text showing the website URL.',
+      viral_curiosity:
+        'Dramatic, story-like composition that feels like a personal experiment or confession. Use story-style text like “I tried X for Y days…” to drive curiosity, and add bottom source text with the website URL.',
+      clumpy_fix:
+        'Practical, how-to style where the visual clearly shows a “problem” version and a “fixed” or improved version of the same thing. Add clear how-to text that promises a simple fix or method, plus small bottom text with the website URL.',
+      minimal_elegant:
+        'Soft, premium, editorial-style image with simple composition and elegant lighting. Elegant, refined typography suitable for a premium brand or blog, with discreet bottom text showing the website URL.',
+      grid_3_images:
+        'Layout where the pin is clearly made from three related images arranged in a clean collage or grid. Each image should show a different angle, example, or step for the topic, with thin spacing between them and a short headline and source text.',
+      grid_4_images:
+        'Layout where the pin is clearly made from four related images in a 2×2 grid. Each panel should show a different angle, variation, or step for the topic, with consistent gutters between panels and a short headline and source text.',
+      stacked_strips:
+        'Three horizontal image strips stacked vertically on one side of the pin, with a solid color text column on the other side. The text column holds a bold headline and small source URL, while the strips show three related scenes.',
+      offset_collage_3:
+        'Asymmetrical three-image collage with one dominant hero photo and two smaller supporting photos arranged to the side. Use overlapping cards or panels to create a dynamic layout, with a short headline and small source text.',
+      circle_cluster_4:
+        'Cluster of four circular photos arranged around a central text area. Each circle shows a different aspect of the topic, with a short headline in the center and small source text at the bottom.',
+      step_cards_3:
+        'Three tall step cards stacked vertically, each with an icon or small image and a very short label like Step 1, Step 2, Step 3. The cards should feel like a guided process, with a concise headline at the top and source URL at the bottom.',
     };
 
     const stylePrompts = [];
 
+    const styleSpecificGuidance = {
+      before_after:
+        'Make the “Before” and “After” areas visually balanced and clearly separated. Avoid generic full-bleed photos; instead, clearly label each side and ensure the change from problem to solution is obvious even at a glance.',
+      timeline_infographic:
+        'The design must look like a clear vertical infographic timeline, not like a regular photo pin. Use simple shapes, lines and icons for each step, with short labels, and avoid busy photographic backgrounds that would make the steps hard to read.',
+    };
+
+    const styleSpecificSystemGuidance = {
+      before_after:
+        'When the requested style is a BEFORE/AFTER layout, you MUST describe two clearly separated halves labelled “Before” and “After”, showing the problem state vs the improved state for this topic. Do not describe a single generic background photo; focus instead on the contrast between the two labelled halves, while still keeping the on-image text large and readable.',
+      timeline_infographic:
+        'When the requested style is a TIMELINE INFOGRAPHIC, you MUST describe a vertical infographic timeline made of multiple clearly numbered or labelled steps (for example: Step 1, Step 2, Step 3...). Do not describe a photographic scene as the main background. Instead, use a simple flat or lightly textured background, vertical connectors or arrows, and boxes or circles for each step, with short labels that summarize each stage of the article. The steps themselves are the main visual focus.',
+    };
+
     for (const id of styles) {
       const styleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
       try {
+        const isTimeline = id === 'timeline_infographic';
+
         const systemPrompt =
           'You create detailed text-to-image prompts that generate full Pinterest pin images, including BOTH background visuals and on-image text. ' +
           'Each prompt must clearly state at the beginning: "Vertical Pinterest pin 1000x1500 px". ' +
-          'Describe a 9:16 Pinterest pin: eye-catching background, clear focal point, and bold, highly readable typography. ' +
-          'Explicitly describe the main headline text, any subheadline, and small branding or source text that includes the website URL at the bottom of the pin (e.g. bottom center). ' +
+          (isTimeline
+            ? 'Describe a vertical infographic-style Pinterest pin where the main visual is a stack of clearly separated steps in a vertical timeline. The background must stay simple and low-contrast so the step boxes, connectors and labels are the main focus. Use very short on-image text: a short title and short labels for each step only. '
+            : 'Describe a 9:16 Pinterest pin: eye-catching but not cluttered background, clear focal point, and bold, highly readable typography. Explicitly describe the main headline text, any subheadline, and small branding or source text that includes the website URL at the bottom of the pin (e.g. bottom center). ') +
+          (brandPrimary || brandSecondary || brandAccent || brandName || brandLogoUrl
+            ? 'Make sure the visual style and on-image text respect the provided brand colors, brand name and logo placement so that the pin looks fully on-brand. '
+            : '') +
+          (styleSpecificSystemGuidance[id] ? styleSpecificSystemGuidance[id] + ' ' : '') +
           'The entire design must remain readable on mobile screens and feel like a high-performing Pinterest pin. ' +
-          'The prompt should be 2–5 sentences, plain text only.';
+          'The prompt must be between 1 and 3 sentences, plain text only. Never write more than 3 sentences.';
 
-        const userPrompt =
+        const userPromptBase =
           `Article title: ${topic}\n` +
           (base.description ? `Article description: ${base.description}\n` : '') +
           (keyword ? `Main keyword or ingredient: ${keyword}\n` : '') +
           `Domain / branding: ${domain}\n` +
           `Year/context: ${year}\n` +
-          `Desired visual style for the Pinterest pin: ${styleDescription}\n\n` +
+          (brandName ? `Brand name: ${brandName}\n` : '') +
+          (brandPrimary ? `Brand primary color: ${brandPrimary}\n` : '') +
+          (brandSecondary ? `Brand secondary color: ${brandSecondary}\n` : '') +
+          (brandAccent ? `Brand accent color: ${brandAccent}\n` : '') +
+          (brandLogoUrl ? `Brand logo reference URL: ${brandLogoUrl}\n` : '') +
+          `Desired visual style for the Pinterest pin: ${styleDescription}\n` +
+          (styleSpecificGuidance[id] ? `Additional layout requirements: ${styleSpecificGuidance[id]}\n` : '') +
+          '\n';
+
+        const userPromptTimeline =
+          'Write a single, self-contained text-to-image prompt for a complete Pinterest pin that looks like a vertical infographic timeline. ' +
+          'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
+          'Describe a simple, low-contrast background plus the vertical stack of step boxes or circles, their connectors or arrows, and the very short labels for each step. ' +
+          'Optionally mention a short title at the top and small source text with the website URL at the bottom, but avoid long headline paragraphs. ';
+
+        const userPromptDefault =
           'Write a single, self-contained text-to-image prompt for a complete Pinterest pin (background plus on-image text). ' +
           'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
           'Describe the background scene, the exact headline and subheadline text to show, their position on the pin, and how the typography should look. ' +
-          'Also describe small source text at the bottom that displays the website URL (use the domain provided above).';
+          'Also describe small source text at the bottom that displays the website URL (use the domain provided above). ';
+
+        const userPromptBrandTail =
+          brandPrimary || brandSecondary || brandAccent || brandName || brandLogoUrl
+            ? 'In the prompt, explicitly mention using the brand colors, logo and name so the final image clearly matches this brand.'
+            : '';
+
+        const userPrompt =
+          userPromptBase +
+          (isTimeline ? userPromptTimeline : userPromptDefault) +
+          userPromptBrandTail;
 
         const completion = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
@@ -1021,10 +1384,20 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           max_tokens: 260,
         });
 
-        const imagePrompt =
+        let imagePrompt =
           completion.choices?.[0]?.message?.content?.trim() ||
           `Vertical Pinterest pin 1000x1500 px, ${styleDescription} about "${topic}". Main concept: ${keyword ||
             'blog article'}. No text in the image.`;
+
+        // For certain layout-heavy styles, enforce a deterministic prompt shape
+        if (id === 'timeline_infographic') {
+          imagePrompt =
+            `Vertical Pinterest pin 1000x1500 px. Simple, light background with very low contrast so text and shapes are easy to read. ` +
+            `A vertical infographic timeline runs from top to bottom with 4–6 clearly separated steps in boxes or circles, connected by a thin line or arrows. ` +
+            `Each step box has a very short label (a few words) that summarizes a stage of "${topic}", using icons or small illustrations instead of detailed photos. ` +
+            `At the very top, include a short title about "${topic}", and at the very bottom, small, readable source text that shows "${domain}".`;
+        }
+
 
         stylePrompts.push({
           id,
@@ -1045,10 +1418,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const pins = [];
 
     for (const sp of stylePrompts) {
-      // First, try Nano Banana 2 with the AI-generated image prompt
+      // First, try Nano Banana 2 with the AI-generated image prompt (one automatic retry on timeout/fail)
       let imageUrl = '';
       try {
         imageUrl = await generateImageWithNanoBanana(sp.prompt);
+        if (!imageUrl) {
+          console.warn('urltopin nano-banana first attempt returned no image, retrying once');
+          imageUrl = await generateImageWithNanoBanana(sp.prompt);
+        }
       } catch (e) {
         console.warn('urltopin nano-banana image generation error:', e.message || e);
       }
@@ -1113,7 +1490,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         console.warn('urltopin metadata generation error:', e.message || e);
       }
 
-      pins.push({
+      const pinRecord = {
         styleId: sp.id,
         styleLabel: sp.label,
         imagePrompt: sp.prompt,
@@ -1122,12 +1499,120 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         description: pinDescription,
         hashtags,
         link: url,
-      });
+      };
+
+      pins.push(pinRecord);
+
+      // Persist URL → Pin history for this user and also surface as a "generated" entry
+      // in the scheduled_pins table so it appears in the main Scheduled Pins dashboard.
+      try {
+        const baseHistory = {
+          user_id: req.user.id,
+          source_url: url,
+          article_title: base.title || null,
+          article_domain: domain || null,
+          style_id: sp.id,
+          style_label: sp.label,
+          image_url: imageUrl || null,
+          pin_title: pinTitle || null,
+          pin_description: pinDescription || null,
+          pin_link: url,
+        };
+
+        // Fire-and-forget inserts so slow DB won't block the response
+        supabaseAdmin
+          .from('urltopin_history')
+          .insert(baseHistory)
+          .then(({ error }) => {
+            if (error) {
+              console.warn('urltopin_history insert error:', error.message || error);
+            }
+          })
+          .catch((e) => {
+            console.warn('urltopin_history insert failed:', e.message || e);
+          });
+
+        const originalPinData = {
+          ...baseHistory,
+          source: 'urltopin',
+        };
+
+        // Store in scheduled_pins with status 'generated' so they show under
+        // Scheduled Pins dashboard and can be scheduled from there.
+        supabaseAdmin
+          .from('scheduled_pins')
+          .insert({
+            user_id: req.user.id,
+            pinterest_account_id: null,
+            title: pinTitle,
+            description: pinDescription,
+            image_url: imageUrl || null,
+            board_id: '', // required by schema when not yet scheduled
+            link: url,
+            scheduled_for: null, // nullable when status is 'generated'; run migration to allow NULL
+            timezone: null,
+            is_recurring: false,
+            recurrence_pattern: null,
+            status: 'generated',
+            original_pin_data: originalPinData,
+          })
+          .then(({ error }) => {
+            if (error) {
+              console.warn(
+                'scheduled_pins insert (generated from urltopin) error:',
+                error.message || error
+              );
+            }
+          })
+          .catch((e) => {
+            console.warn(
+              'scheduled_pins insert (generated from urltopin) failed:',
+              e.message || e
+            );
+          });
+      } catch (historyErr) {
+        console.warn(
+          'urltopin history/scheduled_pins insert threw synchronously:',
+          historyErr.message || historyErr
+        );
+      }
     }
 
     return res.json({ pins });
   } catch (err) {
     console.error('urltopin generate error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/urltopin/download-zip', requireUser, async (req, res) => {
+  try {
+    const { images } = req.body || {};
+    if (!Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({ error: 'No images provided' });
+    }
+
+    const zip = new JSZip();
+
+    for (const img of images) {
+      if (!img?.url) continue;
+      const filename = img.filename || 'pin.png';
+      try {
+        const resp = await fetch(img.url);
+        if (!resp.ok) continue;
+        const arrayBuf = await resp.arrayBuffer();
+        zip.file(filename, Buffer.from(arrayBuf));
+      } catch (e) {
+        console.warn('Failed to fetch image for ZIP:', img.url, e.message || e);
+      }
+    }
+
+    const content = await zip.generateAsync({ type: 'nodebuffer' });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="urltopin-pins.zip"');
+    return res.send(content);
+  } catch (err) {
+    console.error('urltopin download-zip error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -1385,6 +1870,12 @@ app.post('/api/export-pin', async (req, res) => {
 app.post('/api/generate-field', requireUser, async (req, res) => {
   const { content, type, style } = req.body; // type: 'title' or 'description'; style: optional hint
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
+
+  // Soft-limit tracking for metadata usage (titles/descriptions)
+  recordMetadataUsage(req.user.id, 1).catch((err) =>
+    console.warn('recordMetadataUsage(generate-field) error:', err.message || err)
+  );
+
   const isShortTitle = type === 'title' && style === 'short_50';
   const prompt = type === 'title'
     ? (
@@ -1426,6 +1917,11 @@ app.post('/api/analyze-image', requireUser, async (req, res) => {
   try {
     const { imageUrl, urlHint } = req.body;
     if (!imageUrl) return res.status(400).json({ error: 'Missing imageUrl' });
+
+    // Soft-limit tracking for metadata usage (vision-based metadata)
+    recordMetadataUsage(req.user.id, 1).catch((err) =>
+      console.warn('recordMetadataUsage(analyze-image) error:', err.message || err)
+    );
 
     const systemPrompt = `You are helping generate Pinterest pin metadata. First, read any visible text in the image (OCR). Then propose a compelling title (aim for 80-100 characters, maximum 100) and an engaging description (<=450 chars) suitable for Pinterest. The title should be curiosity-driven, descriptive, and use emotional triggers or questions to make people want to click. The description must include 4–6 relevant hashtags at the end. Do not include URLs or phrases like \"visit example.com\", \"click the link\", or similar calls to visit a site. If a destination URL context is provided, use it only to infer keywords, but never include the URL or a CTA. Return JSON with keys: extractedText, title, description. Do not include markdown, code fences, or commentary.`;
 
@@ -1471,6 +1967,156 @@ app.post('/api/analyze-image', requireUser, async (req, res) => {
   } catch (err) {
     console.error('analyze-image error:', err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Dodo Payments checkout session for subscriptions ---
+
+app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
+  try {
+    if (!DODO_API_KEY) {
+      return res.status(500).json({ error: 'Dodo Payments API key not configured' });
+    }
+
+    const { planType } = req.body || {};
+    if (!planType) {
+      return res.status(400).json({ error: 'Missing planType' });
+    }
+
+    // Map internal plan types to Dodo product IDs via environment variables
+    const productMap = {
+      free: process.env.DODO_PRODUCT_FREE_ID,
+      creator: process.env.DODO_PRODUCT_CREATOR_ID,
+      pro: process.env.DODO_PRODUCT_PRO_ID,
+      agency: process.env.DODO_PRODUCT_AGENCY_ID,
+    };
+
+    const productId = productMap[planType];
+    if (!productId) {
+      return res.status(400).json({ error: `No Dodo product configured for planType "${planType}"` });
+    }
+
+  // Compute frontend base (strip any /app or deeper path)
+  let frontendBase = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
+  try {
+    const u = new URL(frontendBase);
+    frontendBase = `${u.protocol}//${u.host}`;
+  } catch {
+    frontendBase = frontendBase.replace(/\/app\/?$/, '');
+  }
+
+  const body = {
+      // One subscription product in the cart; pricing & interval are defined in Dodo dashboard
+      product_cart: [{ product_id: productId, quantity: 1 }],
+      // Optional: pass through metadata so we can link back to Supabase user and plan in webhooks later
+      metadata: {
+        supabase_user_id: req.user.id,
+        app_plan_type: planType,
+      },
+    // Redirect back to app after success/failure
+    return_url: `${frontendBase.replace(/\/$/, '')}/payment-success?plan=${encodeURIComponent(planType)}`,
+    };
+
+    const resp = await fetch(`${DODO_BASE_URL}/checkouts`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DODO_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const json = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      console.error('Dodo create checkout session error:', resp.status, json);
+      return res.status(500).json({
+        error: 'failed_to_create_dodo_checkout',
+        status: resp.status,
+        details: json,
+      });
+    }
+
+    const checkoutUrl = json.checkout_url || json.url || null;
+    const sessionId = json.session_id || json.id || null;
+
+    if (!checkoutUrl && !sessionId) {
+      console.warn('Dodo checkout response missing checkout_url and session_id:', json);
+    }
+
+    return res.json({
+      checkoutUrl,
+      sessionId,
+      raw: json,
+    });
+  } catch (err) {
+    console.error('Dodo create checkout session unexpected error:', err);
+    return res.status(500).json({ error: 'failed_to_create_dodo_checkout', message: err.message });
+  }
+});
+
+// --- Account overview (plan + usage) ---
+
+app.get('/api/account/usage', requireUser, async (req, res) => {
+  try {
+    const snapshot = await getCurrentUsageSnapshot(req.user.id);
+    return res.json(snapshot);
+  } catch (err) {
+    console.error('account/usage error:', err);
+    return res.status(500).json({ error: 'Failed to load account usage' });
+  }
+});
+
+// Simple endpoint to mark a plan as active for the current user
+app.post('/api/account/activate-plan', requireUser, async (req, res) => {
+  try {
+    const { planType } = req.body || {};
+    if (!planType || !PLAN_PIN_LIMITS[planType]) {
+      return res.status(400).json({ error: 'Invalid planType' });
+    }
+
+    const now = new Date();
+    const periodStart = now.toISOString();
+    const nextMonth = new Date(now);
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    const periodEnd = nextMonth.toISOString();
+
+    const pinsLimit = PLAN_PIN_LIMITS[planType];
+
+    // Mark any existing active subscriptions for this user as cancelled
+    await supabaseAdmin
+      .from('billing_subscriptions')
+      .update({ status: 'cancelled', updated_at: now.toISOString() })
+      .eq('user_id', req.user.id)
+      .eq('status', 'active');
+
+    // Insert new active subscription row
+    const { error: insertError } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .insert({
+        user_id: req.user.id,
+        plan_type: planType,
+        pins_limit_per_month: pinsLimit,
+        status: 'active',
+        current_period_start: periodStart,
+        current_period_end: periodEnd,
+      });
+
+    if (insertError) {
+      console.error('activate-plan insert error:', insertError);
+      return res.status(500).json({
+        error: 'Failed to activate plan',
+        details: insertError.message || String(insertError),
+      });
+    }
+
+    return res.json({ ok: true, planType, pinsLimit });
+  } catch (err) {
+    console.error('activate-plan error:', err);
+    return res.status(500).json({
+      error: 'Failed to activate plan',
+      details: err.message || String(err),
+    });
   }
 });
 
@@ -1847,7 +2493,8 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
 
   const { 
     image_url, title, description, board_id, link, account_id,
-    scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern 
+    scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern,
+    force_duplicate = false
   } = req.body;
 
   // Validate required fields
@@ -1891,6 +2538,24 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   }
 
   try {
+    // If not forcing duplicate, check whether this pin was already posted to this board
+    if (!force_duplicate) {
+      const { data: existing } = await supabaseAdmin
+        .from('scheduled_pins')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('board_id', board_id)
+        .eq('status', 'posted')
+        .eq('image_url', image_url)
+        .limit(1);
+      if (existing && existing.length > 0) {
+        return res.status(409).json({
+          already_posted_to_board: true,
+          message: 'This pin was already posted to this board. Post again or skip.',
+        });
+      }
+    }
+
     // Store original pin data for reference
     const originalPinData = {
       image_url, title, description, board_id, link, account_id,
@@ -2250,368 +2915,10 @@ app.get('/api/pinterest/boards', async (req, res) => {
 });
 
 
-// Stripe checkout session endpoint
-app.post('/api/create-checkout-session', async (req, res) => {
-  if (!stripe) {
-    return res.status(500).json({ error: 'Stripe not configured' });
-  }
-  
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
-  const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const { planType, couponCode } = req.body;
-  
-  // Define plan configurations
-  const plans = {
-    'creator': {
-      name: 'Creator Plan',
-      price: 1500, // $15.00 in cents
-      credits: 1000,
-      planType: 'creator'
-    },
-    'pro': {
-      name: 'Pro Plan',
-      price: 2500, // $25.00 in cents
-      credits: 3000,
-      planType: 'pro'
-    },
-    'agency': {
-      name: 'Agency Plan',
-      price: 5600, // $56.00 in cents
-      credits: 7500,
-      planType: 'agency'
-    }
-  };
-
-  const plan = plans[planType];
-  if (!plan) {
-    return res.status(400).json({ error: 'Invalid plan type' });
-  }
-
-  // Validate coupon code if provided
-  let validatedCoupon = null;
-  if (couponCode && couponCode.trim()) {
-    try {
-      const coupon = await stripe.coupons.retrieve(couponCode.trim());
-      if (!coupon.valid) {
-        return res.status(400).json({ error: 'Coupon code is not valid or has expired' });
-      }
-      validatedCoupon = couponCode.trim();
-    } catch (couponError) {
-      console.error('Coupon validation error:', couponError);
-      return res.status(400).json({ error: 'Invalid coupon code' });
-    }
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: {
-              name: plan.name,
-              description: `${plan.credits} credits per month`,
-            },
-            unit_amount: plan.price,
-            recurring: {
-              interval: 'month',
-            },
-          },
-          quantity: 1,
-        },
-      ],
-      mode: 'subscription',
-      success_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/pricing`,
-      client_reference_id: user.id,
-      metadata: {
-        userId: user.id,
-        planType: plan.planType,
-        credits: plan.credits.toString()
-      },
-      discounts: validatedCoupon ? [{ coupon: validatedCoupon }] : undefined
-    });
-
-
-
-    res.json({ sessionId: session.id });
-  } catch (error) {
-    console.error('Error creating checkout session:', error);
-    res.status(500).json({ error: 'Failed to create checkout session' });
-  }
-});
-
-
-// One-time credits top-up checkout session endpoint
-app.post('/api/create-credits-session', async (req, res) => {
-  if (!stripe) {
-    return res.status(500).json({ error: 'Stripe not configured' });
-  }
-
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
-  const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const { creditsPack, couponCode } = req.body; // '250' | '500' | '1000' | '3000', optional coupon
-  const packs = {
-    '250': { name: 'Top-up 250 credits', amount: 600, credits: 250 },   // $6.00
-    '500': { name: 'Top-up 500 credits', amount: 1000, credits: 500 },  // $10.00
-    '1000': { name: 'Top-up 1000 credits', amount: 1800, credits: 1000 }, // $18.00
-    '3000': { name: 'Top-up 3000 credits', amount: 3600, credits: 3000 }, // $36.00
-  };
-  const pack = packs[String(creditsPack)];
-  if (!pack) return res.status(400).json({ error: 'Invalid credits pack' });
-
-  // Validate coupon code if provided
-  let validatedCoupon = null;
-  if (couponCode && couponCode.trim()) {
-    try {
-      const coupon = await stripe.coupons.retrieve(couponCode.trim());
-      if (!coupon.valid) {
-        return res.status(400).json({ error: 'Coupon code is not valid or has expired' });
-      }
-      validatedCoupon = couponCode.trim();
-    } catch (couponError) {
-      console.error('Coupon validation error:', couponError);
-      return res.status(400).json({ error: 'Invalid coupon code' });
-    }
-  }
-
-  try {
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: { name: pack.name },
-            unit_amount: pack.amount,
-          },
-          quantity: 1,
-        },
-      ],
-      success_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'https://csv2pin.com'}/pricing`,
-      client_reference_id: user.id,
-      metadata: {
-        userId: user.id,
-        type: 'topup',
-        credits: String(pack.credits),
-      },
-      discounts: validatedCoupon ? [{ coupon: validatedCoupon }] : undefined,
-    });
-
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error('Error creating credits checkout session:', error);
-    console.error('Error details:', {
-      message: error.message,
-      type: error.type,
-      code: error.code,
-      param: error.param,
-      creditsPack,
-      couponCode,
-      userId: user.id
-    });
-    res.status(500).json({ 
-      error: 'Failed to create checkout session',
-      details: error.message 
-    });
-  }
-});
-
-
-
-// Stripe webhook endpoint
-app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe) {
-    return res.status(500).json({ error: 'Stripe not configured' });
-  }
-  
-  const sig = req.headers['stripe-signature'];
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  // Handle the event
-  switch (event.type) {
-    case 'checkout.session.completed':
-      const session = event.data.object;
-      await handleCheckoutSessionCompleted(session);
-      // Handle one-time credits top-up
-      if (session?.metadata?.type === 'topup' && session?.metadata?.userId && session?.metadata?.credits) {
-        const userId = session.metadata.userId;
-        const addCredits = parseInt(session.metadata.credits, 10) || 0;
-        if (addCredits > 0) {
-          try {
-            const { data: profile } = await supabaseAdmin
-              .from('profiles')
-              .select('credits_remaining')
-              .eq('id', userId)
-              .single();
-            const current = profile?.credits_remaining || 0;
-            const newCredits = current + addCredits;
-            await supabaseAdmin
-              .from('profiles')
-              .update({ credits_remaining: newCredits })
-              .eq('id', userId);
-          } catch (e) {
-            console.error('Error applying top-up credits:', e);
-          }
-        }
-      }
-      break;
-    case 'invoice.payment_succeeded':
-      const invoice = event.data.object;
-      await handleInvoicePaymentSucceeded(invoice);
-      break;
-    case 'customer.subscription.deleted':
-      const subscription = event.data.object;
-      await handleSubscriptionDeleted(subscription);
-      break;
-    default:
-      console.log(`Unhandled event type ${event.type}`);
-  }
-
-  res.json({ received: true });
-});
-
-async function handleCheckoutSessionCompleted(session) {
-  if (!stripe) return;
-  
-  const userId = session.metadata.userId;
-  const planType = session.metadata.planType;
-  const credits = parseInt(session.metadata.credits);
-
-  try {
-    // Update user profile with new plan and credits
-    const { error } = await supabaseAdmin
-      .from('profiles')
-      .update({
-        plan_type: planType,
-        credits_remaining: credits,
-        is_pro: true,
-        stripe_customer_id: session.customer,
-        stripe_subscription_id: session.subscription
-      })
-      .eq('id', userId);
-
-    if (error) {
-      console.error('Error updating user profile:', error);
-    } else {
-      console.log(`User ${userId} upgraded to ${planType} plan`);
-    }
-  } catch (error) {
-    console.error('Error handling checkout session completed:', error);
-  }
-}
-
-async function handleInvoicePaymentSucceeded(invoice) {
-  if (!stripe) return;
-  
-  const subscriptionId = invoice.subscription;
-  
-  try {
-    // Get subscription details
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-    const customerId = subscription.customer;
-    
-    // Find user by Stripe customer ID
-    const { data: profile, error } = await supabaseAdmin
-      .from('profiles')
-      .select('id, plan_type')
-      .eq('stripe_customer_id', customerId)
-      .single();
-
-    if (error || !profile) {
-      console.error('User not found for customer ID:', customerId);
-      return;
-    }
-
-    // Define credits for each plan
-    const planCredits = {
-      'creator': 500,
-      'pro': 1500,
-      'agency': 5000
-    };
-
-    const credits = planCredits[profile.plan_type] || 0;
-
-    // Reset credits for the new month
-    const { error: updateError } = await supabaseAdmin
-      .from('profiles')
-      .update({ credits_remaining: credits })
-      .eq('id', profile.id);
-
-    if (updateError) {
-      console.error('Error updating credits:', updateError);
-    } else {
-      console.log(`Credits reset for user ${profile.id} to ${credits}`);
-    }
-  } catch (error) {
-    console.error('Error handling invoice payment succeeded:', error);
-  }
-}
-
-async function handleSubscriptionDeleted(subscription) {
-  if (!stripe) return;
-  
-  const customerId = subscription.customer;
-  
-  try {
-    // Find user by Stripe customer ID
-    const { data: profile, error } = await supabaseAdmin
-      .from('profiles')
-      .select('id')
-      .eq('stripe_customer_id', customerId)
-      .single();
-
-    if (error || !profile) {
-      console.error('User not found for customer ID:', customerId);
-      return;
-    }
-
-    // Downgrade user to free plan
-    const { error: updateError } = await supabaseAdmin
-      .from('profiles')
-      .update({
-        plan_type: 'free',
-        credits_remaining: 50,
-        is_pro: false,
-        stripe_subscription_id: null
-      })
-      .eq('id', profile.id);
-
-    if (updateError) {
-      console.error('Error downgrading user:', updateError);
-    } else {
-      console.log(`User ${profile.id} downgraded to free plan`);
-    }
-  } catch (error) {
-    console.error('Error handling subscription deleted:', error);
-  }
-}
-
 // Test endpoint
 app.get('/api/test', (req, res) => {
   res.json({ message: 'Backend is working' });
 });
-
 // WordPress API endpoints
 app.post('/api/wordpress/test-connection', async (req, res) => {
   const { siteUrl, username, appPassword } = req.body;
