@@ -1039,7 +1039,7 @@ const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const NANO_BANANA_API_URL = process.env.NANO_BANANA_API_URL;
 const NANO_BANANA_API_KEY = process.env.NANO_BANANA_API_KEY;
 
-async function generateImageWithNanoBanana(prompt) {
+async function generateImageWithNanoBanana(prompt, logLabel = '') {
   if (!NANO_BANANA_API_URL || !NANO_BANANA_API_KEY) {
     console.warn('Nano Banana 2 API not configured (NANO_BANANA_API_URL / NANO_BANANA_API_KEY missing)');
     return null;
@@ -1128,7 +1128,7 @@ async function generateImageWithNanoBanana(prompt) {
       }
     }
 
-    console.warn('Nano Banana 2 generation timed out for prompt');
+    console.warn('Nano Banana 2 generation timed out for prompt' + (logLabel ? ` (style: ${logLabel})` : ''));
     return null;
   } catch (err) {
     console.error('Nano Banana 2 API flow failed:', err);
@@ -1415,19 +1415,70 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }
     }
 
+    // Pre-generate title and description for all styles in parallel (so AI desc doesn't block after each image)
+    const tokenHeader = req.headers.authorization || '';
+    const metadataTimeoutMs = 20000;
+    const styleMetadataByStyleId = new Map();
+    await Promise.all(
+      stylePrompts.map(async (sp) => {
+        const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
+        const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
+        let pinTitle = topic;
+        let pinDescription = base.description || '';
+        let hashtags = [];
+        try {
+          const c1 = new AbortController();
+          const c2 = new AbortController();
+          const t1 = setTimeout(() => c1.abort(), metadataTimeoutMs);
+          const t2 = setTimeout(() => c2.abort(), metadataTimeoutMs);
+          const [titleRes, descRes] = await Promise.all([
+            fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
+              body: JSON.stringify({ content: titlePrompt, type: 'title' }),
+              signal: c1.signal,
+            }),
+            fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
+              body: JSON.stringify({ content: descPrompt, type: 'description' }),
+              signal: c2.signal,
+            }),
+          ]);
+          clearTimeout(t1);
+          clearTimeout(t2);
+          if (titleRes.ok) {
+            const titleJson = await titleRes.json();
+            if (titleJson?.result) pinTitle = titleJson.result;
+          }
+          if (descRes.ok) {
+            const descJson = await descRes.json();
+            if (descJson?.result) {
+              pinDescription = descJson.result;
+              const tagMatches = pinDescription.match(/#[\w-]+/g);
+              if (tagMatches) hashtags = tagMatches.slice(0, 10);
+            }
+          }
+        } catch (e) {
+          console.warn('urltopin metadata generation error (style:', sp.label, '):', e.message || e);
+        }
+        styleMetadataByStyleId.set(sp.id, { pinTitle, pinDescription, hashtags });
+      })
+    );
+
     const pins = [];
 
     for (const sp of stylePrompts) {
       // First, try Nano Banana 2 with the AI-generated image prompt (one automatic retry on timeout/fail)
       let imageUrl = '';
       try {
-        imageUrl = await generateImageWithNanoBanana(sp.prompt);
+        imageUrl = await generateImageWithNanoBanana(sp.prompt, sp.label);
         if (!imageUrl) {
-          console.warn('urltopin nano-banana first attempt returned no image, retrying once');
-          imageUrl = await generateImageWithNanoBanana(sp.prompt);
+          console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
+          imageUrl = await generateImageWithNanoBanana(sp.prompt, sp.label);
         }
       } catch (e) {
-        console.warn('urltopin nano-banana image generation error:', e.message || e);
+        console.warn('urltopin nano-banana image generation error (style:', sp.label, '):', e.message || e);
       }
 
       // Fallback to existing Replicate-based generator if Nano Banana is not configured or fails
@@ -1447,48 +1498,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       }
 
-      // Generate title and description using existing /api/generate-field
-      let pinTitle = topic;
-      let pinDescription = base.description || '';
-      let hashtags = [];
-
-      try {
-        const tokenHeader = req.headers.authorization || '';
-
-        const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
-        const titleRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': tokenHeader,
-          },
-          body: JSON.stringify({ content: titlePrompt, type: 'title' }),
-        });
-        if (titleRes.ok) {
-          const titleJson = await titleRes.json();
-          if (titleJson.result) pinTitle = titleJson.result;
-        }
-
-        const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
-        const descRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': tokenHeader,
-          },
-          body: JSON.stringify({ content: descPrompt, type: 'description' }),
-        });
-        if (descRes.ok) {
-          const descJson = await descRes.json();
-          if (descJson.result) {
-            pinDescription = descJson.result;
-            const tagMatches = pinDescription.match(/#[\w-]+/g);
-            if (tagMatches) hashtags = tagMatches.slice(0, 10);
-          }
-        }
-      } catch (e) {
-        console.warn('urltopin metadata generation error:', e.message || e);
-      }
+      const meta = styleMetadataByStyleId.get(sp.id) || {};
+      const pinTitle = meta.pinTitle ?? topic;
+      const pinDescription = (meta.pinDescription ?? base.description) || '';
+      const hashtags = meta.hashtags ?? [];
 
       const pinRecord = {
         styleId: sp.id,
@@ -1581,6 +1594,51 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     return res.json({ pins });
   } catch (err) {
     console.error('urltopin generate error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/urltopin/regenerate-metadata — regenerate only title or description (fast, no image)
+app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
+  try {
+    const { url, articleData, styleId, type, currentTitle, currentDescription } = req.body || {};
+    if (!url || !styleId || !type || (type !== 'title' && type !== 'description')) {
+      return res.status(400).json({ error: 'Missing or invalid url, styleId, or type (must be "title" or "description")' });
+    }
+    const base = articleData || extractMetaFromHtml('', url);
+    const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
+    const keyword = base.keyword || '';
+    const topic = base.title || 'Does Brown Sugar Expire?';
+
+    recordMetadataUsage(req.user.id, 1).catch((err) =>
+      console.warn('recordMetadataUsage(urltopin/regenerate-metadata) error:', err?.message || err)
+    );
+
+    const contentBase = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${styleId}`;
+    const currentValue = type === 'title' ? (currentTitle || '') : (currentDescription || '');
+    const varietyHint = currentValue.trim()
+      ? `\n\nThe current ${type} is: "${currentValue.slice(0, 200)}${currentValue.length > 200 ? '…' : ''}". Write a different alternative; do not repeat or closely copy the current one.`
+      : '';
+
+    const prompt = type === 'title'
+      ? `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. Curiosity-driven, descriptive, use emotional triggers or questions. Only return the title, nothing else. Avoid quotes.${varietyHint}\n\n${contentBase}`
+      : `Write an engaging Pinterest pin description (max 450 characters) for this content. Explain the benefit or insight. No URLs or "visit/click" CTAs. Include 4–6 relevant hashtags at the end. Only return the description.${varietyHint}\n\n${contentBase}`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: type === 'title' ? 150 : 500,
+      temperature: 0.85,
+    });
+    let result = (completion.choices[0].message?.content || '').trim();
+    if (type === 'title') {
+      result = result.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '');
+      if (result.length > 100) result = result.slice(0, 100);
+      return res.json({ title: result });
+    }
+    return res.json({ description: sanitizeDescription(result) });
+  } catch (err) {
+    console.error('urltopin regenerate-metadata error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
