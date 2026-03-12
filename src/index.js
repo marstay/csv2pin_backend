@@ -1039,6 +1039,23 @@ const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const NANO_BANANA_API_URL = process.env.NANO_BANANA_API_URL;
 const NANO_BANANA_API_KEY = process.env.NANO_BANANA_API_KEY;
 
+// Fetch with timeout to prevent hangs on stuck network requests
+async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return res;
+  } catch (e) {
+    clearTimeout(id);
+    if (e.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw e;
+  }
+}
+
 async function generateImageWithNanoBanana(prompt, logLabel = '') {
   if (!NANO_BANANA_API_URL || !NANO_BANANA_API_KEY) {
     console.warn('Nano Banana 2 API not configured (NANO_BANANA_API_URL / NANO_BANANA_API_KEY missing)');
@@ -1046,102 +1063,372 @@ async function generateImageWithNanoBanana(prompt, logLabel = '') {
   }
 
   const baseUrl = NANO_BANANA_API_URL.replace(/\/$/, ''); // e.g. https://api.kie.ai/api/v1/jobs
+  const maxRetries = 3; // Retry entire flow up to 3 times on transient failures
+  const createTaskTimeoutMs = 25000;
+  const recordInfoTimeoutMs = 15000;
 
-  try {
-    // 1) Create async generation task
-    const createRes = await fetch(`${baseUrl}/createTask`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${NANO_BANANA_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'nano-banana-2',
-        // We don't strictly need a callback for this flow; we will poll instead.
-        input: {
-          prompt,
-          aspect_ratio: '2:3',
-          google_search: false,
-          resolution: '1K',
-          output_format: 'png',
-        },
-      }),
-    });
+  for (let retry = 0; retry < maxRetries; retry++) {
+    try {
+      if (retry > 0) {
+        const backoffMs = 2000 * retry;
+        console.warn(`Nano Banana 2 retry ${retry}/${maxRetries - 1} after ${backoffMs}ms`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
 
-    const createJson = await createRes.json().catch(() => ({}));
-    if (!createRes.ok || createJson.code !== 200 || !createJson.data?.taskId) {
-      console.error('Nano Banana 2 createTask error:', createRes.status, createJson);
-      return null;
-    }
-
-    const taskId = createJson.data.taskId;
-
-    // 2) Poll recordInfo until success / fail / timeout
-    // KIE/Nano Banana can take up to ~50s to finish, so we allow a longer
-    // polling window here. Make sure your backend/proxy request timeout is
-    // configured high enough (e.g. 70–90s) so the request isn't cut off.
-    const maxAttempts = 35; // ~52.5s (35 * 1.5s), then fallback
-    const delayMs = 1500;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      await new Promise((r) => setTimeout(r, delayMs));
-
-      const infoRes = await fetch(
-        `${baseUrl}/recordInfo?taskId=${encodeURIComponent(taskId)}`,
+      // 1) Create async generation task (with timeout to prevent hangs)
+      const createRes = await fetchWithTimeout(
+        `${baseUrl}/createTask`,
         {
-          method: 'GET',
+          method: 'POST',
           headers: {
+            'Content-Type': 'application/json',
             'Authorization': `Bearer ${NANO_BANANA_API_KEY}`,
           },
-        }
+          body: JSON.stringify({
+            model: 'nano-banana-2',
+            input: {
+              prompt,
+              aspect_ratio: '2:3',
+              google_search: false,
+              resolution: '1K',
+              output_format: 'png',
+            },
+          }),
+        },
+        createTaskTimeoutMs
       );
 
-      const infoJson = await infoRes.json().catch(() => ({}));
-      if (!infoRes.ok || infoJson.code !== 200 || !infoJson.data) {
-        console.warn('Nano Banana 2 recordInfo error:', infoRes.status, infoJson);
-        continue;
-      }
-
-      const state = infoJson.data.state;
-      if (state === 'waiting' || state === 'queuing' || state === 'generating') {
-        continue;
-      }
-
-      if (state === 'fail') {
-        console.error('Nano Banana 2 generation failed:', infoJson.data.failCode, infoJson.data.failMsg);
+      const createJson = await createRes.json().catch(() => ({}));
+      if (!createRes.ok || createJson.code !== 200 || !createJson.data?.taskId) {
+        console.error('Nano Banana 2 createTask error:', createRes.status, createJson);
+        if (retry < maxRetries - 1 && (createRes.status >= 500 || createRes.status === 429)) continue;
         return null;
       }
 
-      if (state === 'success') {
-        try {
-          const resultJsonStr = infoJson.data.resultJson || '{}';
-          const parsed = JSON.parse(resultJsonStr);
-          const urls = parsed.resultUrls;
-          if (Array.isArray(urls) && urls.length > 0 && typeof urls[0] === 'string') {
-            return urls[0];
+      const taskId = createJson.data.taskId;
+
+      // 2) Poll recordInfo until success / fail / timeout
+      const maxAttempts = 45; // ~67.5s (45 * 1.5s) for slow generations
+      const delayMs = 1500;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise((r) => setTimeout(r, delayMs));
+
+        let infoRes;
+        let infoJson = {};
+        const maxPollRetries = 3;
+        for (let pollRetry = 0; pollRetry < maxPollRetries; pollRetry++) {
+          try {
+            infoRes = await fetchWithTimeout(
+              `${baseUrl}/recordInfo?taskId=${encodeURIComponent(taskId)}`,
+              {
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${NANO_BANANA_API_KEY}` },
+              },
+              recordInfoTimeoutMs
+            );
+            infoJson = await infoRes.json().catch(() => ({}));
+            break;
+          } catch (pollErr) {
+            if (pollRetry < maxPollRetries - 1) {
+              await new Promise((r) => setTimeout(r, 1000 * (pollRetry + 1)));
+            } else {
+              console.warn('Nano Banana 2 recordInfo fetch failed after retries:', pollErr.message);
+              throw pollErr;
+            }
           }
-        } catch (e) {
-          console.error('Nano Banana 2 resultJson parse error:', e);
         }
-        console.warn('Nano Banana 2 success but no resultUrls found');
-        return null;
-      }
-    }
 
-    console.warn('Nano Banana 2 generation timed out for prompt' + (logLabel ? ` (style: ${logLabel})` : ''));
-    return null;
-  } catch (err) {
-    console.error('Nano Banana 2 API flow failed:', err);
-    return null;
+        if (!infoRes.ok || infoJson.code !== 200 || !infoJson.data) {
+          console.warn('Nano Banana 2 recordInfo error:', infoRes?.status, infoJson);
+          continue;
+        }
+
+        const state = infoJson.data.state;
+        if (state === 'waiting' || state === 'queuing' || state === 'generating') {
+          continue;
+        }
+
+        if (state === 'fail') {
+          console.error('Nano Banana 2 generation failed:', infoJson.data.failCode, infoJson.data.failMsg);
+          return null; // Don't retry on explicit API failure
+        }
+
+        if (state === 'success') {
+          try {
+            const resultJsonStr = infoJson.data.resultJson || '{}';
+            const parsed = JSON.parse(resultJsonStr);
+            const urls = parsed.resultUrls;
+            if (Array.isArray(urls) && urls.length > 0 && typeof urls[0] === 'string') {
+              return urls[0];
+            }
+          } catch (e) {
+            console.error('Nano Banana 2 resultJson parse error:', e);
+          }
+          console.warn('Nano Banana 2 success but no resultUrls found');
+          return null;
+        }
+      }
+
+      console.warn('Nano Banana 2 generation timed out' + (logLabel ? ` (style: ${logLabel})` : ''));
+      if (retry < maxRetries - 1) continue;
+      return null;
+    } catch (err) {
+      console.error('Nano Banana 2 API flow failed' + (logLabel ? ` (style: ${logLabel})` : '') + ':', err.message || err);
+      if (retry < maxRetries - 1) continue;
+      return null;
+    }
+  }
+
+  return null;
+}
+
+const STYLE_ON_IMAGE_TEXT_GUIDANCE = {
+  curiosity_shock:
+    'Generate a bold curiosity hook that creates shock or surprise. Use patterns like "Most People Get This Wrong About X" or "The Truth About X They Don\'t Tell You". Make people want to click. Max 60 chars for headline. Subheadline: short supporting line like "Check Before You Decide" or "Here\'s What Actually Works".',
+  question_style:
+    'Generate a viral question that invites clicks. Must be a direct question people want answered. Examples: "Can You Really Trust X?" or "Is X Actually Worth It?". Max 60 chars. Subheadline: promise line like "Get the Real Answer" or "What the Experts Say".',
+  viral_curiosity:
+    'Generate a story-style headline that creates curiosity. Use patterns like "I Tried X For 30 Days..." or "What Happened When I Stopped X". Max 60 chars. Subheadline: "Here\'s What Actually Happened" or "The Results Surprised Me".',
+  money_saving:
+    'Generate a value-focused headline about saving time or money. Punchy, practical. Examples: "Stop Wasting Time & Money on X" or "The Smart Way to Do X". Max 60 chars. Subheadline: "Do It The Smart Way Instead" or "Save Hours Every Week".',
+  minimal_typography:
+    'Generate a short bold statement. Minimal, high-impact. One powerful phrase. Max 50 chars. Subheadline: "Key Things You Should Know" or similar. Keep both very short.',
+  cozy_baking:
+    'Generate a friendly, practical headline. Warm and inviting. Max 60 chars. Subheadline: "Practical tips you can actually use" or "Simple tips for everyday".',
+  clean_appetizing:
+    'Generate a clear, appetizing headline. Soft and approachable. Max 60 chars. Subheadline: "Updated guide" or "Everything you need to know".',
+  clumpy_fix:
+    'Generate a practical how-to headline. Simple fix or method. Examples: "The Simple Fix for X" or "How to Get X Right". Max 60 chars. Subheadline: "Plain-English guide, no fluff".',
+  minimal_elegant:
+    'Generate an elegant, refined headline. Premium feel, minimal words. Max 50 chars. Subheadline: keep very short or empty.',
+  before_after:
+    'Generate a before/after contrast headline. Can be the topic or "Before vs After: X". Max 60 chars. Subheadline: "See the difference" or "The transformation".',
+  timeline_infographic:
+    'Generate a concise step-by-step headline. Examples: "The X Timeline" or "5 Steps to Master X". Max 60 chars. Subheadline: "Step-by-step guide" or "Your roadmap".',
+  grid_3_images: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+  grid_4_images: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+  stacked_strips: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+  offset_collage_3: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+  circle_cluster_4: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+  step_cards_3: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+};
+
+async function generateStyleOnImageText({ styleId, topic, domain, keyword, year, description, avoidText }) {
+  const guidance = STYLE_ON_IMAGE_TEXT_GUIDANCE[styleId] ||
+    'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.';
+  const avoidNote = avoidText && (avoidText.headline || avoidText.subheadline)
+    ? `\n\nIMPORTANT: The current image already has this text - you MUST generate DIFFERENT text. Do NOT use: headline "${avoidText.headline || ''}", subheadline "${avoidText.subheadline || ''}". Create something fresh and varied.`
+    : '';
+  const content = `Article/topic: ${topic}\n${keyword ? `Keyword: ${keyword}\n` : ''}Domain: ${domain}\nYear: ${year}\n${description ? `Context: ${description.slice(0, 200)}\n` : ''}\nStyle: ${styleId}\n\n${guidance}${avoidNote}\n\nReturn JSON only: {"headline":"...","subheadline":"..."}. No markdown.`;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content }],
+      max_tokens: 120,
+      temperature: 0.8,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      let headline = (parsed.headline || topic || '').slice(0, 120).trim();
+      let subheadline = (parsed.subheadline || '').slice(0, 140).trim();
+      if (!headline) headline = topic;
+      return { headline, subheadline };
+    }
+  } catch (e) {
+    console.warn('generateStyleOnImageText error:', e.message || e);
+  }
+  return { headline: topic, subheadline: '' };
+}
+
+const ILLUSTRATED_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
+const REALISTIC_PREFIX = 'Photorealistic, high-quality photograph. Natural lighting, lifelike imagery, professional photography style. ';
+
+function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand }) {
+  const headline = overlayText?.headline || topic;
+  const subheadline = overlayText?.subheadline || '';
+  const source = overlayText?.source || domain;
+  const brandTail = brand?.brandName ? ` Use the brand name ${brand.brandName} subtly in the design.` : '';
+  const useRealistic = !ILLUSTRATED_STYLES.has(styleId);
+  const baseIntro = 'Vertical Pinterest pin 1000x1500 px. ' + (useRealistic ? REALISTIC_PREFIX : '');
+
+  switch (styleId) {
+    case 'before_after':
+      return (
+        baseIntro +
+        `Split layout with a clear “Before” left half and “After” right half about "${keyword || topic}". ` +
+        `Show the on-image main text "${headline}" across the top center. ` +
+        `Label the left side "Before" and the right side "After" with short, readable labels. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the main text. ` : '') +
+        `At the bottom, add small, readable source text "${source}".` +
+        brandTail
+      );
+    case 'timeline_infographic':
+      return (
+        baseIntro +
+        `Clean vertical infographic timeline with 4–5 steps explaining "${keyword || topic}". ` +
+        `At the top of the pin, place the main title text "${headline}". ` +
+        (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
+        `Each step box has a very short label, and the background stays simple and low-contrast so the text is readable. ` +
+        `At the bottom, include small source text "${source}".` +
+        brandTail
+      );
+    case 'grid_4_images':
+      return (
+        baseIntro +
+        `2×2 grid of four related photographs about "${keyword || topic}" with thin white gutters. ` +
+        `Place the main headline "${headline}" in a banner at the top of the pin. ` +
+        (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `At the very bottom, add small source text "${source}".` +
+        brandTail
+      );
+    case 'offset_collage_3':
+      return (
+        baseIntro +
+        `Asymmetrical collage: one large hero photograph on the left and two smaller stacked photographs on the right, all about "${keyword || topic}". ` +
+        `Place the main text "${headline}" over a solid or semi-transparent area in the top-right region so it is very readable. ` +
+        (subheadline ? `Add a short supporting line "${subheadline}" below the headline. ` : '') +
+        `Include small source text "${source}" near the bottom edge.` +
+        brandTail
+      );
+    case 'clean_appetizing':
+      return (
+        baseIntro +
+        `Soft neutral background with subtle texture. Simple, clear focal object or photograph that represents "${keyword || topic}". Clean, modern blog-style design with plenty of white space. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'curiosity_shock':
+      return (
+        baseIntro +
+        `Bold, dramatic, high-contrast image. Strong central subject that creates shock and curiosity. Dramatic lighting. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'money_saving':
+      return (
+        baseIntro +
+        `Visual value motif: imagery suggesting saving time, money, or results. Clean layout with practical elements related to "${keyword || topic}". Bright but simple. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'minimal_typography':
+      return (
+        baseIntro +
+        `Minimalist layout: pure white or light background, lots of whitespace. Single strong visual object representing "${keyword || topic}". High-contrast, typography-forward. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'question_style':
+      return (
+        baseIntro +
+        `Image that visually represents a question or dilemma, with subtle question-mark elements or split choices. Clean background. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'cozy_baking':
+      return (
+        baseIntro +
+        `Lifestyle context scene: someone interacting with "${keyword || topic}" in everyday life (e.g. at a desk, with a laptop, or using a product). Warm natural light. Warm, inviting, lifestyle photography. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'viral_curiosity':
+      return (
+        baseIntro +
+        `Story-like composition: focused close-up of a hand holding something that represents "${keyword || topic}" (e.g. document, device, product). Slightly dramatic lighting. Mysterious, story-driven, personal experiment feel. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'clumpy_fix':
+      return (
+        baseIntro +
+        `Practical, simple layout: light surface with a clear object representing "${keyword || topic}" and a small related element (tool, document). Minimal props, lots of breathing room. Non-dramatic. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'minimal_elegant':
+      return (
+        baseIntro +
+        `Soft beige or light gray background. Elegant overhead shot of a single, simple object representing "${keyword || topic}" with delicate shadows. Minimal, premium feel. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    case 'step_cards_3':
+      return (
+        baseIntro +
+        `Three tall step cards stacked vertically, each with an icon or small image and short label (Step 1, Step 2, Step 3) for "${keyword || topic}". Simple flat or lightly textured background. ` +
+        `At the top, place the main title text "${headline}". ` +
+        (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
+        `At the bottom, include small source text "${source}".` +
+        brandTail
+      );
+    case 'grid_3_images':
+      return (
+        baseIntro +
+        `Clean layout with a grid of three related photographs representing "${keyword || topic}" (e.g. three variations, steps, or examples). Thin white borders between panels. ` +
+        `Place the main headline "${headline}" in a banner at the top. ` +
+        (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `At the very bottom, add small source text "${source}".` +
+        brandTail
+      );
+    case 'stacked_strips':
+      return (
+        baseIntro +
+        `Three horizontal photograph strips stacked vertically on one side. Each strip shows a different scene or detail related to "${keyword || topic}". Clean editorial feel. ` +
+        `Place the main text "${headline}" over a solid or semi-transparent area. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" below the headline. ` : '') +
+        `Include small source text "${source}" at the bottom.` +
+        brandTail
+      );
+    case 'circle_cluster_4':
+      return (
+        baseIntro +
+        `Four circular photographs arranged around a central text area, each showing a different aspect of "${keyword || topic}". Clean light background. ` +
+        `Place the main headline "${headline}" in the center. ` +
+        (subheadline ? `Add a short subheadline "${subheadline}" below. ` : '') +
+        `Add small source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
+    default:
+      return (
+        baseIntro +
+        `Eye-catching but not cluttered design about "${keyword || topic}". Use real-life photography or photorealistic imagery. ` +
+        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+        (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
+        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        brandTail
+      );
   }
 }
 
 // POST /api/generate-image
+// Accepts { title } for simple background-only, or { prompt } for full prompt including baked-in text (used by URL-to-Pin fallback)
 app.post('/api/generate-image', async (req, res) => {
   console.log('Received request:', req.body);
-  const { title } = req.body;
-  if (!title) {
-    return res.status(400).json({ error: 'Title is required' });
+  const { title, prompt: customPrompt } = req.body;
+  if (!title && !customPrompt) {
+    return res.status(400).json({ error: 'Title or prompt is required' });
   }
 
   if (!REPLICATE_API_TOKEN) {
@@ -1149,8 +1436,8 @@ app.post('/api/generate-image', async (req, res) => {
   }
 
   try {
-    // Construct a highly optimized Pinterest-style prompt
-    const pinterestPrompt = `Create an eye-catching, scroll-stopping Pinterest pin background for a blog post titled "${title}". The image must be vertical (portrait layout), visually stunning, and use vibrant, modern colors with a clean, contemporary style. Soft lighting, shallow depth of field, high resolution, professional photographer style. Absolutely no text, words, or lettering—only visuals. The design should be suitable as a background for a Pinterest pin, with clear space for text overlay.`;
+    const pinterestPrompt = customPrompt ||
+      `Create an eye-catching, scroll-stopping Pinterest pin background for a blog post titled "${title || 'this topic'}". The image must be vertical (portrait layout), visually stunning, and use vibrant, modern colors with a clean, contemporary style. Soft lighting, shallow depth of field, high resolution, professional photographer style. Absolutely no text, words, or lettering—only visuals. The design should be suitable as a background for a Pinterest pin, with clear space for text overlay.`;
     // Call Replicate SDXL API
     const response = await fetch('https://api.replicate.com/v1/predictions', {
       method: 'POST',
@@ -1238,7 +1525,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
 
 app.post('/api/urltopin/generate', requireUser, async (req, res) => {
   try {
-    const { url, styles, articleData, brand } = req.body || {};
+    const { url, styles, articleData, brand, avoidText } = req.body || {};
     if (!url || !Array.isArray(styles) || styles.length === 0) {
       return res.status(400).json({ error: 'Missing url or styles' });
     }
@@ -1426,12 +1713,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         let pinTitle = topic;
         let pinDescription = base.description || '';
         let hashtags = [];
+        let onImageHeadline = topic;
+        let onImageSubheadline = '';
         try {
           const c1 = new AbortController();
           const c2 = new AbortController();
           const t1 = setTimeout(() => c1.abort(), metadataTimeoutMs);
           const t2 = setTimeout(() => c2.abort(), metadataTimeoutMs);
-          const [titleRes, descRes] = await Promise.all([
+          const [titleRes, descRes, onImageResult] = await Promise.all([
             fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
@@ -1443,6 +1732,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
               headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
               body: JSON.stringify({ content: descPrompt, type: 'description' }),
               signal: c2.signal,
+            }),
+            generateStyleOnImageText({
+              styleId: sp.id,
+              topic,
+              domain,
+              keyword,
+              year,
+              description: base.description || '',
+              avoidText: styles.length === 1 && avoidText ? avoidText : null,
             }),
           ]);
           clearTimeout(t1);
@@ -1459,35 +1757,69 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
               if (tagMatches) hashtags = tagMatches.slice(0, 10);
             }
           }
+          if (onImageResult) {
+            onImageHeadline = onImageResult.headline || topic;
+            onImageSubheadline = onImageResult.subheadline || '';
+          }
         } catch (e) {
           console.warn('urltopin metadata generation error (style:', sp.label, '):', e.message || e);
         }
-        styleMetadataByStyleId.set(sp.id, { pinTitle, pinDescription, hashtags });
+        styleMetadataByStyleId.set(sp.id, { pinTitle, pinDescription, hashtags, onImageHeadline, onImageSubheadline });
       })
     );
 
     const pins = [];
+    const brandForPrompt = {
+      brandName: brandName || null,
+      primaryColor: brandPrimary || null,
+      secondaryColor: brandSecondary || null,
+      accentColor: brandAccent || null,
+      logoUrl: brandLogoUrl || null,
+    };
 
     for (const sp of stylePrompts) {
-      // First, try Nano Banana 2 with the AI-generated image prompt (one automatic retry on timeout/fail)
+      const meta = styleMetadataByStyleId.get(sp.id) || {};
+      const pinTitle = meta.pinTitle ?? topic;
+      const pinDescription = (meta.pinDescription ?? base.description) || '';
+      const hashtags = meta.hashtags ?? [];
+      const onImageHeadline = meta.onImageHeadline ?? pinTitle;
+      const onImageSubheadline = meta.onImageSubheadline ?? '';
+
+      const overlayTextForPrompt = {
+        headline: onImageHeadline,
+        subheadline: onImageSubheadline,
+        source: domain,
+      };
+
+      const imagePrompt = buildOverlayImagePrompt({
+        styleId: sp.id,
+        topic,
+        domain,
+        keyword,
+        year,
+        overlayText: overlayTextForPrompt,
+        brand: brandForPrompt,
+      });
+
+      const overlayText = { headline: '', subheadline: '', source: '' };
+
       let imageUrl = '';
       try {
-        imageUrl = await generateImageWithNanoBanana(sp.prompt, sp.label);
+        imageUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
         if (!imageUrl) {
           console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
-          imageUrl = await generateImageWithNanoBanana(sp.prompt, sp.label);
+          imageUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
         }
       } catch (e) {
         console.warn('urltopin nano-banana image generation error (style:', sp.label, '):', e.message || e);
       }
 
-      // Fallback to existing Replicate-based generator if Nano Banana is not configured or fails
       if (!imageUrl) {
         try {
           const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: topic }),
+            body: JSON.stringify({ prompt: imagePrompt, title: topic }),
           });
           if (imgRes.ok) {
             const imgJson = await imgRes.json();
@@ -1498,20 +1830,17 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       }
 
-      const meta = styleMetadataByStyleId.get(sp.id) || {};
-      const pinTitle = meta.pinTitle ?? topic;
-      const pinDescription = (meta.pinDescription ?? base.description) || '';
-      const hashtags = meta.hashtags ?? [];
-
       const pinRecord = {
         styleId: sp.id,
         styleLabel: sp.label,
-        imagePrompt: sp.prompt,
+        imagePrompt,
         imageUrl,
         title: pinTitle,
         description: pinDescription,
         hashtags,
         link: url,
+        overlayText,
+        bakedInText: overlayTextForPrompt,
       };
 
       pins.push(pinRecord);
@@ -1548,6 +1877,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         const originalPinData = {
           ...baseHistory,
           source: 'urltopin',
+          overlayText,
+          bakedInText: overlayTextForPrompt,
         };
 
         // Store in scheduled_pins with status 'generated' so they show under
@@ -1639,6 +1970,68 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     return res.json({ description: sanitizeDescription(result) });
   } catch (err) {
     console.error('urltopin regenerate-metadata error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Regenerate only the image for a given style using explicit overlay text
+app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, res) => {
+  try {
+    const { url, styleId, overlayText, articleData, brand } = req.body || {};
+    if (!url || !styleId || !overlayText) {
+      return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
+    }
+
+    // Consume one pin from the user’s plan limit
+    const usageResult = await consumePinUsage(req.user.id, 1);
+    if (!usageResult.allowed) {
+      return res.status(402).json({
+        error: 'pin_limit_reached',
+        message: `Your current plan allows ${usageResult.planPinsLimit} pins per month. You have already used ${usageResult.currentUsed} pins this month, so generating 1 more would exceed your limit.`,
+        details: usageResult,
+      });
+    }
+
+    const base = articleData || extractMetaFromHtml('', url);
+    const year = new Date().getFullYear();
+    const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
+    const keyword = base.keyword || '';
+    const topic = base.title || 'Does Brown Sugar Expire?';
+
+    const imagePrompt = buildOverlayImagePrompt({
+      styleId,
+      topic,
+      domain,
+      keyword,
+      year,
+      overlayText,
+      brand,
+    });
+
+    let imageUrl = await generateImageWithNanoBanana(imagePrompt, styleId);
+    if (!imageUrl) {
+      try {
+        const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: imagePrompt, title: topic }),
+        });
+        if (imgRes.ok) {
+          const imgJson = await imgRes.json();
+          imageUrl = imgJson.imageUrl || '';
+        }
+      } catch (e) {
+        console.warn('urltopin regenerate-image-with-text fallback error:', e.message || e);
+      }
+    }
+
+    if (!imageUrl) {
+      return res.status(500).json({ error: 'Failed to generate image with the provided text' });
+    }
+
+    return res.json({ imageUrl, imagePrompt });
+  } catch (err) {
+    console.error('urltopin regenerate-image-with-text error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
