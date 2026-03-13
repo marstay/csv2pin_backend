@@ -2761,6 +2761,55 @@ app.get('/api/pinterest/accounts', async (req, res) => {
   res.json({ accounts: data || [] });
 });
 
+// Delete / disconnect a Pinterest account for the current user
+app.delete('/api/pinterest/accounts/:id', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const accountId = req.params.id;
+  if (!accountId) return res.status(400).json({ error: 'Missing account id' });
+
+  try {
+    // Ensure the account belongs to this user
+    const { data: account, error: fetchError } = await supabaseAdmin
+      .from('pinterest_accounts')
+      .select('id, user_id')
+      .eq('id', accountId)
+      .eq('user_id', user.id)
+      .single();
+
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      console.error('Error fetching pinterest account before delete:', fetchError);
+      return res.status(500).json({ error: 'Failed to verify account ownership' });
+    }
+
+    if (!account) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    // Delete the account; scheduled_pins.pinterest_account_id has ON DELETE CASCADE
+    const { error: deleteError } = await supabaseAdmin
+      .from('pinterest_accounts')
+      .delete()
+      .eq('id', accountId)
+      .eq('user_id', user.id);
+
+    if (deleteError) {
+      console.error('Error deleting pinterest account:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete account' });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Unexpected error deleting pinterest account:', err);
+    return res.status(500).json({ error: 'Unexpected error deleting account' });
+  }
+});
+
 function extractAccountId(req) {
   return req.query.account_id || req.body?.account_id || null;
 }
@@ -3708,54 +3757,63 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
       const pageSize = 200; // fetch in batches to avoid memory spikes
       let from = 0;
       while (true) {
-        const { data, error } = await supabaseAdmin
+        let scheduledQuery = supabaseAdmin
           .from('scheduled_pins')
           .select('id, pinterest_pin_id, metrics_last_updated')
           .eq('user_id', user.id)
           .eq('status', 'posted')
           .not('pinterest_pin_id', 'is', null)
           .range(from, from + pageSize - 1);
+        if (account_id) scheduledQuery = scheduledQuery.eq('pinterest_account_id', account_id);
+        const { data, error } = await scheduledQuery;
         if (error) { fetchError = error; break; }
         if (!data || data.length === 0) break;
         postedPins = postedPins.concat(data);
         from += pageSize;
       }
 
-      from = 0;
-      while (true) {
-        const { data, error } = await supabaseAdmin
-          .from('user_images')
-          .select('id, pinterest_pin_id, metrics_last_updated')
-          .eq('user_id', user.id)
-          .eq('pinterest_uploaded', true)
-          .not('pinterest_pin_id', 'is', null)
-          .range(from, from + pageSize - 1);
-        if (error) { userImagesError = error; break; }
-        if (!data || data.length === 0) break;
-        userImagePins = userImagePins.concat(data);
-        from += pageSize;
+      // user_images are not tied to an account; only include when syncing all accounts
+      if (!account_id) {
+        from = 0;
+        while (true) {
+          const { data, error } = await supabaseAdmin
+            .from('user_images')
+            .select('id, pinterest_pin_id, metrics_last_updated')
+            .eq('user_id', user.id)
+            .eq('pinterest_uploaded', true)
+            .not('pinterest_pin_id', 'is', null)
+            .range(from, from + pageSize - 1);
+          if (error) { userImagesError = error; break; }
+          if (!data || data.length === 0) break;
+          userImagePins = userImagePins.concat(data);
+          from += pageSize;
+        }
       }
     } else {
       // Non-force path keeps a conservative limit to respect rate limits
-      const postedResp = await supabaseAdmin
+      let postedQuery = supabaseAdmin
         .from('scheduled_pins')
         .select('id, pinterest_pin_id, metrics_last_updated')
         .eq('user_id', user.id)
         .eq('status', 'posted')
         .not('pinterest_pin_id', 'is', null)
         .limit(50);
+      if (account_id) postedQuery = postedQuery.eq('pinterest_account_id', account_id);
+      const postedResp = await postedQuery;
       postedPins = postedResp.data || [];
       fetchError = postedResp.error;
 
-      const userImgResp = await supabaseAdmin
-        .from('user_images')
-        .select('id, pinterest_pin_id, metrics_last_updated')
-        .eq('user_id', user.id)
-        .eq('pinterest_uploaded', true)
-        .not('pinterest_pin_id', 'is', null)
-        .limit(50);
-      userImagePins = userImgResp.data || [];
-      userImagesError = userImgResp.error;
+      if (!account_id) {
+        const userImgResp = await supabaseAdmin
+          .from('user_images')
+          .select('id, pinterest_pin_id, metrics_last_updated')
+          .eq('user_id', user.id)
+          .eq('pinterest_uploaded', true)
+          .not('pinterest_pin_id', 'is', null)
+          .limit(50);
+        userImagePins = userImgResp.data || [];
+        userImagesError = userImgResp.error;
+      }
     }
 
     console.log(`📊 Found ${postedPins?.length || 0} pins in scheduled_pins table`);
