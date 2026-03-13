@@ -3063,7 +3063,7 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { status, limit = 50, offset = 0 } = req.query;
+  const { status, limit = 50, offset = 0, date_from, date_to } = req.query;
 
   try {
     let query = supabaseAdmin
@@ -3078,6 +3078,13 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
 
     if (status) {
       query = query.eq('status', status);
+    }
+    if (date_from) {
+      query = query.gte('scheduled_for', date_from);
+    }
+    if (date_to) {
+      const toEndOfDay = new Date(date_to + 'T23:59:59.999Z');
+      query = query.lte('scheduled_for', toEndOfDay.toISOString());
     }
 
     const { data: scheduledPins, error: fetchError } = await query
