@@ -681,24 +681,16 @@ async function processAnalyticsSync() {
     // Get all unique users who have posted pins with Pinterest pin IDs from scheduled_pins
     const { data: scheduledPostedPins, error: scheduledFetchError } = await supabaseAdmin
       .from('scheduled_pins')
-      .select(`
-        user_id,
-        pinterest_accounts(access_token)
-      `)
+      .select('user_id')
       .eq('status', 'posted')
       .not('pinterest_pin_id', 'is', null);
 
     // Also get users who have uploaded pins directly (Images mode) from user_images
     const { data: directUploadPins, error: directFetchError } = await supabaseAdmin
       .from('user_images')
-      .select(`
-        user_id,
-        profiles(pinterest_access_token)
-      `)
+      .select('user_id')
       .eq('pinterest_uploaded', true)
       .not('pinterest_pin_id', 'is', null);
-
-    const allPostedPins = [...(scheduledPostedPins || []), ...(directUploadPins || [])];
 
     if (scheduledFetchError) {
       console.error('❌ Error fetching scheduled posted pins for analytics sync:', scheduledFetchError);
@@ -711,32 +703,34 @@ async function processAnalyticsSync() {
       return;
     }
 
-    // Get unique users
-    const usersMap = new Map();
-    allPostedPins?.forEach(pin => {
-      if (!usersMap.has(pin.user_id)) {
-        // Handle both pinterest_accounts (from scheduled_pins) and profiles (from user_images)
-        const accessToken = pin.pinterest_accounts?.access_token || pin.profiles?.pinterest_access_token;
-        usersMap.set(pin.user_id, { access_token: accessToken });
-      }
+    // Collect unique user_ids across both sources
+    const userIdSet = new Set();
+    (scheduledPostedPins || []).forEach(pin => {
+      if (pin.user_id) userIdSet.add(pin.user_id);
+    });
+    (directUploadPins || []).forEach(pin => {
+      if (pin.user_id) userIdSet.add(pin.user_id);
     });
 
-    const usersWithPins = Array.from(usersMap.entries()).map(([user_id, pinterest_accounts]) => ({
-      user_id,
-      pinterest_accounts
-    }));
+    const userIds = Array.from(userIdSet);
 
-    if (!usersWithPins || usersWithPins.length === 0) {
+    if (!userIds || userIds.length === 0) {
       console.log('✅ No users with posted pins found for analytics sync');
       return;
     }
 
-    console.log(`📊 Found ${usersWithPins.length} users for analytics sync`);
+    console.log(`📊 Found ${userIds.length} users for analytics sync`);
 
     // Process each user's analytics
-    for (const userPin of usersWithPins) {
+    for (const userId of userIds) {
       try {
-        await syncUserAnalytics(userPin.user_id, userPin.pinterest_accounts?.access_token);
+        // Resolve the correct Pinterest access token for this user
+        const accessToken = await getPinterestAccessTokenForUser(userId, null);
+        if (!accessToken) {
+          console.log(`⚠️ No Pinterest access token for user ${userId}, skipping analytics sync`);
+          continue;
+        }
+        await syncUserAnalytics(userId, accessToken);
         // Add delay between users to respect rate limits
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
