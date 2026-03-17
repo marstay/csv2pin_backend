@@ -1799,10 +1799,44 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
       let imageUrl = '';
       try {
-        imageUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+        const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+        imageUrl = nanoUrl || '';
         if (!imageUrl) {
           console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
-          imageUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+          const retryUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+          imageUrl = retryUrl || '';
+        }
+
+        // If Nano Banana returned an image, persist it to Supabase Storage (ai-images)
+        if (imageUrl) {
+          try {
+            const imageRes = await fetch(imageUrl);
+            if (imageRes.ok) {
+              const arrayBuffer = await imageRes.arrayBuffer();
+              const buffer = Buffer.from(arrayBuffer);
+              const fileExt = imageUrl.split('.').pop().split('?')[0] || 'png';
+              const fileName = `urltopin-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${sp.id}.${fileExt}`;
+              const { error: uploadError } = await supabaseAdmin.storage
+                .from('ai-images')
+                .upload(fileName, buffer, {
+                  contentType: imageRes.headers.get('content-type') || 'image/png',
+                  upsert: true,
+                });
+              if (!uploadError) {
+                const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+                const publicUrl = publicUrlData?.publicUrl;
+                if (publicUrl) {
+                  imageUrl = publicUrl;
+                }
+              } else {
+                console.warn('urltopin nano-banana upload error:', uploadError.message || uploadError);
+              }
+            } else {
+              console.warn('urltopin nano-banana fetch image failed with status', imageRes.status);
+            }
+          } catch (uploadErr) {
+            console.warn('urltopin nano-banana download/upload error:', uploadErr.message || uploadErr);
+          }
         }
       } catch (e) {
         console.warn('urltopin nano-banana image generation error (style:', sp.label, '):', e.message || e);
