@@ -6,6 +6,9 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import JSZip from 'jszip';
+import { enrichContentProfile, planStrategies, generateStrategicPinMetadata, checkDiversity, rankPins, getStrategyReason } from './strategicPin.js';
+
+const ANGLE_OPTIONS = ['mistake', 'beginner', 'advanced', 'time-saving', 'emotional', 'secret', 'warning', 'benefit'];
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -1240,13 +1243,14 @@ async function generateStyleOnImageText({ styleId, topic, domain, keyword, year,
 const ILLUSTRATED_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
 const REALISTIC_PREFIX = 'Photorealistic, high-quality photograph. Natural lighting, lifelike imagery, professional photography style. ';
 
-function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand }) {
+function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand, stepCount }) {
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
   const source = overlayText?.source || domain;
   const brandTail = brand?.brandName ? ` Use the brand name ${brand.brandName} subtly in the design.` : '';
   const useRealistic = !ILLUSTRATED_STYLES.has(styleId);
   const baseIntro = 'Vertical Pinterest pin 1000x1500 px. ' + (useRealistic ? REALISTIC_PREFIX : '');
+  const numSteps = typeof stepCount === 'number' ? stepCount : (styleId === 'step_cards_3' || styleId === 'grid_3_images' ? 3 : styleId === 'grid_4_images' ? 4 : styleId === 'timeline_infographic' ? 5 : null);
 
   switch (styleId) {
     case 'before_after':
@@ -1259,16 +1263,20 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `At the bottom, add small, readable source text "${source}".` +
         brandTail
       );
-    case 'timeline_infographic':
+    case 'timeline_infographic': {
+      const steps = numSteps || 5;
+      const stepLabels = Array.from({ length: steps }, (_, i) => `Step ${i + 1}`).join(', ');
       return (
         baseIntro +
-        `Clean vertical infographic timeline with 4–5 steps explaining "${keyword || topic}". ` +
+        `Clean vertical infographic timeline with exactly ${steps} steps explaining "${keyword || topic}". ` +
+        `Label steps as: ${stepLabels}. ` +
         `At the top of the pin, place the main title text "${headline}". ` +
         (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
         `Each step box has a very short label, and the background stays simple and low-contrast so the text is readable. ` +
         `At the bottom, include small source text "${source}".` +
         brandTail
       );
+    }
     case 'grid_4_images':
       return (
         baseIntro +
@@ -1501,7 +1509,7 @@ app.post('/api/generate-image', async (req, res) => {
 
 app.post('/api/urltopin/scrape', async (req, res) => {
   try {
-    const { url } = req.body || {};
+    const { url, enrich } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
     const response = await fetch(url, { redirect: 'follow' });
@@ -1510,6 +1518,13 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     }
     const html = await response.text();
     const meta = extractMetaFromHtml(html, url);
+    if (enrich) {
+      try {
+        meta.contentProfile = await enrichContentProfile(meta, openai);
+      } catch (e) {
+        console.warn('urltopin scrape enrich error:', e.message || e);
+      }
+    }
     return res.json(meta);
   } catch (err) {
     console.error('urltopin scrape error:', err);
@@ -1517,15 +1532,60 @@ app.post('/api/urltopin/scrape', async (req, res) => {
   }
 });
 
+app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
+  try {
+    const { url, articleData } = req.body || {};
+    if (!url || !articleData) {
+      return res.status(400).json({ error: 'Missing url or articleData' });
+    }
+    const base = articleData || extractMetaFromHtml('', url);
+    const contentProfile = await enrichContentProfile(base, openai);
+    const plan = planStrategies(contentProfile, 10);
+    const strategyCounts = {};
+    plan.forEach((p) => { strategyCounts[p.strategy] = (strategyCounts[p.strategy] || 0) + 1; });
+    const topStrategies = Object.entries(strategyCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([s]) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()));
+    return res.json({ plan, contentProfile, top_strategies: topStrategies });
+  } catch (err) {
+    console.error('urltopin plan-strategic error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/urltopin/generate', requireUser, async (req, res) => {
   try {
-    const { url, styles, articleData, brand, avoidText } = req.body || {};
-    if (!url || !Array.isArray(styles) || styles.length === 0) {
-      return res.status(400).json({ error: 'Missing url or styles' });
+    const { url, styles, articleData, brand, avoidText, mode, count, strategicSingle } = req.body || {};
+    const isStrategic = mode === 'strategic';
+    const isStrategicSingle = mode === 'strategic_single';
+
+    let effectiveStyles = Array.isArray(styles) ? styles : [];
+    if (isStrategicSingle && strategicSingle) {
+      const { strategy, layoutId } = strategicSingle;
+      if (strategy && layoutId) {
+        effectiveStyles = [layoutId];
+        req._strategicPlan = [{ strategy, goal: strategicSingle.goal || 'clicks', layoutId }];
+        req._contentProfile = strategicSingle.contentProfile || {};
+        req._strategicSingle = true;
+      }
+    } else if (isStrategic) {
+      const base = articleData || extractMetaFromHtml('', url);
+      const contentProfile = await enrichContentProfile(base, openai);
+      const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
+      effectiveStyles = plan.map((p) => p.layoutId);
+      req._strategicPlan = plan;
+      req._contentProfile = contentProfile;
+    }
+
+    if (!url || effectiveStyles.length === 0) {
+      return res.status(400).json({
+        error: isStrategic ? 'Missing url or articleData for strategic mode' : 'Missing url or styles',
+      });
     }
 
     // Enforce plan-based pin limits using pin_usage
-    const pinsToGenerate = styles.length;
+    const pinsToGenerate = effectiveStyles.length;
     const usageResult = await consumePinUsage(req.user.id, pinsToGenerate);
     if (!usageResult.allowed) {
       return res.status(402).json({
@@ -1540,6 +1600,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
+
+    const articleSummary = [base.title, base.description].filter(Boolean).join('. ').slice(0, 600);
 
     const brandPrimary = brand?.primaryColor || null;
     const brandSecondary = brand?.secondaryColor || null;
@@ -1585,6 +1647,24 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     };
 
     const stylePrompts = [];
+    let strategicMetadataByIndex = [];
+    if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
+      const plan = req._strategicPlan;
+      const metaResults = await Promise.all(
+        plan.map((p, i) =>
+          generateStrategicPinMetadata(
+            { articleSummary, keyword, strategy: p.strategy, layoutId: p.layoutId, suggestedAngle: ANGLE_OPTIONS[i % ANGLE_OPTIONS.length] },
+            openai
+          )
+        )
+      );
+      strategicMetadataByIndex = plan.map((p, i) => ({
+        ...metaResults[i],
+        strategy: p.strategy,
+        goal: p.goal,
+        layoutId: p.layoutId,
+      }));
+    }
 
     const styleSpecificGuidance = {
       before_after:
@@ -1600,8 +1680,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         'When the requested style is a TIMELINE INFOGRAPHIC, you MUST describe a vertical infographic timeline made of multiple clearly numbered or labelled steps (for example: Step 1, Step 2, Step 3...). Do not describe a photographic scene as the main background. Instead, use a simple flat or lightly textured background, vertical connectors or arrows, and boxes or circles for each step, with short labels that summarize each stage of the article. The steps themselves are the main visual focus.',
     };
 
-    for (const id of styles) {
-      const styleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
+    const useDummyImages = process.env.USE_DUMMY_IMAGES === 'true';
+
+    for (let i = 0; i < effectiveStyles.length; i++) {
+      const id = effectiveStyles[i];
+      const strategicMeta = strategicMetadataByIndex[i];
+      const styleDescription =
+        (styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.') +
+        (strategicMeta?.image_prompt_hint ? ` Strategy visual: ${strategicMeta.image_prompt_hint}.` : '');
       try {
         const isTimeline = id === 'timeline_infographic';
 
@@ -1670,13 +1756,29 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           `Vertical Pinterest pin 1000x1500 px, ${styleDescription} about "${topic}". Main concept: ${keyword ||
             'blog article'}. No text in the image.`;
 
-        // For certain layout-heavy styles, enforce a deterministic prompt shape
+        // For certain layout-heavy styles, enforce a deterministic prompt shape with consistent step count
+        const stepCount = strategicMeta?.step_count;
+        const numSteps = typeof stepCount === 'number' ? stepCount : (id === 'step_cards_3' || id === 'grid_3_images' ? 3 : id === 'grid_4_images' ? 4 : 5);
         if (id === 'timeline_infographic') {
+          const stepLabels = Array.from({ length: numSteps }, (_, i) => `Step ${i + 1}`).join(', ');
           imagePrompt =
             `Vertical Pinterest pin 1000x1500 px. Simple, light background with very low contrast so text and shapes are easy to read. ` +
-            `A vertical infographic timeline runs from top to bottom with 4–6 clearly separated steps in boxes or circles, connected by a thin line or arrows. ` +
+            `A vertical infographic timeline runs from top to bottom with exactly ${numSteps} clearly separated steps in boxes or circles, connected by a thin line or arrows. ` +
             `Each step box has a very short label (a few words) that summarizes a stage of "${topic}", using icons or small illustrations instead of detailed photos. ` +
+            `Label steps as: ${stepLabels}. ` +
             `At the very top, include a short title about "${topic}", and at the very bottom, small, readable source text that shows "${domain}".`;
+        } else if (id === 'step_cards_3') {
+          imagePrompt =
+            `Vertical Pinterest pin 1000x1500 px. Three tall step cards stacked vertically, each labelled "Step 1", "Step 2", "Step 3" for "${topic}". ` +
+            `Soft neutral background. Concise headline at top, small "${domain}" at bottom.`;
+        } else if (id === 'grid_3_images') {
+          imagePrompt =
+            `Vertical Pinterest pin 1000x1500 px. Grid of exactly 3 related images for "${topic}". ` +
+            `Short headline at top, small "${domain}" at bottom.`;
+        } else if (id === 'grid_4_images') {
+          imagePrompt =
+            `Vertical Pinterest pin 1000x1500 px. 2×2 grid of exactly 4 related images for "${topic}". ` +
+            `Short headline at top, small "${domain}" at bottom.`;
         }
 
 
@@ -1684,6 +1786,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           id,
           label: id,
           prompt: imagePrompt,
+          index: i,
         });
       } catch (promptErr) {
         console.warn('urltopin prompt generation error:', promptErr.message || promptErr);
@@ -1700,69 +1803,86 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const tokenHeader = req.headers.authorization || '';
     const metadataTimeoutMs = 20000;
     const styleMetadataByStyleId = new Map();
-    await Promise.all(
-      stylePrompts.map(async (sp) => {
-        const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
-        const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
-        let pinTitle = topic;
-        let pinDescription = base.description || '';
-        let hashtags = [];
-        let onImageHeadline = topic;
-        let onImageSubheadline = '';
-        try {
-          const c1 = new AbortController();
-          const c2 = new AbortController();
-          const t1 = setTimeout(() => c1.abort(), metadataTimeoutMs);
-          const t2 = setTimeout(() => c2.abort(), metadataTimeoutMs);
-          const [titleRes, descRes, onImageResult] = await Promise.all([
-            fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
-              body: JSON.stringify({ content: titlePrompt, type: 'title' }),
-              signal: c1.signal,
-            }),
-            fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
-              body: JSON.stringify({ content: descPrompt, type: 'description' }),
-              signal: c2.signal,
-            }),
-            generateStyleOnImageText({
-              styleId: sp.id,
-              topic,
-              domain,
-              keyword,
-              year,
-              description: base.description || '',
-              avoidText: styles.length === 1 && avoidText ? avoidText : null,
-            }),
-          ]);
-          clearTimeout(t1);
-          clearTimeout(t2);
-          if (titleRes.ok) {
-            const titleJson = await titleRes.json();
-            if (titleJson?.result) pinTitle = titleJson.result;
-          }
-          if (descRes.ok) {
-            const descJson = await descRes.json();
-            if (descJson?.result) {
-              pinDescription = descJson.result;
-              const tagMatches = pinDescription.match(/#[\w-]+/g);
-              if (tagMatches) hashtags = tagMatches.slice(0, 10);
-            }
-          }
-          if (onImageResult) {
-            onImageHeadline = onImageResult.headline || topic;
-            onImageSubheadline = onImageResult.subheadline || '';
-          }
-        } catch (e) {
-          console.warn('urltopin metadata generation error (style:', sp.label, '):', e.message || e);
-        }
-        styleMetadataByStyleId.set(sp.id, { pinTitle, pinDescription, hashtags, onImageHeadline, onImageSubheadline });
-      })
-    );
 
-    const pins = [];
+    if ((isStrategic || isStrategicSingle) && strategicMetadataByIndex.length > 0) {
+      for (let i = 0; i < strategicMetadataByIndex.length; i++) {
+        const meta = strategicMetadataByIndex[i];
+        const layoutId = effectiveStyles[i];
+        styleMetadataByStyleId.set(`${layoutId}::${i}`, {
+          pinTitle: meta.title || topic,
+          pinDescription: meta.description || base.description || '',
+          hashtags: meta.hashtags || [],
+          onImageHeadline: meta.overlay_headline || topic,
+          onImageSubheadline: meta.overlay_subheadline || '',
+          strategy: meta.strategy,
+          goal: meta.goal,
+          step_count: meta.step_count ?? null,
+        });
+      }
+    } else {
+      await Promise.all(
+        stylePrompts.map(async (sp) => {
+          const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
+          const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
+          let pinTitle = topic;
+          let pinDescription = base.description || '';
+          let hashtags = [];
+          let onImageHeadline = topic;
+          let onImageSubheadline = '';
+          try {
+            const c1 = new AbortController();
+            const c2 = new AbortController();
+            const t1 = setTimeout(() => c1.abort(), metadataTimeoutMs);
+            const t2 = setTimeout(() => c2.abort(), metadataTimeoutMs);
+            const [titleRes, descRes, onImageResult] = await Promise.all([
+              fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
+                body: JSON.stringify({ content: titlePrompt, type: 'title' }),
+                signal: c1.signal,
+              }),
+              fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
+                body: JSON.stringify({ content: descPrompt, type: 'description' }),
+                signal: c2.signal,
+              }),
+              generateStyleOnImageText({
+                styleId: sp.id,
+                topic,
+                domain,
+                keyword,
+                year,
+                description: base.description || '',
+                avoidText: effectiveStyles.length === 1 && avoidText ? avoidText : null,
+              }),
+            ]);
+            clearTimeout(t1);
+            clearTimeout(t2);
+            if (titleRes.ok) {
+              const titleJson = await titleRes.json();
+              if (titleJson?.result) pinTitle = titleJson.result;
+            }
+            if (descRes.ok) {
+              const descJson = await descRes.json();
+              if (descJson?.result) {
+                pinDescription = descJson.result;
+                const tagMatches = pinDescription.match(/#[\w-]+/g);
+                if (tagMatches) hashtags = tagMatches.slice(0, 10);
+              }
+            }
+            if (onImageResult) {
+              onImageHeadline = onImageResult.headline || topic;
+              onImageSubheadline = onImageResult.subheadline || '';
+            }
+          } catch (e) {
+            console.warn('urltopin metadata generation error (style:', sp.label, '):', e.message || e);
+          }
+          styleMetadataByStyleId.set(sp.id, { pinTitle, pinDescription, hashtags, onImageHeadline, onImageSubheadline });
+        })
+      );
+    }
+
     const brandForPrompt = {
       brandName: brandName || null,
       primaryColor: brandPrimary || null,
@@ -1771,8 +1891,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       logoUrl: brandLogoUrl || null,
     };
 
-    for (const sp of stylePrompts) {
-      const meta = styleMetadataByStyleId.get(sp.id) || {};
+    const pinPromises = stylePrompts.map(async (sp) => {
+      const metaKey = (isStrategic || isStrategicSingle) && sp.index != null ? `${sp.id}::${sp.index}` : sp.id;
+      const meta = styleMetadataByStyleId.get(metaKey) || styleMetadataByStyleId.get(sp.id) || {};
       const pinTitle = meta.pinTitle ?? topic;
       const pinDescription = (meta.pinDescription ?? base.description) || '';
       const hashtags = meta.hashtags ?? [];
@@ -1793,71 +1914,81 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         year,
         overlayText: overlayTextForPrompt,
         brand: brandForPrompt,
+        stepCount: meta.step_count ?? null,
       });
 
-      const overlayText = { headline: '', subheadline: '', source: '' };
+      const overlayText = {
+        headline: onImageHeadline,
+        subheadline: onImageSubheadline,
+        source: domain,
+      };
 
       let imageUrl = '';
-      try {
-        const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
-        imageUrl = nanoUrl || '';
-        if (!imageUrl) {
-          console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
-          const retryUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
-          imageUrl = retryUrl || '';
-        }
+      if (useDummyImages) {
+        imageUrl = `https://via.placeholder.com/1000x1500.png?text=${encodeURIComponent('Dev Pin')}`;
+      } else {
+        try {
+          const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+          imageUrl = nanoUrl || '';
+          if (!imageUrl) {
+            console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
+            const retryUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+            imageUrl = retryUrl || '';
+          }
 
-        // If Nano Banana returned an image, persist it to Supabase Storage (ai-images)
-        if (imageUrl) {
-          try {
-            const imageRes = await fetch(imageUrl);
-            if (imageRes.ok) {
-              const arrayBuffer = await imageRes.arrayBuffer();
-              const buffer = Buffer.from(arrayBuffer);
-              const fileExt = imageUrl.split('.').pop().split('?')[0] || 'png';
-              const fileName = `urltopin-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${sp.id}.${fileExt}`;
-              const { error: uploadError } = await supabaseAdmin.storage
-                .from('ai-images')
-                .upload(fileName, buffer, {
-                  contentType: imageRes.headers.get('content-type') || 'image/png',
-                  upsert: true,
-                });
-              if (!uploadError) {
-                const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
-                const publicUrl = publicUrlData?.publicUrl;
-                if (publicUrl) {
-                  imageUrl = publicUrl;
+          // If Nano Banana returned an image, persist it to Supabase Storage (ai-images)
+          if (imageUrl) {
+            try {
+              const imageRes = await fetch(imageUrl);
+              if (imageRes.ok) {
+                const arrayBuffer = await imageRes.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+                const fileExt = imageUrl.split('.').pop().split('?')[0] || 'png';
+                const fileName = `urltopin-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${sp.id}.${fileExt}`;
+                const { error: uploadError } = await supabaseAdmin.storage
+                  .from('ai-images')
+                  .upload(fileName, buffer, {
+                    contentType: imageRes.headers.get('content-type') || 'image/png',
+                    upsert: true,
+                  });
+                if (!uploadError) {
+                  const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+                  const publicUrl = publicUrlData?.publicUrl;
+                  if (publicUrl) {
+                    imageUrl = publicUrl;
+                  }
+                } else {
+                  console.warn('urltopin nano-banana upload error:', uploadError.message || uploadError);
                 }
               } else {
-                console.warn('urltopin nano-banana upload error:', uploadError.message || uploadError);
+                console.warn('urltopin nano-banana fetch image failed with status', imageRes.status);
               }
-            } else {
-              console.warn('urltopin nano-banana fetch image failed with status', imageRes.status);
+            } catch (uploadErr) {
+              console.warn('urltopin nano-banana download/upload error:', uploadErr.message || uploadErr);
             }
-          } catch (uploadErr) {
-            console.warn('urltopin nano-banana download/upload error:', uploadErr.message || uploadErr);
-          }
-        }
-      } catch (e) {
-        console.warn('urltopin nano-banana image generation error (style:', sp.label, '):', e.message || e);
-      }
-
-      if (!imageUrl) {
-        try {
-          const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: imagePrompt, title: topic }),
-          });
-          if (imgRes.ok) {
-            const imgJson = await imgRes.json();
-            imageUrl = imgJson.imageUrl || '';
           }
         } catch (e) {
-          console.warn('urltopin replicate image generation error:', e.message || e);
+          console.warn('urltopin nano-banana image generation error (style:', sp.label, '):', e.message || e);
+        }
+
+        if (!imageUrl) {
+          try {
+            const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ prompt: imagePrompt, title: topic }),
+            });
+            if (imgRes.ok) {
+              const imgJson = await imgRes.json();
+              imageUrl = imgJson.imageUrl || '';
+            }
+          } catch (e) {
+            console.warn('urltopin replicate image generation error:', e.message || e);
+          }
         }
       }
 
+      const metaExtra = meta;
       const pinRecord = {
         styleId: sp.id,
         styleLabel: sp.label,
@@ -1869,9 +2000,23 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         link: url,
         overlayText,
         bakedInText: overlayTextForPrompt,
+        ...((isStrategic || isStrategicSingle) && metaExtra.strategy && {
+          strategy: metaExtra.strategy,
+          goal: metaExtra.goal,
+          goalLabel:
+            metaExtra.goal === 'clicks'
+              ? 'High Click Potential'
+              : metaExtra.goal === 'saves'
+                ? 'Save-Friendly'
+                : metaExtra.goal === 'engagement'
+                  ? 'Engagement Focused'
+                  : metaExtra.goal === 'trust'
+                    ? 'Trust & Clarity'
+                    : 'Experimental',
+          ...(metaExtra.angle && { angle: metaExtra.angle }),
+          ...(metaExtra.strategy && { reason: metaExtra.reason || getStrategyReason(metaExtra.strategy) }),
+        }),
       };
-
-      pins.push(pinRecord);
 
       // Persist URL → Pin history for this user and also surface as a "generated" entry
       // in the scheduled_pins table so it appears in the main Scheduled Pins dashboard.
@@ -1948,9 +2093,20 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           historyErr.message || historyErr
         );
       }
-    }
 
-    return res.json({ pins });
+      return pinRecord;
+    });
+
+    const pins = await Promise.all(pinPromises);
+    let finalPins = pins;
+    if (isStrategic || isStrategicSingle) {
+      const diverse = checkDiversity(pins);
+      if (diverse.length >= 10) {
+        finalPins = diverse;
+      }
+      finalPins = rankPins(finalPins);
+    }
+    return res.json({ pins: finalPins });
   } catch (err) {
     console.error('urltopin generate error:', err);
     return res.status(500).json({ error: err.message });
@@ -3151,20 +3307,31 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
       `)
       .eq('user_id', user.id)
       .is('deleted_at', null)
-      .order('scheduled_for', { ascending: true });
+      .order('scheduled_for', { ascending: true, nullsFirst: true })
+      .order('created_at', { ascending: false });
 
     if (status) {
       query = query.eq('status', status);
     }
-    if (account_id) {
+    // Generated pins have pinterest_account_id=null and scheduled_for=null - avoid filtering them out
+    const isGeneratedOnly = status === 'generated';
+    const isAllStatus = !status || status === 'all';
+    if (account_id && !isGeneratedOnly) {
       query = query.eq('pinterest_account_id', account_id);
     }
-    if (date_from) {
-      query = query.gte('scheduled_for', date_from);
-    }
-    if (date_to) {
-      const toEndOfDay = new Date(date_to + 'T23:59:59.999Z');
-      query = query.lte('scheduled_for', toEndOfDay.toISOString());
+    if (date_from || date_to) {
+      const fromVal = date_from || '1970-01-01T00:00:00.000Z';
+      const toEndOfDay = date_to
+        ? new Date(date_to + 'T23:59:59.999Z').toISOString()
+        : '2099-12-31T23:59:59.999Z';
+      if (isGeneratedOnly) {
+        // Generated pins have no scheduled_for - skip date filter
+      } else if (isAllStatus) {
+        // Include generated pins when viewing "All" with date filter
+        query = query.or(`and(scheduled_for.gte.${fromVal},scheduled_for.lte.${toEndOfDay}),status.eq.generated`);
+      } else {
+        query = query.gte('scheduled_for', fromVal).lte('scheduled_for', toEndOfDay);
+      }
     }
 
     const { data: scheduledPins, error: fetchError } = await query
