@@ -70,7 +70,12 @@ Image prompt: Minimal design, soft tones, plenty of whitespace`,
 - Use strong phrasing (e.g. "stop", "avoid")
 - Create tension
 Overlay text: Direct and bold
-Image prompt: High contrast, emphasis on text, slightly dramatic tone`,
+Image prompt: High contrast, emphasis on text, slightly dramatic tone
+IMPORTANT CONSISTENCY:
+- If the title or overlay uses words like "mistakes", "doing this wrong", or "things to stop", each item or step MUST be phrased as a mistake or wrong action to avoid (not as a correct tip).
+- Do NOT mix a "mistakes" title with positive step-by-step instructions. Either:
+  - Phrase each line as a mistake (e.g. "Keeping your fridge too warm"), or
+  - Reframe the title to talk about "tips/steps/ways" if the content is positive recommendations.`,
   },
   transformation: {
     goal: 'clicks',
@@ -181,6 +186,18 @@ const STRATEGY_SCORES = {
   wildcard: { ctr: 70, save: 55 },
 };
 
+// Layouts that are clearly multi-image or multi-panel
+const MULTI_IMAGE_LAYOUTS = new Set([
+  'grid_3_images',
+  'grid_4_images',
+  'stacked_strips',
+  'offset_collage_3',
+  'circle_cluster_4',
+  'step_cards_3',
+  'timeline_infographic',
+  'before_after',
+]);
+
 /**
  * Build strategy mix with dynamic weighting based on content profile.
  * @param {Object} contentProfile - from enrichContentProfile
@@ -256,6 +273,29 @@ function planStrategies(contentProfile, count = 10) {
       plan.push(p);
     }
     if (plan.length === 0) break;
+  }
+
+  // Ensure at least a couple of multi-image layouts are present when possible
+  let multiCount = plan.filter((p) => MULTI_IMAGE_LAYOUTS.has(p.layoutId)).length;
+  const desiredMulti = Math.min(2, count);
+  if (multiCount < desiredMulti) {
+    // Prefer to add list_value or transformation strategies that map to multi-image layouts
+    const candidateStrategies = ['list_value', 'transformation', 'wildcard', 'lifestyle'];
+    while (multiCount < desiredMulti && plan.length < count) {
+      let added = false;
+      for (const strat of candidateStrategies) {
+        const layouts = STRATEGY_LAYOUT_MAP[strat];
+        if (!layouts) continue;
+        const multiLayout = layouts.find((id) => MULTI_IMAGE_LAYOUTS.has(id));
+        if (!multiLayout) continue;
+        const goal = STRATEGY_COPY_RULES[strat]?.goal || 'clicks';
+        plan.push({ strategy: strat, goal, layoutId: multiLayout });
+        multiCount += 1;
+        added = true;
+        break;
+      }
+      if (!added) break;
+    }
   }
 
   return plan.slice(0, count);
@@ -456,6 +496,10 @@ Return JSON only (no markdown) with these exact keys:
 - angle: one of mistake, beginner, advanced, time-saving, emotional, secret, warning, benefit
 - reason: one short sentence why this pin works for Pinterest (max 80 chars)
 
+IMPORTANT:
+- Ensure semantic consistency between the title and the type of items you imply in the copy.
+- If the title uses "mistakes", "things you're doing wrong", or similar, the content (overlay and implied steps/items) MUST describe mistakes or wrong behaviors to avoid, not correct tips.
+- If the content is positive recommendations (tips/steps/ways), then the title should use positive framing (tips/steps/ways) instead of "mistakes".
 No markdown, no code fences.`;
 
 /**
