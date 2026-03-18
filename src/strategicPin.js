@@ -420,6 +420,9 @@ const BASE_TEMPLATE = `Generate a Pinterest pin.
 ARTICLE:
 {{article_summary}}
 
+KEY IDEAS (use these concretely in copy and visuals):
+{{article_key_ideas}}
+
 TARGET KEYWORD:
 {{keyword}}
 
@@ -456,23 +459,77 @@ Return JSON only (no markdown) with these exact keys:
 No markdown, no code fences.`;
 
 /**
+ * Extract 3–5 key ideas from an article summary.
+ * @param {string} articleSummary
+ * @param {Object} openai
+ * @returns {Promise<string[]>}
+ */
+async function extractArticleKeyIdeas(articleSummary, openai) {
+  const text = (articleSummary || '').trim();
+  if (!text) return [];
+
+  const prompt = `You are helping generate Pinterest pins for an article.
+
+ARTICLE SUMMARY:
+${text.slice(0, 1500)}
+
+From this summary, extract the 3–5 most important concrete ideas, problems, solutions, or entities that should appear in visuals and headlines.
+
+Return JSON only (no markdown) with this exact shape:
+{ "key_ideas": ["idea 1", "idea 2", "idea 3"] }`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 250,
+      temperature: 0.4,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (Array.isArray(parsed.key_ideas)) {
+        return parsed.key_ideas
+          .map((s) => String(s).trim())
+          .filter(Boolean)
+          .slice(0, 5);
+      }
+    }
+  } catch (e) {
+    console.warn('extractArticleKeyIdeas error:', e.message || e);
+  }
+
+  return [];
+}
+
+/**
  * Generate full pin metadata (title, overlay, description, hashtags, image hint) using strategy rules.
  * @param {Object} params
  * @param {string} params.articleSummary
  * @param {string} params.keyword
  * @param {string} params.strategy
  * @param {string} [params.layoutId] - layout ID for number consistency (step_count)
+ * @param {string[]} [params.keyIdeas] - optional list of key ideas for this article
  * @param {Object} openai
  * @returns {Promise<Object>} { title, overlay_headline, overlay_subheadline, description, hashtags, image_prompt_hint, step_count }
  */
-async function generateStrategicPinMetadata({ articleSummary, keyword, strategy, layoutId, suggestedAngle }, openai) {
+async function generateStrategicPinMetadata(
+  { articleSummary, keyword, strategy, layoutId, suggestedAngle, keyIdeas },
+  openai
+) {
   const rules = STRATEGY_COPY_RULES[strategy]?.rules || STRATEGY_COPY_RULES.curiosity_hook.rules;
   const strategyLabel = strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   const layoutRule = LAYOUT_NUMBER_RULES[layoutId] ? `\nLAYOUT (${layoutId}):\n${LAYOUT_NUMBER_RULES[layoutId]}` : '';
   const angle = ANGLE_OPTIONS.includes(suggestedAngle) ? suggestedAngle : ANGLE_OPTIONS[0];
 
+  const ideasList = Array.isArray(keyIdeas) && keyIdeas.length
+    ? keyIdeas.map((s) => `- ${s}`).join('\n')
+    : '';
+
   const prompt = BASE_TEMPLATE
     .replace('{{article_summary}}', articleSummary.slice(0, 600))
+    .replace('{{article_key_ideas}}', ideasList || '- (not provided)')
     .replace('{{keyword}}', keyword || '')
     .replace('{{strategy}}', strategyLabel)
     .replace('{{layout_rule}}', layoutRule)
@@ -538,6 +595,7 @@ export {
   checkDiversity,
   rankPins,
   generateStrategicPinMetadata,
+  extractArticleKeyIdeas,
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
   NICHE_MIXES,

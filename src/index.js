@@ -6,7 +6,15 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import JSZip from 'jszip';
-import { enrichContentProfile, planStrategies, generateStrategicPinMetadata, checkDiversity, rankPins, getStrategyReason } from './strategicPin.js';
+import {
+  enrichContentProfile,
+  planStrategies,
+  generateStrategicPinMetadata,
+  extractArticleKeyIdeas,
+  checkDiversity,
+  rankPins,
+  getStrategyReason,
+} from './strategicPin.js';
 
 const ANGLE_OPTIONS = ['mistake', 'beginner', 'advanced', 'time-saving', 'emotional', 'secret', 'warning', 'benefit'];
 dotenv.config();
@@ -355,6 +363,54 @@ function extractMetaFromHtml(html, url) {
   }
 
   return { title, description, domain, keyword };
+}
+
+/**
+ * Fetch full article HTML and build richer base metadata + summary.
+ * Falls back gracefully to meta tags only if fetch or parsing fails.
+ */
+async function fetchArticleBaseAndSummary(url, clientArticleData) {
+  let html = '';
+  try {
+    const resp = await fetch(url);
+    if (resp.ok) {
+      html = await resp.text();
+    }
+  } catch (e) {
+    console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
+  }
+
+  const metaFromHtml = extractMetaFromHtml(html || '', url);
+  const base = {
+    ...metaFromHtml,
+    ...(clientArticleData || {}),
+  };
+
+  // Very lightweight body text extraction from HTML
+  let bodyText = '';
+  if (html) {
+    try {
+      bodyText = html
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    } catch (e) {
+      console.warn('fetchArticleBaseAndSummary body parse error:', e.message || e);
+    }
+  }
+
+  const summaryParts = [
+    base.title || '',
+    base.description || '',
+    bodyText ? bodyText.slice(0, 1000) : '',
+  ].filter(Boolean);
+
+  const articleSummary = summaryParts.join('. ').slice(0, 1200);
+
+  return { base, articleSummary };
 }
 
 // Background job processor for scheduled pins
@@ -1538,7 +1594,7 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
     if (!url || !articleData) {
       return res.status(400).json({ error: 'Missing url or articleData' });
     }
-    const base = articleData || extractMetaFromHtml('', url);
+    const { base } = await fetchArticleBaseAndSummary(url, articleData);
     const contentProfile = await enrichContentProfile(base, openai);
     const plan = planStrategies(contentProfile, 10);
     const strategyCounts = {};
@@ -1570,7 +1626,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         req._strategicSingle = true;
       }
     } else if (isStrategic) {
-      const base = articleData || extractMetaFromHtml('', url);
+      const { base } = await fetchArticleBaseAndSummary(url, articleData);
       const contentProfile = await enrichContentProfile(base, openai);
       const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
       effectiveStyles = plan.map((p) => p.layoutId);
@@ -1595,13 +1651,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
     }
 
-    const base = articleData || extractMetaFromHtml('', url);
+    const { base, articleSummary } = await fetchArticleBaseAndSummary(url, articleData);
     const year = new Date().getFullYear();
     const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
-
-    const articleSummary = [base.title, base.description].filter(Boolean).join('. ').slice(0, 600);
 
     const brandPrimary = brand?.primaryColor || null;
     const brandSecondary = brand?.secondaryColor || null;
@@ -1646,14 +1700,37 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         'Three tall step cards stacked vertically, each with an icon or small image and a very short label like Step 1, Step 2, Step 3. The cards should feel like a guided process, with a concise headline at the top and source URL at the bottom.',
     };
 
+    const nicheVisualHints = {
+      recipe:
+        'Prioritize food, ingredients, kitchen scenes, storage containers, and real cooking or prep visuals rather than abstract icons.',
+      finance:
+        'Prioritize money-related visuals like bills, receipts, budgets, calculators, and simple charts instead of generic office imagery.',
+      travel:
+        'Use locations, landscapes, maps, luggage, and travel scenes that clearly signal destinations or journeys, not generic interiors.',
+      self_improvement:
+        'Show people in everyday life improving habits, routines, or mindset (journals, checklists, calm home scenes) rather than random tech imagery.',
+      product_review:
+        'Show the product or category clearly (packaging, close-ups, comparison layouts) so it is obvious what is being reviewed.',
+    };
+
+    const niche = req._contentProfile?.niche || null;
     const stylePrompts = [];
     let strategicMetadataByIndex = [];
+    let keyIdeas = [];
     if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
       const plan = req._strategicPlan;
+      keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
       const metaResults = await Promise.all(
         plan.map((p, i) =>
           generateStrategicPinMetadata(
-            { articleSummary, keyword, strategy: p.strategy, layoutId: p.layoutId, suggestedAngle: ANGLE_OPTIONS[i % ANGLE_OPTIONS.length] },
+            {
+              articleSummary,
+              keyword,
+              strategy: p.strategy,
+              layoutId: p.layoutId,
+              suggestedAngle: ANGLE_OPTIONS[i % ANGLE_OPTIONS.length],
+              keyIdeas,
+            },
             openai
           )
         )
@@ -1685,9 +1762,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     for (let i = 0; i < effectiveStyles.length; i++) {
       const id = effectiveStyles[i];
       const strategicMeta = strategicMetadataByIndex[i];
-      const styleDescription =
-        (styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.') +
-        (strategicMeta?.image_prompt_hint ? ` Strategy visual: ${strategicMeta.image_prompt_hint}.` : '');
+      const baseStyleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
+      const nicheHint = niche && nicheVisualHints[niche] ? ` Niche-specific visual guidance: ${nicheVisualHints[niche]}` : '';
+      const strategyHint = strategicMeta?.image_prompt_hint ? ` Strategy visual (must respect this): ${strategicMeta.image_prompt_hint}.` : '';
+      const styleDescription = baseStyleDescription + nicheHint + strategyHint;
       try {
         const isTimeline = id === 'timeline_infographic';
 
@@ -1707,6 +1785,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         const userPromptBase =
           `Article title: ${topic}\n` +
           (base.description ? `Article description: ${base.description}\n` : '') +
+          (articleSummary ? `Article key ideas (short summary): ${articleSummary.slice(0, 400)}\n` : '') +
+          (keyIdeas && keyIdeas.length
+            ? `Key ideas to highlight visually:\n- ${keyIdeas.join('\n- ')}\n`
+            : '') +
           (keyword ? `Main keyword or ingredient: ${keyword}\n` : '') +
           `Domain / branding: ${domain}\n` +
           `Year/context: ${year}\n` +
