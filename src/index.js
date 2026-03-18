@@ -1343,7 +1343,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
     case 'cozy_baking':
       return (
         baseIntro +
-        `Lifestyle context scene: someone interacting with "${keyword || topic}" in everyday life (e.g. at a desk, with a laptop, or using a product). Warm natural light. Warm, inviting, lifestyle photography. ` +
+        `Lifestyle context scene: someone interacting with "${keyword || topic}" in everyday life (for example in a kitchen, living room, or everyday home setting). Avoid showing computers or laptops unless they are truly essential. Warm natural light. Warm, inviting, lifestyle photography. ` +
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
@@ -1625,7 +1625,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       timeline_infographic:
         'Vertical infographic-style timeline made of 4–6 steps or milestones that walk the reader through the key stages of this topic (for example: Discover → Decide → Act → Maintain). Each step has a short label and simple icon. Arrange steps from top to bottom with clear arrows or connectors, and include a concise headline at the top plus small source text with the website URL at the bottom.',
       cozy_baking:
-        'Lifestyle context scene where someone interacts with the topic in everyday life (for example at a desk, with a laptop, or using a product). Warm, welcoming lighting and environment, friendly headline text, and subtle bottom text showing the website URL.',
+        'Lifestyle context scene where someone interacts with the topic in everyday life (for example in a kitchen, living room, or everyday home setting). Avoid showing computers or laptops unless they are truly essential. Warm, welcoming lighting and environment, friendly headline text, and subtle bottom text showing the website URL.',
       viral_curiosity:
         'Dramatic, story-like composition that feels like a personal experiment or confession. Use story-style text like “I tried X for Y days…” to drive curiosity, and add bottom source text with the website URL.',
       clumpy_fix:
