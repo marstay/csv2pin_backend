@@ -11,12 +11,11 @@ import {
   planStrategies,
   generateStrategicPinMetadata,
   extractArticleKeyIdeas,
+  pickAngle,
   checkDiversity,
   rankPins,
   getStrategyReason,
 } from './strategicPin.js';
-
-const ANGLE_OPTIONS = ['mistake', 'beginner', 'advanced', 'time-saving', 'emotional', 'secret', 'warning', 'benefit'];
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -1363,7 +1362,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
     case 'curiosity_shock':
       return (
         baseIntro +
-        `Bold, dramatic, high-contrast image. Strong central subject that creates shock and curiosity. Dramatic lighting. ` +
+        `Bold, dramatic, high-contrast image. Strong central subject that represents or relates to "${keyword || topic}" and creates shock and curiosity. The visual must be semantically relevant to the article topic—e.g. for tech/WordPress show a laptop, screen, or workspace; for food show ingredients or cooking. Dramatic lighting. ` +
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
@@ -1390,7 +1389,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
     case 'question_style':
       return (
         baseIntro +
-        `Image that visually represents a question or dilemma, with subtle question-mark elements or split choices. Clean background. ` +
+        `Image that visually represents a question or dilemma about "${keyword || topic}", with subtle question-mark elements or split choices. The scene or subject must relate to the article topic. Clean background. ` +
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
@@ -1399,7 +1398,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
     case 'cozy_baking':
       return (
         baseIntro +
-        `Lifestyle context scene: someone interacting with "${keyword || topic}" in everyday life (for example in a kitchen, living room, or everyday home setting). Avoid showing computers or laptops unless they are truly essential. Warm natural light. Warm, inviting, lifestyle photography. ` +
+        `Lifestyle context scene: someone interacting with "${keyword || topic}" in an appropriate everyday setting. The setting must match the topic—e.g. for tech/WordPress/digital topics show a laptop, screen, or workspace; for food/recipes show a kitchen; for wellness show a calm home setting. Warm natural light. Warm, inviting, lifestyle photography. ` +
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
@@ -1426,7 +1425,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
     case 'minimal_elegant':
       return (
         baseIntro +
-        `Soft beige or light gray background. Elegant overhead shot of a single, simple object representing "${keyword || topic}" with delicate shadows. Minimal, premium feel. ` +
+        `Soft beige or light gray background. Elegant overhead shot of a single, simple object that is semantically relevant to "${keyword || topic}"—e.g. for tech/WordPress show a laptop, tablet, or document; for food show ingredients or a dish; for wellness show a journal or plant. Delicate shadows. Minimal, premium feel. ` +
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
@@ -1591,10 +1590,10 @@ app.post('/api/urltopin/scrape', async (req, res) => {
 app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
   try {
     const { url, articleData } = req.body || {};
-    if (!url || !articleData) {
-      return res.status(400).json({ error: 'Missing url or articleData' });
+    if (!url) {
+      return res.status(400).json({ error: 'Missing url' });
     }
-    const { base } = await fetchArticleBaseAndSummary(url, articleData);
+    const { base } = await fetchArticleBaseAndSummary(url, articleData || null);
     const contentProfile = await enrichContentProfile(base, openai);
     const plan = planStrategies(contentProfile, 10);
     const strategyCounts = {};
@@ -1626,12 +1625,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         req._strategicSingle = true;
       }
     } else if (isStrategic) {
-      const { base } = await fetchArticleBaseAndSummary(url, articleData);
+      const fetched = await fetchArticleBaseAndSummary(url, articleData);
+      const { base } = fetched;
       const contentProfile = await enrichContentProfile(base, openai);
       const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
       effectiveStyles = plan.map((p) => p.layoutId);
       req._strategicPlan = plan;
       req._contentProfile = contentProfile;
+      req._fetchedArticle = fetched;
     }
 
     if (!url || effectiveStyles.length === 0) {
@@ -1651,7 +1652,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
     }
 
-    const { base, articleSummary } = await fetchArticleBaseAndSummary(url, articleData);
+    const { base, articleSummary } = req._fetchedArticle || await fetchArticleBaseAndSummary(url, articleData);
     const year = new Date().getFullYear();
     const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
@@ -1667,25 +1668,25 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       clean_appetizing:
         'Clean, soft layout with a clear focal object related to the topic on a neutral background. Include a bold, legible Pinterest headline, a small subheadline, and small source text with the website URL at the bottom.',
       curiosity_shock:
-        'Bold, dramatic, high-contrast image that creates shock and curiosity with a strong central subject. Use large, high-contrast headline text that feels urgent or surprising, plus bottom source text with the website URL.',
+        'Bold, dramatic, high-contrast image with a strong central subject that represents or relates to the article topic (e.g. laptop/screen for tech, ingredients for food). Creates shock and curiosity while staying semantically relevant. Use large, high-contrast headline text that feels urgent or surprising, plus bottom source text with the website URL.',
       money_saving:
         'Visual value or money-saving angle, using simple icons or motifs for money, time, and checkmarks alongside the main concept. Add punchy text that emphasizes saving time or money, and include small source text with the website URL at the bottom.',
       minimal_typography:
         'Minimal, elegant layout with lots of whitespace and a single strong visual object. Use clean, modern typography with a short, bold statement, and subtle bottom text showing the website URL.',
       question_style:
-        'Image that visually represents a question or dilemma, with subtle question-mark elements or split choices. Headline text should be a direct question that invites clicks, plus bottom source text with the website URL.',
+        'Image that visually represents a question or dilemma about the article topic, with subtle question-mark elements or split choices. The scene or subject must relate to the topic. Headline text should be a direct question that invites clicks, plus bottom source text with the website URL.',
       before_after:
         'Split “before vs after” layout with very clear visual contrast between the problem state and the improved state for this topic. Left side labelled “Before” shows confusion, mess or inefficiency; right side labelled “After” shows clarity, organization or success. Overlay short, readable text on each side and include small source text with the website URL at the bottom.',
       timeline_infographic:
         'Vertical infographic-style timeline made of 4–6 steps or milestones that walk the reader through the key stages of this topic (for example: Discover → Decide → Act → Maintain). Each step has a short label and simple icon. Arrange steps from top to bottom with clear arrows or connectors, and include a concise headline at the top plus small source text with the website URL at the bottom.',
       cozy_baking:
-        'Lifestyle context scene where someone interacts with the topic in everyday life (for example in a kitchen, living room, or everyday home setting). Avoid showing computers or laptops unless they are truly essential. Warm, welcoming lighting and environment, friendly headline text, and subtle bottom text showing the website URL.',
+        'Lifestyle context scene where someone interacts with the topic in an appropriate everyday setting. The setting must match the topic—for tech/digital topics show a laptop or workspace; for food show a kitchen; for wellness show a calm home. Warm, welcoming lighting, friendly headline text, and subtle bottom text showing the website URL.',
       viral_curiosity:
         'Dramatic, story-like composition that feels like a personal experiment or confession. Use story-style text like “I tried X for Y days…” to drive curiosity, and add bottom source text with the website URL.',
       clumpy_fix:
         'Practical, how-to style where the visual clearly shows a “problem” version and a “fixed” or improved version of the same thing. Add clear how-to text that promises a simple fix or method, plus small bottom text with the website URL.',
       minimal_elegant:
-        'Soft, premium, editorial-style image with simple composition and elegant lighting. Elegant, refined typography suitable for a premium brand or blog, with discreet bottom text showing the website URL.',
+        'Soft, premium, editorial-style image with a single object that clearly represents the article topic (e.g. laptop for tech, ingredients for food). Simple composition, elegant lighting, refined typography, discreet bottom text showing the website URL.',
       grid_3_images:
         'Layout where the pin is clearly made from three related images arranged in a clean collage or grid. Each image should show a different angle, example, or step for the topic, with thin spacing between them and a short headline and source text.',
       grid_4_images:
@@ -1713,27 +1714,31 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         'Show the product or category clearly (packaging, close-ups, comparison layouts) so it is obvious what is being reviewed.',
     };
 
-    const niche = req._contentProfile?.niche || null;
+    const contentProfile = req._contentProfile || null;
+    const niche = contentProfile?.niche || null;
     const stylePrompts = [];
     let strategicMetadataByIndex = [];
     let keyIdeas = [];
+    const usedAngles = [];
     if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
       const plan = req._strategicPlan;
       keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
       const metaResults = await Promise.all(
-        plan.map((p, i) =>
-          generateStrategicPinMetadata(
+        plan.map((p, i) => {
+          const angle = pickAngle(p.strategy, contentProfile, usedAngles);
+          usedAngles.push(angle);
+          return generateStrategicPinMetadata(
             {
               articleSummary,
               keyword,
               strategy: p.strategy,
               layoutId: p.layoutId,
-              suggestedAngle: ANGLE_OPTIONS[i % ANGLE_OPTIONS.length],
+              suggestedAngle: angle,
               keyIdeas,
             },
             openai
-          )
-        )
+          );
+        })
       );
       strategicMetadataByIndex = plan.map((p, i) => ({
         ...metaResults[i],
@@ -1840,7 +1845,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
         // For certain layout-heavy styles, enforce a deterministic prompt shape with consistent step count
         const stepCount = strategicMeta?.step_count;
-        const numSteps = typeof stepCount === 'number' ? stepCount : (id === 'step_cards_3' || id === 'grid_3_images' ? 3 : id === 'grid_4_images' ? 4 : 5);
+        const numSteps = typeof stepCount === 'number' ? stepCount : (id === 'step_cards_3' || id === 'grid_3_images' || id === 'stacked_strips' ? 3 : id === 'grid_4_images' || id === 'circle_cluster_4' ? 4 : id === 'timeline_infographic' ? 5 : 5);
         if (id === 'timeline_infographic') {
           const stepLabels = Array.from({ length: numSteps }, (_, i) => `Step ${i + 1}`).join(', ');
           imagePrompt =

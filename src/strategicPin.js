@@ -6,20 +6,20 @@
 // Strategy → layoutId mapping (from design doc Section 8)
 const STRATEGY_LAYOUT_MAP = {
   curiosity_hook: ['curiosity_shock', 'question_style', 'viral_curiosity'],
-  list_value: ['timeline_infographic', 'step_cards_3', 'grid_3_images', 'grid_4_images'],
-  lifestyle: ['cozy_baking', 'minimal_elegant'],
+  list_value: ['timeline_infographic', 'step_cards_3', 'grid_3_images', 'grid_4_images', 'stacked_strips'],
+  lifestyle: ['cozy_baking', 'minimal_elegant', 'stacked_strips'],
   clean_authority: ['clean_appetizing', 'minimal_typography'],
   mistake_warning: ['curiosity_shock', 'clumpy_fix'],
   transformation: ['before_after', 'offset_collage_3', 'grid_4_images'],
-  wildcard: ['circle_cluster_4', 'offset_collage_3', 'grid_3_images'],
+  wildcard: ['circle_cluster_4', 'offset_collage_3', 'grid_3_images', 'stacked_strips'],
 };
 
 // Niche-specific strategy mixes (from design doc Section 13)
 const NICHE_MIXES = {
-  default: { curiosity_hook: 3, list_value: 3, lifestyle: 2, clean_authority: 1, wildcard: 1 },
+  default: { curiosity_hook: 3, list_value: 2, lifestyle: 2, clean_authority: 1, wildcard: 1, transformation: 1 },
   recipe: { curiosity_hook: 2, list_value: 3, lifestyle: 3, transformation: 1, clean_authority: 1 },
-  finance: { curiosity_hook: 3, list_value: 3, mistake_warning: 2, clean_authority: 1, wildcard: 1 },
-  travel: { curiosity_hook: 2, list_value: 3, lifestyle: 4, wildcard: 1 },
+  finance: { curiosity_hook: 3, list_value: 2, mistake_warning: 2, clean_authority: 1, wildcard: 1, transformation: 1 },
+  travel: { curiosity_hook: 2, list_value: 3, lifestyle: 3, wildcard: 1, transformation: 1 },
   self_improvement: { curiosity_hook: 3, lifestyle: 3, transformation: 2, list_value: 1, wildcard: 1 },
   product_review: { curiosity_hook: 2, list_value: 3, transformation: 2, clean_authority: 2, wildcard: 1 },
 };
@@ -455,6 +455,35 @@ function normalizeNumberInText(text, stepCount) {
 
 const ANGLE_OPTIONS = ['mistake', 'beginner', 'advanced', 'time-saving', 'emotional', 'secret', 'warning', 'benefit'];
 
+/**
+ * Pick an angle based on strategy, content profile, and already used angles.
+ * Keeps variation while staying intentional.
+ */
+function pickAngle(strategy, contentProfile, usedAngles = []) {
+  const basePoolByStrategy = {
+    curiosity_hook: ['secret', 'mistake', 'warning', 'emotional'],
+    list_value: ['benefit', 'beginner', 'time-saving'],
+    lifestyle: ['emotional', 'benefit'],
+    clean_authority: ['advanced', 'benefit'],
+    mistake_warning: ['mistake', 'warning', 'secret'],
+    transformation: ['benefit', 'advanced', 'time-saving'],
+    wildcard: ['secret', 'emotional', 'warning'],
+  };
+
+  let pool = basePoolByStrategy[strategy] || ANGLE_OPTIONS;
+
+  if (contentProfile?.emotional_intensity === 'high') {
+    const emotionalFavored = ['emotional', 'mistake', 'secret', 'warning'];
+    pool = pool.filter((a) => emotionalFavored.includes(a)).concat(pool);
+  }
+
+  const unused = pool.filter((a) => !usedAngles.includes(a));
+  const candidates = unused.length > 0 ? unused : pool;
+
+  const chosen = candidates.find((a) => ANGLE_OPTIONS.includes(a)) || ANGLE_OPTIONS[0];
+  return chosen;
+}
+
 const BASE_TEMPLATE = `Generate a Pinterest pin.
 
 ARTICLE:
@@ -600,7 +629,7 @@ async function generateStrategicPinMetadata(
         title = normalizeNumberInText(title, stepCount);
         overlay_headline = normalizeNumberInText(overlay_headline, stepCount);
       }
-      const angle = ANGLE_OPTIONS.includes(parsed.angle) ? parsed.angle : ANGLE_OPTIONS[Math.floor(Math.random() * ANGLE_OPTIONS.length)];
+      const angle = ANGLE_OPTIONS.includes(parsed.angle) ? parsed.angle : (ANGLE_OPTIONS.includes(suggestedAngle) ? suggestedAngle : ANGLE_OPTIONS[0]);
       const reason = (parsed.reason || '').slice(0, 100).trim() || getStrategyReason(strategy);
       return {
         title,
@@ -640,6 +669,7 @@ export {
   rankPins,
   generateStrategicPinMetadata,
   extractArticleKeyIdeas,
+  pickAngle,
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
   NICHE_MIXES,
