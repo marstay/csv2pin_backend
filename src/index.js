@@ -1266,12 +1266,17 @@ const STYLE_ON_IMAGE_TEXT_GUIDANCE = {
   step_cards_3: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
 };
 
-async function generateStyleOnImageText({ styleId, topic, domain, keyword, year, description, avoidText }) {
+async function generateStyleOnImageText({ styleId, topic, domain, keyword, year, description, avoidText, usedOverlayTexts }) {
   const guidance = STYLE_ON_IMAGE_TEXT_GUIDANCE[styleId] ||
     'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.';
-  const avoidNote = avoidText && (avoidText.headline || avoidText.subheadline)
-    ? `\n\nIMPORTANT: The current image already has this text - you MUST generate DIFFERENT text. Do NOT use: headline "${avoidText.headline || ''}", subheadline "${avoidText.subheadline || ''}". Create something fresh and varied.`
-    : '';
+  let avoidNote = '';
+  if (avoidText && (avoidText.headline || avoidText.subheadline)) {
+    avoidNote = `\n\nIMPORTANT: The current image already has this text - you MUST generate DIFFERENT text. Do NOT use: headline "${avoidText.headline || ''}", subheadline "${avoidText.subheadline || ''}". Create something fresh and varied.`;
+  } else if (Array.isArray(usedOverlayTexts) && usedOverlayTexts.length > 0) {
+    avoidNote = `\n\nAVOID REPEATING: The following overlay headlines/subheadlines were already used for other pins of this style. Generate DIFFERENT overlay text:\n${usedOverlayTexts
+      .map((u) => `- "${u.headline}"${u.subheadline ? ` / "${u.subheadline}"` : ''}`)
+      .join('\n')}\n`;
+  }
   const content = `Article/topic: ${topic}\n${keyword ? `Keyword: ${keyword}\n` : ''}Domain: ${domain}\nYear: ${year}\n${description ? `Context: ${description.slice(0, 200)}\n` : ''}\nStyle: ${styleId}\n\n${guidance}${avoidNote}\n\nReturn JSON only: {"headline":"...","subheadline":"..."}. No markdown.`;
   try {
     const completion = await openai.chat.completions.create({
@@ -1298,11 +1303,21 @@ async function generateStyleOnImageText({ styleId, topic, domain, keyword, year,
 const ILLUSTRATED_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
 const REALISTIC_PREFIX = 'Photorealistic, high-quality photograph. Natural lighting, lifelike imagery, professional photography style. ';
 
-function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand, stepCount }) {
+const NICHE_VISUAL_HINTS = {
+  recipe: 'Prioritize food, ingredients, kitchen scenes, storage containers, and real cooking or prep visuals rather than abstract icons.',
+  finance: 'Prioritize money-related visuals like bills, receipts, budgets, calculators, and simple charts instead of generic office imagery.',
+  travel: 'Use locations, landscapes, maps, luggage, and travel scenes that clearly signal destinations or journeys, not generic interiors.',
+  self_improvement: 'Show people in everyday life improving habits, routines, or mindset (journals, checklists, calm home scenes) rather than random tech imagery.',
+  product_review: 'Show the product or category clearly (packaging, close-ups, comparison layouts) so it is obvious what is being reviewed.',
+};
+
+function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand, stepCount, niche }) {
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
   const source = overlayText?.source || domain;
   const brandTail = brand?.brandName ? ` Use the brand name ${brand.brandName} subtly in the design.` : '';
+  const nicheTail = niche && NICHE_VISUAL_HINTS[niche] ? ` ${NICHE_VISUAL_HINTS[niche]}` : '';
+  const tail = nicheTail + brandTail;
   const useRealistic = !ILLUSTRATED_STYLES.has(styleId);
   const baseIntro = 'Vertical Pinterest pin 1000x1500 px. ' + (useRealistic ? REALISTIC_PREFIX : '');
   const numSteps = typeof stepCount === 'number' ? stepCount : (styleId === 'step_cards_3' || styleId === 'grid_3_images' ? 3 : styleId === 'grid_4_images' ? 4 : styleId === 'timeline_infographic' ? 5 : null);
@@ -1316,7 +1331,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Label the left side "Before" and the right side "After" with short, readable labels. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the main text. ` : '') +
         `At the bottom, add small, readable source text "${source}".` +
-        brandTail
+        tail
       );
     case 'timeline_infographic': {
       const steps = numSteps || 5;
@@ -1329,7 +1344,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
         `Each step box has a very short label, and the background stays simple and low-contrast so the text is readable. ` +
         `At the bottom, include small source text "${source}".` +
-        brandTail
+        tail
       );
     }
     case 'grid_4_images':
@@ -1339,7 +1354,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Place the main headline "${headline}" in a banner at the top of the pin. ` +
         (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
         `At the very bottom, add small source text "${source}".` +
-        brandTail
+        tail
       );
     case 'offset_collage_3':
       return (
@@ -1348,7 +1363,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Place the main text "${headline}" over a solid or semi-transparent area in the top-right region so it is very readable. ` +
         (subheadline ? `Add a short supporting line "${subheadline}" below the headline. ` : '') +
         `Include small source text "${source}" near the bottom edge.` +
-        brandTail
+        tail
       );
     case 'clean_appetizing':
       return (
@@ -1357,7 +1372,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'curiosity_shock':
       return (
@@ -1366,7 +1381,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'money_saving':
       return (
@@ -1375,7 +1390,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'minimal_typography':
       return (
@@ -1384,7 +1399,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'question_style':
       return (
@@ -1393,7 +1408,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'cozy_baking':
       return (
@@ -1402,7 +1417,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'viral_curiosity':
       return (
@@ -1411,7 +1426,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'clumpy_fix':
       return (
@@ -1420,7 +1435,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'minimal_elegant':
       return (
@@ -1429,7 +1444,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     case 'step_cards_3':
       return (
@@ -1438,7 +1453,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `At the top, place the main title text "${headline}". ` +
         (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
         `At the bottom, include small source text "${source}".` +
-        brandTail
+        tail
       );
     case 'grid_3_images':
       return (
@@ -1447,7 +1462,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Place the main headline "${headline}" in a banner at the top. ` +
         (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
         `At the very bottom, add small source text "${source}".` +
-        brandTail
+        tail
       );
     case 'stacked_strips':
       return (
@@ -1456,7 +1471,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Place the main text "${headline}" over a solid or semi-transparent area. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" below the headline. ` : '') +
         `Include small source text "${source}" at the bottom.` +
-        brandTail
+        tail
       );
     case 'circle_cluster_4':
       return (
@@ -1465,7 +1480,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Place the main headline "${headline}" in the center. ` +
         (subheadline ? `Add a short subheadline "${subheadline}" below. ` : '') +
         `Add small source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
     default:
       return (
@@ -1474,7 +1489,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
         (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
         `Add small, readable source text "${source}" at the bottom of the pin.` +
-        brandTail
+        tail
       );
   }
 }
@@ -1723,23 +1738,32 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
       const plan = req._strategicPlan;
       keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
-      const metaResults = await Promise.all(
-        plan.map((p, i) => {
-          const angle = pickAngle(p.strategy, contentProfile, usedAngles);
-          usedAngles.push(angle);
-          return generateStrategicPinMetadata(
-            {
-              articleSummary,
-              keyword,
-              strategy: p.strategy,
-              layoutId: p.layoutId,
-              suggestedAngle: angle,
-              keyIdeas,
-            },
-            openai
-          );
-        })
-      );
+      const usedOverlayByLayout = new Map(); // layoutId -> [{ headline, subheadline }, ...]
+      const metaResults = [];
+      for (let i = 0; i < plan.length; i++) {
+        const p = plan[i];
+        const angle = pickAngle(p.strategy, contentProfile, usedAngles);
+        usedAngles.push(angle);
+        const usedOverlayTexts = usedOverlayByLayout.get(p.layoutId) || [];
+        const layoutOverlayGuidance = STYLE_ON_IMAGE_TEXT_GUIDANCE[p.layoutId] || null;
+        const meta = await generateStrategicPinMetadata(
+          {
+            articleSummary,
+            keyword,
+            strategy: p.strategy,
+            layoutId: p.layoutId,
+            suggestedAngle: angle,
+            keyIdeas,
+            usedOverlayTexts,
+            layoutOverlayGuidance,
+          },
+          openai
+        );
+        metaResults.push(meta);
+        const used = usedOverlayByLayout.get(p.layoutId) || [];
+        used.push({ headline: meta.overlay_headline || '', subheadline: meta.overlay_subheadline || '' });
+        usedOverlayByLayout.set(p.layoutId, used);
+      }
       strategicMetadataByIndex = plan.map((p, i) => ({
         ...metaResults[i],
         strategy: p.strategy,
@@ -1907,67 +1931,73 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         });
       }
     } else {
-      await Promise.all(
-        stylePrompts.map(async (sp) => {
-          const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
-          const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
-          let pinTitle = topic;
-          let pinDescription = base.description || '';
-          let hashtags = [];
-          let onImageHeadline = topic;
-          let onImageSubheadline = '';
-          try {
-            const c1 = new AbortController();
-            const c2 = new AbortController();
-            const t1 = setTimeout(() => c1.abort(), metadataTimeoutMs);
-            const t2 = setTimeout(() => c2.abort(), metadataTimeoutMs);
-            const [titleRes, descRes, onImageResult] = await Promise.all([
-              fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
-                body: JSON.stringify({ content: titlePrompt, type: 'title' }),
-                signal: c1.signal,
-              }),
-              fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
-                body: JSON.stringify({ content: descPrompt, type: 'description' }),
-                signal: c2.signal,
-              }),
-              generateStyleOnImageText({
-                styleId: sp.id,
-                topic,
-                domain,
-                keyword,
-                year,
-                description: base.description || '',
-                avoidText: effectiveStyles.length === 1 && avoidText ? avoidText : null,
-              }),
-            ]);
-            clearTimeout(t1);
-            clearTimeout(t2);
-            if (titleRes.ok) {
-              const titleJson = await titleRes.json();
-              if (titleJson?.result) pinTitle = titleJson.result;
-            }
-            if (descRes.ok) {
-              const descJson = await descRes.json();
-              if (descJson?.result) {
-                pinDescription = descJson.result;
-                const tagMatches = pinDescription.match(/#[\w-]+/g);
-                if (tagMatches) hashtags = tagMatches.slice(0, 10);
-              }
-            }
-            if (onImageResult) {
-              onImageHeadline = onImageResult.headline || topic;
-              onImageSubheadline = onImageResult.subheadline || '';
-            }
-          } catch (e) {
-            console.warn('urltopin metadata generation error (style:', sp.label, '):', e.message || e);
+      const usedOverlayByStyle = new Map();
+      const metaKeyForManual = (sp) => (effectiveStyles.length > 1 && sp.index != null ? `${sp.id}::${sp.index}` : sp.id);
+      for (let i = 0; i < stylePrompts.length; i++) {
+        const sp = stylePrompts[i];
+        const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
+        const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
+        let pinTitle = topic;
+        let pinDescription = base.description || '';
+        let hashtags = [];
+        let onImageHeadline = topic;
+        let onImageSubheadline = '';
+        try {
+          const c1 = new AbortController();
+          const c2 = new AbortController();
+          const t1 = setTimeout(() => c1.abort(), metadataTimeoutMs);
+          const t2 = setTimeout(() => c2.abort(), metadataTimeoutMs);
+          const usedOverlayTexts = usedOverlayByStyle.get(sp.id) || [];
+          const [titleRes, descRes, onImageResult] = await Promise.all([
+            fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
+              body: JSON.stringify({ content: titlePrompt, type: 'title' }),
+              signal: c1.signal,
+            }),
+            fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
+              body: JSON.stringify({ content: descPrompt, type: 'description' }),
+              signal: c2.signal,
+            }),
+            generateStyleOnImageText({
+              styleId: sp.id,
+              topic,
+              domain,
+              keyword,
+              year,
+              description: base.description || '',
+              avoidText: effectiveStyles.length === 1 && avoidText ? avoidText : null,
+              usedOverlayTexts: effectiveStyles.length > 1 ? usedOverlayTexts : null,
+            }),
+          ]);
+          clearTimeout(t1);
+          clearTimeout(t2);
+          if (titleRes.ok) {
+            const titleJson = await titleRes.json();
+            if (titleJson?.result) pinTitle = titleJson.result;
           }
-          styleMetadataByStyleId.set(sp.id, { pinTitle, pinDescription, hashtags, onImageHeadline, onImageSubheadline });
-        })
-      );
+          if (descRes.ok) {
+            const descJson = await descRes.json();
+            if (descJson?.result) {
+              pinDescription = descJson.result;
+              const tagMatches = pinDescription.match(/#[\w-]+/g);
+              if (tagMatches) hashtags = tagMatches.slice(0, 10);
+            }
+          }
+          if (onImageResult) {
+            onImageHeadline = onImageResult.headline || topic;
+            onImageSubheadline = onImageResult.subheadline || '';
+          }
+          const used = usedOverlayByStyle.get(sp.id) || [];
+          used.push({ headline: onImageHeadline || '', subheadline: onImageSubheadline || '' });
+          usedOverlayByStyle.set(sp.id, used);
+        } catch (e) {
+          console.warn('urltopin metadata generation error (style:', sp.label, '):', e.message || e);
+        }
+        styleMetadataByStyleId.set(metaKeyForManual(sp), { pinTitle, pinDescription, hashtags, onImageHeadline, onImageSubheadline });
+      }
     }
 
     const brandForPrompt = {
@@ -1979,7 +2009,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     };
 
     const pinPromises = stylePrompts.map(async (sp) => {
-      const metaKey = (isStrategic || isStrategicSingle) && sp.index != null ? `${sp.id}::${sp.index}` : sp.id;
+      const metaKey = sp.index != null && ((isStrategic || isStrategicSingle) || effectiveStyles.length > 1) ? `${sp.id}::${sp.index}` : sp.id;
       const meta = styleMetadataByStyleId.get(metaKey) || styleMetadataByStyleId.get(sp.id) || {};
       const pinTitle = meta.pinTitle ?? topic;
       const pinDescription = (meta.pinDescription ?? base.description) || '';
@@ -2002,6 +2032,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         overlayText: overlayTextForPrompt,
         brand: brandForPrompt,
         stepCount: meta.step_count ?? null,
+        niche: contentProfile?.niche || null,
       });
 
       const overlayText = {

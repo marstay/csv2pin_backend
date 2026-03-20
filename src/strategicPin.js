@@ -584,11 +584,13 @@ Return JSON only (no markdown) with this exact shape:
  * @param {string} params.strategy
  * @param {string} [params.layoutId] - layout ID for number consistency (step_count)
  * @param {string[]} [params.keyIdeas] - optional list of key ideas for this article
+ * @param {Array<{headline:string,subheadline?:string}>} [params.usedOverlayTexts] - overlay texts already used for this layout; avoid repeating them
+ * @param {string} [params.layoutOverlayGuidance] - layout-specific guidance for overlay_headline/subheadline (from STYLE_ON_IMAGE_TEXT_GUIDANCE)
  * @param {Object} openai
  * @returns {Promise<Object>} { title, overlay_headline, overlay_subheadline, description, hashtags, image_prompt_hint, step_count }
  */
 async function generateStrategicPinMetadata(
-  { articleSummary, keyword, strategy, layoutId, suggestedAngle, keyIdeas },
+  { articleSummary, keyword, strategy, layoutId, suggestedAngle, keyIdeas, usedOverlayTexts, layoutOverlayGuidance },
   openai
 ) {
   const rules = STRATEGY_COPY_RULES[strategy]?.rules || STRATEGY_COPY_RULES.curiosity_hook.rules;
@@ -600,6 +602,23 @@ async function generateStrategicPinMetadata(
     ? keyIdeas.map((s) => `- ${s}`).join('\n')
     : '';
 
+  const avoidBlock =
+    Array.isArray(usedOverlayTexts) && usedOverlayTexts.length > 0
+      ? `\n\nAVOID REPEATING: The following overlay headlines/subheadlines were already used for other pins of this layout. Generate a DIFFERENT overlay_headline and overlay_subheadline:\n${usedOverlayTexts
+          .map((u) => `- "${u.headline}"${u.subheadline ? ` / "${u.subheadline}"` : ''}`)
+          .join('\n')}\n`
+      : '';
+
+  const hasLayoutOverlay = layoutOverlayGuidance && layoutOverlayGuidance.trim();
+  const layoutGuidanceBlock = hasLayoutOverlay
+    ? `\n\nLAYOUT-SPECIFIC OVERLAY GUIDANCE (${layoutId || 'this layout'}):\n${layoutOverlayGuidance.trim()}\n`
+    : '';
+
+  // When layout overlay guidance exists, remove redundant "Overlay text:" from strategy rules to avoid conflicting instructions
+  const rulesToUse = hasLayoutOverlay
+    ? rules.replace(/\nOverlay text:[^\n]*/g, '').replace(/\n{2,}/g, '\n').trim()
+    : rules;
+
   const prompt = BASE_TEMPLATE
     .replace('{{article_summary}}', articleSummary.slice(0, 600))
     .replace('{{article_key_ideas}}', ideasList || '- (not provided)')
@@ -607,7 +626,9 @@ async function generateStrategicPinMetadata(
     .replace('{{strategy}}', strategyLabel)
     .replace('{{layout_rule}}', layoutRule)
     .replace('{{suggested_angle}}', angle)
-    + `\n\nSTRATEGY RULES:\n${rules}\n\nReturn JSON only.`;
+    + avoidBlock
+    + layoutGuidanceBlock
+    + `\n\nSTRATEGY RULES:\n${rulesToUse}\n\nReturn JSON only.`;
 
   try {
     const completion = await openai.chat.completions.create({
