@@ -16,6 +16,7 @@ import {
   rankPins,
   getStrategyReason,
 } from './strategicPin.js';
+import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -35,6 +36,14 @@ const PLAN_PIN_LIMITS = {
   creator: 100,
   pro: 400,
   agency: 1000,
+};
+
+/** Monthly caps for “your photo + text overlay” pins (no image model). Separate from AI pin quota. */
+const PLAN_USER_PHOTO_PIN_LIMITS = {
+  free: 40,
+  creator: 400,
+  pro: 1600,
+  agency: 4000,
 };
 
 const PLAN_METADATA_LIMITS = {
@@ -75,26 +84,40 @@ async function getActiveSubscriptionForUser(userId) {
 }
 
 // Serialize pin consumption per user so concurrent requests (e.g. 2+ styles in URL→Pin)
-// don't all read the same pins_used and only write one increment.
+// don't all read the same counters and only write one increment.
 const pinUsageLocks = new Map();
 
-async function consumePinUsage(userId, pinsToConsume) {
+function planAiPinsLimit(sub) {
+  const planType = sub?.plan_type || 'free';
+  if (typeof sub?.pins_limit_per_month === 'number' && sub.pins_limit_per_month > 0) {
+    return sub.pins_limit_per_month;
+  }
+  return PLAN_PIN_LIMITS[planType] || PLAN_PIN_LIMITS.free;
+}
+
+function resolveUserPhotoPinLimitForPlan(sub) {
+  const planType = sub?.plan_type || 'free';
+  return PLAN_USER_PHOTO_PIN_LIMITS[planType] || PLAN_USER_PHOTO_PIN_LIMITS.free;
+}
+
+/**
+ * @param {string} userId
+ * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas — positive consume, negative refund
+ */
+async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
   const key = String(userId);
   let promise = pinUsageLocks.get(key);
   const run = async () => {
     const yearMonth = currentYearMonthDate();
-
     const sub = await getActiveSubscriptionForUser(userId);
     const planType = sub?.plan_type || 'free';
-    const planPinsLimit =
-      typeof sub?.pins_limit_per_month === 'number' && sub.pins_limit_per_month > 0
-        ? sub.pins_limit_per_month
-        : PLAN_PIN_LIMITS[planType] || PLAN_PIN_LIMITS.free;
+    const planPinsLimit = planAiPinsLimit(sub);
+    const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(sub);
 
     try {
       const { data: usageRows, error: usageError } = await supabaseAdmin
         .from('pin_usage')
-        .select('pins_used')
+        .select('pins_used, user_photo_pins_used')
         .eq('user_id', userId)
         .eq('year_month', yearMonth)
         .limit(1);
@@ -103,29 +126,70 @@ async function consumePinUsage(userId, pinsToConsume) {
         console.warn('pin_usage fetch error:', usageError.message || usageError);
       }
 
-      const currentUsed = usageRows && usageRows.length ? usageRows[0].pins_used || 0 : 0;
-      const newUsed = currentUsed + pinsToConsume;
+      const row = usageRows && usageRows.length ? usageRows[0] : null;
+      const currentAi = row?.pins_used ?? 0;
+      const currentUserPhoto = row?.user_photo_pins_used ?? 0;
 
-      if (newUsed > planPinsLimit) {
+      const tentativeAi = currentAi + aiDelta;
+      const tentativeUserPhoto = currentUserPhoto + userPhotoDelta;
+
+      if (tentativeAi < 0 || tentativeUserPhoto < 0) {
+        console.warn('applyPinQuotaDelta: negative usage prevented', {
+          userId,
+          currentAi,
+          currentUserPhoto,
+          aiDelta,
+          userPhotoDelta,
+        });
         return {
           allowed: false,
           planType,
           planPinsLimit,
-          currentUsed,
-          wouldUse: pinsToConsume,
+          planUserPhotoPinsLimit,
+          limitKind: 'invalid_delta',
+          currentUsed: currentAi,
+          currentUserPhotoPinsUsed: currentUserPhoto,
         };
       }
 
-      const { error: upsertError } = await supabaseAdmin
-        .from('pin_usage')
-        .upsert(
-          {
-            user_id: userId,
-            year_month: yearMonth,
-            pins_used: newUsed,
-          },
-          { onConflict: 'user_id,year_month' }
-        );
+      if (aiDelta > 0 && tentativeAi > planPinsLimit) {
+        return {
+          allowed: false,
+          limitKind: 'ai',
+          planType,
+          planPinsLimit,
+          planUserPhotoPinsLimit,
+          currentUsed: currentAi,
+          wouldUseAi: aiDelta,
+          currentUserPhotoPinsUsed: currentUserPhoto,
+        };
+      }
+
+      if (userPhotoDelta > 0 && tentativeUserPhoto > planUserPhotoPinsLimit) {
+        return {
+          allowed: false,
+          limitKind: 'user_photo',
+          planType,
+          planPinsLimit,
+          planUserPhotoPinsLimit,
+          currentUsed: currentAi,
+          currentUserPhotoPinsUsed: currentUserPhoto,
+          wouldUseUserPhoto: userPhotoDelta,
+        };
+      }
+
+      const newAi = tentativeAi;
+      const newUserPhoto = tentativeUserPhoto;
+
+      const { error: upsertError } = await supabaseAdmin.from('pin_usage').upsert(
+        {
+          user_id: userId,
+          year_month: yearMonth,
+          pins_used: newAi,
+          user_photo_pins_used: newUserPhoto,
+        },
+        { onConflict: 'user_id,year_month' }
+      );
 
       if (upsertError) {
         console.warn('pin_usage upsert error:', upsertError.message || upsertError);
@@ -135,17 +199,23 @@ async function consumePinUsage(userId, pinsToConsume) {
         allowed: true,
         planType,
         planPinsLimit,
-        previousUsed: currentUsed,
-        newUsed,
+        planUserPhotoPinsLimit,
+        previousUsed: currentAi,
+        newUsed: newAi,
+        previousUserPhotoPinsUsed: currentUserPhoto,
+        newUserPhotoPinsUsed: newUserPhoto,
       };
     } catch (err) {
-      console.warn('consumePinUsage error (falling back to allow):', err.message || err);
+      console.warn('applyPinQuotaDelta error (falling back to allow):', err.message || err);
       return {
         allowed: true,
         planType,
         planPinsLimit,
+        planUserPhotoPinsLimit,
         previousUsed: 0,
-        newUsed: pinsToConsume,
+        newUsed: Math.max(0, aiDelta),
+        previousUserPhotoPinsUsed: 0,
+        newUserPhotoPinsUsed: Math.max(0, userPhotoDelta),
       };
     }
   };
@@ -153,7 +223,6 @@ async function consumePinUsage(userId, pinsToConsume) {
   promise = promise ? promise.then(() => run()) : run();
   pinUsageLocks.set(key, promise);
   const result = await promise;
-  // Only remove the lock if no one else chained after us (same promise still in map)
   if (pinUsageLocks.get(key) === promise) {
     pinUsageLocks.delete(key);
   }
@@ -226,10 +295,8 @@ async function getCurrentUsageSnapshot(userId) {
   // Active subscription row (if any)
   const subscription = await getActiveSubscriptionForUser(userId);
   const planType = subscription?.plan_type || 'free';
-  const planPinsLimit =
-    typeof subscription?.pins_limit_per_month === 'number' && subscription.pins_limit_per_month > 0
-      ? subscription.pins_limit_per_month
-      : PLAN_PIN_LIMITS[planType] || PLAN_PIN_LIMITS.free;
+  const planPinsLimit = planAiPinsLimit(subscription);
+  const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(subscription);
 
   // Profile info (for email, created_at, etc.)
   const { data: profile } = await supabaseAdmin
@@ -240,10 +307,11 @@ async function getCurrentUsageSnapshot(userId) {
 
   // Pin usage for current month
   let pinsUsed = 0;
+  let userPhotoPinsUsed = 0;
   try {
     const { data: pinUsageRow, error: pinError } = await supabaseAdmin
       .from('pin_usage')
-      .select('pins_used')
+      .select('pins_used, user_photo_pins_used')
       .eq('user_id', userId)
       .eq('year_month', yearMonth)
       .single();
@@ -254,6 +322,7 @@ async function getCurrentUsageSnapshot(userId) {
       }
     } else if (pinUsageRow) {
       pinsUsed = pinUsageRow.pins_used || 0;
+      userPhotoPinsUsed = pinUsageRow.user_photo_pins_used ?? 0;
     }
   } catch (e) {
     console.warn('pin_usage fetch unexpected error:', e.message || e);
@@ -288,12 +357,15 @@ async function getCurrentUsageSnapshot(userId) {
     plan: {
       type: planType,
       pins_limit_per_month: planPinsLimit,
+      user_photo_pins_limit_per_month: planUserPhotoPinsLimit,
       metadata_limit_per_month: planMetaLimit,
     },
     usage: {
       year_month: yearMonth,
       pins_used: pinsUsed,
       pins_remaining: Math.max(0, planPinsLimit - pinsUsed),
+      user_photo_pins_used: userPhotoPinsUsed,
+      user_photo_pins_remaining: Math.max(0, planUserPhotoPinsLimit - userPhotoPinsUsed),
       metadata_calls: metadataCalls,
       metadata_soft_limit: planMetaLimit,
     },
@@ -1091,6 +1163,14 @@ const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const NANO_BANANA_API_URL = process.env.NANO_BANANA_API_URL;
 const NANO_BANANA_API_KEY = process.env.NANO_BANANA_API_KEY;
 
+/**
+ * User photo + on-image text: deterministic Sharp compositor only.
+ * We already have the photo, so we avoid calling an image-generation model here.
+ */
+async function buildUserPhotoPinBuffer(sourceImageUrl, overlayText, brand, renderOptions = null) {
+  return compositeUserPhotoPin({ sourceImageUrl, overlayText, brand, renderOptions });
+}
+
 // Fetch with timeout to prevent hangs on stuck network requests
 async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
   const controller = new AbortController();
@@ -1108,11 +1188,15 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
   }
 }
 
-async function generateImageWithNanoBanana(prompt, logLabel = '') {
+async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) {
   if (!NANO_BANANA_API_URL || !NANO_BANANA_API_KEY) {
     console.warn('Nano Banana 2 API not configured (NANO_BANANA_API_URL / NANO_BANANA_API_KEY missing)');
     return null;
   }
+
+  const imageInput = Array.isArray(options.imageInput)
+    ? options.imageInput.filter((u) => u && String(u).trim()).map((u) => String(u).trim())
+    : [];
 
   const baseUrl = NANO_BANANA_API_URL.replace(/\/$/, ''); // e.g. https://api.kie.ai/api/v1/jobs
   const maxRetries = 3; // Retry entire flow up to 3 times on transient failures
@@ -1144,6 +1228,7 @@ async function generateImageWithNanoBanana(prompt, logLabel = '') {
               google_search: false,
               resolution: '1K',
               output_format: 'png',
+              ...(imageInput.length > 0 ? { image_input: imageInput } : {}),
             },
           }),
         },
@@ -1626,7 +1711,32 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
 
 app.post('/api/urltopin/generate', requireUser, async (req, res) => {
   try {
-    const { url, styles, articleData, brand, avoidText, mode, count, strategicSingle } = req.body || {};
+    const {
+      url,
+      styles,
+      articleData,
+      brand,
+      avoidText,
+      mode,
+      count,
+      strategicSingle,
+      imageSource = 'ai',
+      userImageUrls: rawUserImageUrls,
+    } = req.body || {};
+    let userImageUrls = rawUserImageUrls;
+    if (typeof userImageUrls === 'string' && userImageUrls.trim()) {
+      userImageUrls = [userImageUrls.trim()];
+    } else if (!Array.isArray(userImageUrls)) {
+      userImageUrls = [];
+    } else {
+      userImageUrls = userImageUrls.map((u) => (typeof u === 'string' ? u.trim() : u)).filter(Boolean);
+    }
+    const imageSourceNorm =
+      typeof imageSource === 'string' ? imageSource.trim().toLowerCase() : 'ai';
+    const useUserComposite =
+      imageSourceNorm === 'user' &&
+      userImageUrls.length > 0 &&
+      userImageUrls.some((u) => u && String(u).trim());
     const isStrategic = mode === 'strategic';
     const isStrategicSingle = mode === 'strategic_single';
 
@@ -1656,13 +1766,25 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
     }
 
-    // Enforce plan-based pin limits using pin_usage
+    // Own-photo composites use a separate monthly cap (no image model). AI pins use pins_used.
     const pinsToGenerate = effectiveStyles.length;
-    const usageResult = await consumePinUsage(req.user.id, pinsToGenerate);
+    const aiPins = useUserComposite ? 0 : pinsToGenerate;
+    const userPhotoPins = useUserComposite ? pinsToGenerate : 0;
+    const usageResult = await applyPinQuotaDelta(req.user.id, {
+      aiDelta: aiPins,
+      userPhotoDelta: userPhotoPins,
+    });
     if (!usageResult.allowed) {
+      if (usageResult.limitKind === 'user_photo') {
+        return res.status(402).json({
+          error: 'user_photo_pin_limit_reached',
+          message: `Your plan allows ${usageResult.planUserPhotoPinsLimit} own-photo pins per month. You have used ${usageResult.currentUserPhotoPinsUsed}, so creating ${userPhotoPins} more would exceed that limit.`,
+          details: usageResult,
+        });
+      }
       return res.status(402).json({
         error: 'pin_limit_reached',
-        message: `Your current plan allows ${usageResult.planPinsLimit} pins per month. You have already used ${usageResult.currentUsed} pins this month, so generating ${pinsToGenerate} more would exceed your limit.`,
+        message: `Your current plan allows ${usageResult.planPinsLimit} AI image pins per month. You have already used ${usageResult.currentUsed} this month, so generating ${aiPins} more would exceed your limit.`,
         details: usageResult,
       });
     }
@@ -1795,6 +1917,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const nicheHint = niche && nicheVisualHints[niche] ? ` Niche-specific visual guidance: ${nicheVisualHints[niche]}` : '';
       const strategyHint = strategicMeta?.image_prompt_hint ? ` Strategy visual (must respect this): ${strategicMeta.image_prompt_hint}.` : '';
       const styleDescription = baseStyleDescription + nicheHint + strategyHint;
+      if (useUserComposite) {
+        stylePrompts.push({
+          id,
+          label: id,
+          prompt: `[user_photo_composite] ${styleDescription}`,
+          index: i,
+        });
+        continue;
+      }
       try {
         const isTimeline = id === 'timeline_infographic';
 
@@ -1906,6 +2037,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           label: id,
           prompt: `Vertical Pinterest pin 1000x1500 px. High quality, modern design about "${topic}". Domain text: ${domain}. Year: ${year}. Main concept keyword: ${keyword ||
             'blog article'}. No text baked into the image, only background photography and design.`,
+          index: i,
         });
       }
     }
@@ -2042,9 +2174,41 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       };
 
       let imageUrl = '';
+      let userCompositeSourceUrl = null;
+      const pinUserImageRaw =
+        useUserComposite && userImageUrls.length
+          ? userImageUrls[sp.index] ?? userImageUrls[sp.index % userImageUrls.length]
+          : null;
+      const pinUserImageUrl = pinUserImageRaw ? String(pinUserImageRaw).trim() : '';
+
       if (useDummyImages) {
         imageUrl = `https://via.placeholder.com/1000x1500.png?text=${encodeURIComponent('Dev Pin')}`;
-      } else {
+      } else if (
+        useUserComposite &&
+        pinUserImageUrl &&
+        isAllowedUserImageUrl(pinUserImageUrl, process.env.SUPABASE_URL)
+      ) {
+        userCompositeSourceUrl = pinUserImageUrl;
+        try {
+          const png = await buildUserPhotoPinBuffer(pinUserImageUrl, overlayText, brandForPrompt, req.body?.renderOptions || null);
+          const fileName = `urltopin-user-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${sp.id}.png`;
+          const { error: uploadError } = await supabaseAdmin.storage
+            .from('ai-images')
+            .upload(fileName, png, {
+              contentType: 'image/png',
+              upsert: true,
+            });
+          if (!uploadError) {
+            const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+            const publicUrl = publicUrlData?.publicUrl;
+            if (publicUrl) imageUrl = publicUrl;
+          } else {
+            console.warn('urltopin user composite upload error:', uploadError.message || uploadError);
+          }
+        } catch (e) {
+          console.warn('urltopin user composite error (style:', sp.label, '):', e.message || e);
+        }
+      } else if (!useUserComposite) {
         try {
           const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
           imageUrl = nanoUrl || '';
@@ -2106,6 +2270,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       }
 
+      if (useUserComposite && !imageUrl) {
+        console.warn('urltopin user composite produced no image (style:', sp.label, ')');
+      }
+
       const metaExtra = meta;
       const pinRecord = {
         styleId: sp.id,
@@ -2118,6 +2286,12 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         link: url,
         overlayText,
         bakedInText: overlayTextForPrompt,
+        ...(userCompositeSourceUrl && {
+          userCompositeSourceUrl,
+          imageGenerationMode: 'user_composite',
+        }),
+        ...(!userCompositeSourceUrl &&
+          !useUserComposite && { imageGenerationMode: 'ai' }),
         ...((isStrategic || isStrategicSingle) && metaExtra.strategy && {
           strategy: metaExtra.strategy,
           goal: metaExtra.goal,
@@ -2170,6 +2344,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           source: 'urltopin',
           overlayText,
           bakedInText: overlayTextForPrompt,
+          ...(userCompositeSourceUrl && {
+            userCompositeSourceUrl,
+            imageGenerationMode: 'user_composite',
+          }),
         };
 
         // Store in scheduled_pins with status 'generated' so they show under
@@ -2279,19 +2457,9 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
 // Regenerate only the image for a given style using explicit overlay text
 app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, res) => {
   try {
-    const { url, styleId, overlayText, articleData, brand } = req.body || {};
+    const { url, styleId, overlayText, articleData, brand, userImageUrl, renderOptions } = req.body || {};
     if (!url || !styleId || !overlayText) {
       return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
-    }
-
-    // Consume one pin from the user’s plan limit
-    const usageResult = await consumePinUsage(req.user.id, 1);
-    if (!usageResult.allowed) {
-      return res.status(402).json({
-        error: 'pin_limit_reached',
-        message: `Your current plan allows ${usageResult.planPinsLimit} pins per month. You have already used ${usageResult.currentUsed} pins this month, so generating 1 more would exceed your limit.`,
-        details: usageResult,
-      });
     }
 
     const base = articleData || extractMetaFromHtml('', url);
@@ -2310,24 +2478,78 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       brand,
     });
 
-    let imageUrl = await generateImageWithNanoBanana(imagePrompt, styleId);
-    if (!imageUrl) {
-      try {
-        const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt: imagePrompt, title: topic }),
+    const trimmedUserImg = userImageUrl && String(userImageUrl).trim();
+    if (trimmedUserImg && isAllowedUserImageUrl(trimmedUserImg, process.env.SUPABASE_URL)) {
+      const userQuota = await applyPinQuotaDelta(req.user.id, { userPhotoDelta: 1 });
+      if (!userQuota.allowed) {
+        return res.status(402).json({
+          error: 'user_photo_pin_limit_reached',
+          message: `Your plan allows ${userQuota.planUserPhotoPinsLimit} own-photo pins per month. You have used ${userQuota.currentUserPhotoPinsUsed}, so one more would exceed that limit.`,
+          details: userQuota,
         });
-        if (imgRes.ok) {
-          const imgJson = await imgRes.json();
-          imageUrl = imgJson.imageUrl || '';
+      }
+      try {
+        const png = await buildUserPhotoPinBuffer(trimmedUserImg, overlayText, brand, renderOptions || null);
+        const fileName = `urltopin-user-${req.user.id}-${Date.now()}-regen-${styleId}.png`;
+        const { error: uploadError } = await supabaseAdmin.storage
+          .from('ai-images')
+          .upload(fileName, png, { contentType: 'image/png', upsert: true });
+        if (!uploadError) {
+          const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+          const publicUrl = publicUrlData?.publicUrl;
+          if (publicUrl) {
+            return res.json({
+              imageUrl: publicUrl,
+              imagePrompt: '[user_photo_pin]',
+              userCompositeSourceUrl: trimmedUserImg,
+              imageGenerationMode: 'user_composite',
+              renderOptions: renderOptions || null,
+            });
+          }
+        } else {
+          console.warn('urltopin regenerate user composite upload error:', uploadError.message || uploadError);
         }
       } catch (e) {
-        console.warn('urltopin regenerate-image-with-text fallback error:', e.message || e);
+        console.warn('urltopin regenerate user composite error:', e.message || e);
       }
+      await applyPinQuotaDelta(req.user.id, { userPhotoDelta: -1 });
+    }
+
+    const aiQuota = await applyPinQuotaDelta(req.user.id, { aiDelta: 1 });
+    if (!aiQuota.allowed) {
+      return res.status(402).json({
+        error: 'pin_limit_reached',
+        message: `Your current plan allows ${aiQuota.planPinsLimit} AI image pins per month. You have already used ${aiQuota.currentUsed} this month, so generating one more would exceed your limit.`,
+        details: aiQuota,
+      });
+    }
+
+    let imageUrl = '';
+    try {
+      imageUrl = await generateImageWithNanoBanana(imagePrompt, styleId);
+      if (!imageUrl) {
+        try {
+          const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: imagePrompt, title: topic }),
+          });
+          if (imgRes.ok) {
+            const imgJson = await imgRes.json();
+            imageUrl = imgJson.imageUrl || '';
+          }
+        } catch (e) {
+          console.warn('urltopin regenerate-image-with-text fallback error:', e.message || e);
+        }
+      }
+    } catch (e) {
+      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 });
+      console.error('urltopin regenerate-image-with-text AI error:', e.message || e);
+      return res.status(500).json({ error: e.message || 'Failed to generate image' });
     }
 
     if (!imageUrl) {
+      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 });
       return res.status(500).json({ error: 'Failed to generate image with the provided text' });
     }
 
@@ -2348,15 +2570,32 @@ app.post('/api/urltopin/download-zip', requireUser, async (req, res) => {
     const zip = new JSZip();
 
     for (const img of images) {
-      if (!img?.url) continue;
       const filename = img.filename || 'pin.png';
       try {
+        const bake = img?.bake && typeof img.bake === 'object' ? img.bake : null;
+        const bakeUserImageUrl = bake?.userImageUrl && String(bake.userImageUrl).trim();
+
+        if (bakeUserImageUrl && isAllowedUserImageUrl(bakeUserImageUrl, process.env.SUPABASE_URL)) {
+          const overlayText = bake?.overlayText && typeof bake.overlayText === 'object' ? bake.overlayText : {};
+          const brand = bake?.brand && typeof bake.brand === 'object' ? bake.brand : null;
+          const renderOptions = bake?.renderOptions && typeof bake.renderOptions === 'object' ? bake.renderOptions : null;
+          const png = await compositeUserPhotoPin({
+            sourceImageUrl: bakeUserImageUrl,
+            overlayText,
+            brand,
+            renderOptions,
+          });
+          zip.file(filename, png);
+          continue;
+        }
+
+        if (!img?.url) continue;
         const resp = await fetch(img.url);
         if (!resp.ok) continue;
         const arrayBuf = await resp.arrayBuffer();
         zip.file(filename, Buffer.from(arrayBuf));
       } catch (e) {
-        console.warn('Failed to fetch image for ZIP:', img.url, e.message || e);
+        console.warn('Failed to add image to ZIP:', filename, e.message || e);
       }
     }
 
@@ -3296,12 +3535,13 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   const { 
     image_url, title, description, board_id, link, account_id,
     scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern,
-    force_duplicate = false
+    force_duplicate = false,
+    bake
   } = req.body;
 
   // Validate required fields
-  if (!image_url || !title || !description || !board_id || !scheduled_for) {
-    return res.status(400).json({ error: 'Missing required fields: image_url, title, description, board_id, scheduled_for' });
+  if ((!image_url && !bake) || !title || !description || !board_id || !scheduled_for) {
+    return res.status(400).json({ error: 'Missing required fields: image_url (or bake), title, description, board_id, scheduled_for' });
   }
 
   // Validate scheduling time
@@ -3340,6 +3580,29 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   }
 
   try {
+    // Optional: bake a user-photo composite at scheduling time (avoids extra "regenerate" step).
+    let finalImageUrl = image_url;
+    if (bake && typeof bake === 'object') {
+      const userImageUrl = bake.userImageUrl && String(bake.userImageUrl).trim();
+      if (userImageUrl && isAllowedUserImageUrl(userImageUrl, process.env.SUPABASE_URL)) {
+        const overlayText = bake.overlayText && typeof bake.overlayText === 'object' ? bake.overlayText : {};
+        const brand = bake.brand && typeof bake.brand === 'object' ? bake.brand : null;
+        const renderOptions = bake.renderOptions && typeof bake.renderOptions === 'object' ? bake.renderOptions : null;
+        const png = await compositeUserPhotoPin({ sourceImageUrl: userImageUrl, overlayText, brand, renderOptions });
+        const fileName = `pinterest-bake-${user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}.png`;
+        const { error: uploadError } = await supabaseAdmin.storage
+          .from('ai-images')
+          .upload(fileName, png, { contentType: 'image/png', upsert: true });
+        if (!uploadError) {
+          const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+          const publicUrl = publicUrlData?.publicUrl;
+          if (publicUrl) finalImageUrl = publicUrl;
+        } else {
+          console.warn('schedule-pin bake upload error:', uploadError.message || uploadError);
+        }
+      }
+    }
+
     // If not forcing duplicate, check whether this pin was already posted to this board
     if (!force_duplicate) {
       const { data: existing } = await supabaseAdmin
@@ -3348,7 +3611,7 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
         .eq('user_id', user.id)
         .eq('board_id', board_id)
         .eq('status', 'posted')
-        .eq('image_url', image_url)
+        .eq('image_url', finalImageUrl)
         .limit(1);
       if (existing && existing.length > 0) {
         return res.status(409).json({
@@ -3360,7 +3623,7 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
 
     // Store original pin data for reference
     const originalPinData = {
-      image_url, title, description, board_id, link, account_id,
+      image_url: finalImageUrl, title, description, board_id, link, account_id,
       user_id: user.id, created_at: new Date().toISOString()
     };
 
@@ -3372,7 +3635,7 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
         pinterest_account_id: account_id,
         title,
         description,
-        image_url,
+        image_url: finalImageUrl,
         board_id,
         link: link || '',
         scheduled_for: scheduleDate.toISOString(),
