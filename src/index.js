@@ -1387,6 +1387,8 @@ async function generateStyleOnImageText({ styleId, topic, domain, keyword, year,
 
 const ILLUSTRATED_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
 const REALISTIC_PREFIX = 'Photorealistic, high-quality photograph. Natural lighting, lifelike imagery, professional photography style. ';
+const SCROLL_STOPPING_RULE =
+  'The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche. ';
 
 const NICHE_VISUAL_HINTS = {
   recipe: 'Prioritize food, ingredients, kitchen scenes, storage containers, and real cooking or prep visuals rather than abstract icons.',
@@ -1404,7 +1406,10 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
   const nicheTail = niche && NICHE_VISUAL_HINTS[niche] ? ` ${NICHE_VISUAL_HINTS[niche]}` : '';
   const tail = nicheTail + brandTail;
   const useRealistic = !ILLUSTRATED_STYLES.has(styleId);
-  const baseIntro = 'Vertical Pinterest pin 1000x1500 px. ' + (useRealistic ? REALISTIC_PREFIX : '');
+  const baseIntro =
+    'Vertical Pinterest pin 1000x1500 px. ' +
+    SCROLL_STOPPING_RULE +
+    (useRealistic ? REALISTIC_PREFIX : '');
   const numSteps = typeof stepCount === 'number' ? stepCount : (styleId === 'step_cards_3' || styleId === 'grid_3_images' ? 3 : styleId === 'grid_4_images' ? 4 : styleId === 'timeline_infographic' ? 5 : null);
 
   switch (styleId) {
@@ -1932,6 +1937,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         const systemPrompt =
           'You create detailed text-to-image prompts that generate full Pinterest pin images, including BOTH background visuals and on-image text. ' +
           'Each prompt must clearly state at the beginning: "Vertical Pinterest pin 1000x1500 px". ' +
+          'Add this to ALL prompts: "The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche." ' +
           (isTimeline
             ? 'Describe a vertical infographic-style Pinterest pin where the main visual is a stack of clearly separated steps in a vertical timeline. The background must stay simple and low-contrast so the step boxes, connectors and labels are the main focus. Use very short on-image text: a short title and short labels for each step only. '
             : 'Describe a 9:16 Pinterest pin: eye-catching but not cluttered background, clear focal point, and bold, highly readable typography. Explicitly describe the main headline text, any subheadline, and small branding or source text that includes the website URL at the bottom of the pin (e.g. bottom center). ') +
@@ -1964,12 +1970,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         const userPromptTimeline =
           'Write a single, self-contained text-to-image prompt for a complete Pinterest pin that looks like a vertical infographic timeline. ' +
           'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
+          'Include this exact requirement in the prompt: "The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche." ' +
           'Describe a simple, low-contrast background plus the vertical stack of step boxes or circles, their connectors or arrows, and the very short labels for each step. ' +
           'Optionally mention a short title at the top and small source text with the website URL at the bottom, but avoid long headline paragraphs. ';
 
         const userPromptDefault =
           'Write a single, self-contained text-to-image prompt for a complete Pinterest pin (background plus on-image text). ' +
           'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
+          'Include this exact requirement in the prompt: "The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche." ' +
           'Describe the background scene, the exact headline and subheadline text to show, their position on the pin, and how the typography should look. ' +
           'Also describe small source text at the bottom that displays the website URL (use the domain provided above). ';
 
@@ -2004,22 +2012,26 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         if (id === 'timeline_infographic') {
           const stepLabels = Array.from({ length: numSteps }, (_, i) => `Step ${i + 1}`).join(', ');
           imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. Simple, light background with very low contrast so text and shapes are easy to read. ` +
+            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
+            `Simple, light background with very low contrast so text and shapes are easy to read. ` +
             `A vertical infographic timeline runs from top to bottom with exactly ${numSteps} clearly separated steps in boxes or circles, connected by a thin line or arrows. ` +
             `Each step box has a very short label (a few words) that summarizes a stage of "${topic}", using icons or small illustrations instead of detailed photos. ` +
             `Label steps as: ${stepLabels}. ` +
             `At the very top, include a short title about "${topic}", and at the very bottom, small, readable source text that shows "${domain}".`;
         } else if (id === 'step_cards_3') {
           imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. Three tall step cards stacked vertically, each labelled "Step 1", "Step 2", "Step 3" for "${topic}". ` +
+            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
+            `Three tall step cards stacked vertically, each labelled "Step 1", "Step 2", "Step 3" for "${topic}". ` +
             `Soft neutral background. Concise headline at top, small "${domain}" at bottom.`;
         } else if (id === 'grid_3_images') {
           imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. Grid of exactly 3 related images for "${topic}". ` +
+            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
+            `Grid of exactly 3 related images for "${topic}". ` +
             `Short headline at top, small "${domain}" at bottom.`;
         } else if (id === 'grid_4_images') {
           imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. 2×2 grid of exactly 4 related images for "${topic}". ` +
+            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
+            `2×2 grid of exactly 4 related images for "${topic}". ` +
             `Short headline at top, small "${domain}" at bottom.`;
         }
 
