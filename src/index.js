@@ -17,6 +17,7 @@ import {
   getStrategyReason,
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
+import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -1738,7 +1739,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     }
     const imageSourceNorm =
       typeof imageSource === 'string' ? imageSource.trim().toLowerCase() : 'ai';
+    const useTextBased = imageSourceNorm === 'text' || imageSourceNorm === 'text_based';
     const useUserComposite =
+      !useTextBased &&
       imageSourceNorm === 'user' &&
       userImageUrls.length > 0 &&
       userImageUrls.some((u) => u && String(u).trim());
@@ -1773,8 +1776,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     // Own-photo composites use a separate monthly cap (no image model). AI pins use pins_used.
     const pinsToGenerate = effectiveStyles.length;
-    const aiPins = useUserComposite ? 0 : pinsToGenerate;
-    const userPhotoPins = useUserComposite ? pinsToGenerate : 0;
+    const aiPins = useUserComposite || useTextBased ? 0 : pinsToGenerate;
+    const userPhotoPins = useUserComposite || useTextBased ? pinsToGenerate : 0;
     const usageResult = await applyPinQuotaDelta(req.user.id, {
       aiDelta: aiPins,
       userPhotoDelta: userPhotoPins,
@@ -1793,6 +1796,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         details: usageResult,
       });
     }
+
+    const textBasedNorm = normalizeTextBasedInput(req.body?.textBased);
+    const requestRenderOptions =
+      req.body?.renderOptions && typeof req.body.renderOptions === 'object' ? req.body.renderOptions : null;
+    const bodyVariationSeed = Number(req.body?.variationSeed);
 
     const { base, articleSummary } = req._fetchedArticle || await fetchArticleBaseAndSummary(url, articleData);
     const year = new Date().getFullYear();
@@ -2167,7 +2175,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         source: domain,
       };
 
-      const imagePrompt = buildOverlayImagePrompt({
+      let imagePrompt = buildOverlayImagePrompt({
         styleId: sp.id,
         topic,
         domain,
@@ -2178,6 +2186,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         stepCount: meta.step_count ?? null,
         niche: contentProfile?.niche || null,
       });
+      if (useTextBased) {
+        imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
+      }
 
       const overlayText = {
         headline: onImageHeadline,
@@ -2193,8 +2204,40 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           : null;
       const pinUserImageUrl = pinUserImageRaw ? String(pinUserImageRaw).trim() : '';
 
+      const textPinVariationSeed = Number.isFinite(bodyVariationSeed)
+        ? bodyVariationSeed
+        : typeof sp.index === 'number'
+          ? sp.index
+          : 0;
+
       if (useDummyImages) {
         imageUrl = `https://via.placeholder.com/1000x1500.png?text=${encodeURIComponent('Dev Pin')}`;
+      } else if (useTextBased) {
+        try {
+          const png = await renderTextBasedPin({
+            overlayText,
+            brand: brandForPrompt,
+            textBased: textBasedNorm,
+            variationSeed: textPinVariationSeed,
+            renderOptions: requestRenderOptions,
+          });
+          const fileName = `urltopin-text-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${sp.id}.png`;
+          const { error: uploadError } = await supabaseAdmin.storage
+            .from('ai-images')
+            .upload(fileName, png, {
+              contentType: 'image/png',
+              upsert: true,
+            });
+          if (!uploadError) {
+            const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+            const publicUrl = publicUrlData?.publicUrl;
+            if (publicUrl) imageUrl = publicUrl;
+          } else {
+            console.warn('urltopin text-based upload error:', uploadError.message || uploadError);
+          }
+        } catch (e) {
+          console.warn('urltopin text-based pin error (style:', sp.label, '):', e.message || e);
+        }
       } else if (
         useUserComposite &&
         pinUserImageUrl &&
@@ -2202,7 +2245,12 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       ) {
         userCompositeSourceUrl = pinUserImageUrl;
         try {
-          const png = await buildUserPhotoPinBuffer(pinUserImageUrl, overlayText, brandForPrompt, req.body?.renderOptions || null);
+          const png = await buildUserPhotoPinBuffer(
+            pinUserImageUrl,
+            overlayText,
+            brandForPrompt,
+            requestRenderOptions
+          );
           const fileName = `urltopin-user-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${sp.id}.png`;
           const { error: uploadError } = await supabaseAdmin.storage
             .from('ai-images')
@@ -2282,6 +2330,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       }
 
+      if (useTextBased && !imageUrl) {
+        console.warn('urltopin text-based produced no image (style:', sp.label, ')');
+      }
       if (useUserComposite && !imageUrl) {
         console.warn('urltopin user composite produced no image (style:', sp.label, ')');
       }
@@ -2301,9 +2352,17 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         ...(userCompositeSourceUrl && {
           userCompositeSourceUrl,
           imageGenerationMode: 'user_composite',
+          ...(requestRenderOptions ? { renderOptions: requestRenderOptions } : {}),
+        }),
+        ...(useTextBased && {
+          imageGenerationMode: 'text_based',
+          textBased: textBasedNorm,
+          variationSeed: textPinVariationSeed,
+          ...(requestRenderOptions ? { renderOptions: requestRenderOptions } : {}),
         }),
         ...(!userCompositeSourceUrl &&
-          !useUserComposite && { imageGenerationMode: 'ai' }),
+          !useUserComposite &&
+          !useTextBased && { imageGenerationMode: 'ai' }),
         ...((isStrategic || isStrategicSingle) && metaExtra.strategy && {
           strategy: metaExtra.strategy,
           goal: metaExtra.goal,
@@ -2469,9 +2528,69 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
 // Regenerate only the image for a given style using explicit overlay text
 app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, res) => {
   try {
-    const { url, styleId, overlayText, articleData, brand, userImageUrl, renderOptions } = req.body || {};
+    const {
+      url,
+      styleId,
+      overlayText,
+      articleData,
+      brand,
+      userImageUrl,
+      renderOptions,
+      variationSeed: rawVariationSeed,
+      imageGenerationMode,
+      textBased: rawTextBased,
+    } = req.body || {};
     if (!url || !styleId || !overlayText) {
       return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
+    }
+
+    const modeNorm = typeof imageGenerationMode === 'string' ? imageGenerationMode.trim().toLowerCase() : '';
+    const textBasedNorm = normalizeTextBasedInput(rawTextBased);
+
+    if (modeNorm === 'text_based') {
+      const userQuota = await applyPinQuotaDelta(req.user.id, { userPhotoDelta: 1 });
+      if (!userQuota.allowed) {
+        return res.status(402).json({
+          error: 'user_photo_pin_limit_reached',
+          message: `Your plan allows ${userQuota.planUserPhotoPinsLimit} own-photo pins per month. You have used ${userQuota.currentUserPhotoPinsUsed}, so one more would exceed that limit.`,
+          details: userQuota,
+        });
+      }
+      try {
+        const vs = Number(rawVariationSeed);
+        const variationSeed = Number.isFinite(vs) ? vs : 0;
+        const png = await renderTextBasedPin({
+          overlayText,
+          brand,
+          textBased: textBasedNorm,
+          variationSeed,
+          renderOptions: renderOptions && typeof renderOptions === 'object' ? renderOptions : null,
+        });
+        const fileName = `urltopin-text-${req.user.id}-${Date.now()}-regen-${styleId}.png`;
+        const { error: uploadError } = await supabaseAdmin.storage
+          .from('ai-images')
+          .upload(fileName, png, { contentType: 'image/png', upsert: true });
+        if (!uploadError) {
+          const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+          const publicUrl = publicUrlData?.publicUrl;
+          if (publicUrl) {
+            return res.json({
+              imageUrl: publicUrl,
+              imagePrompt: `[text_based_pin] preset=${textBasedNorm.preset}`,
+              imageGenerationMode: 'text_based',
+              textBased: textBasedNorm,
+              renderOptions: renderOptions && typeof renderOptions === 'object' ? renderOptions : null,
+              variationSeed,
+            });
+          }
+        } else {
+          console.warn('urltopin regenerate text-based upload error:', uploadError.message || uploadError);
+        }
+      } catch (e) {
+        console.warn('urltopin regenerate text-based error:', e.message || e);
+      }
+      await applyPinQuotaDelta(req.user.id, { userPhotoDelta: -1 });
+      return res.status(500).json({ error: 'Failed to render text-based pin' });
     }
 
     const base = articleData || extractMetaFromHtml('', url);
@@ -2598,6 +2717,29 @@ app.post('/api/urltopin/download-zip', requireUser, async (req, res) => {
             renderOptions,
           });
           zip.file(filename, png);
+          continue;
+        }
+
+        const bakeText = bake?.textBased && typeof bake.textBased === 'object';
+        if (bakeText) {
+          const overlayText = bake?.overlayText && typeof bake.overlayText === 'object' ? bake.overlayText : {};
+          const brand = bake?.brand && typeof bake.brand === 'object' ? bake.brand : null;
+          const renderOptions = bake?.renderOptions && typeof bake.renderOptions === 'object' ? bake.renderOptions : null;
+          const textBased = normalizeTextBasedInput(bake.textBased);
+          const vs = Number(bake?.variationSeed);
+          const variationSeed = Number.isFinite(vs) ? vs : 0;
+          try {
+            const png = await renderTextBasedPin({
+              overlayText,
+              brand,
+              textBased,
+              variationSeed,
+              renderOptions,
+            });
+            zip.file(filename, png);
+          } catch (e) {
+            console.warn('ZIP text-based bake failed:', e.message || e);
+          }
           continue;
         }
 
@@ -3611,6 +3753,35 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
           if (publicUrl) finalImageUrl = publicUrl;
         } else {
           console.warn('schedule-pin bake upload error:', uploadError.message || uploadError);
+        }
+      } else if (bake.textBased && typeof bake.textBased === 'object') {
+        const overlayText = bake.overlayText && typeof bake.overlayText === 'object' ? bake.overlayText : {};
+        const brand = bake.brand && typeof bake.brand === 'object' ? bake.brand : null;
+        const renderOptions = bake.renderOptions && typeof bake.renderOptions === 'object' ? bake.renderOptions : null;
+        const textBased = normalizeTextBasedInput(bake.textBased);
+        const vs = Number(bake?.variationSeed);
+        const variationSeed = Number.isFinite(vs) ? vs : 0;
+        try {
+          const png = await renderTextBasedPin({
+            overlayText,
+            brand,
+            textBased,
+            variationSeed,
+            renderOptions,
+          });
+          const fileName = `pinterest-textbake-${user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}.png`;
+          const { error: uploadError } = await supabaseAdmin.storage
+            .from('ai-images')
+            .upload(fileName, png, { contentType: 'image/png', upsert: true });
+          if (!uploadError) {
+            const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+            const publicUrl = publicUrlData?.publicUrl;
+            if (publicUrl) finalImageUrl = publicUrl;
+          } else {
+            console.warn('schedule-pin text-based bake upload error:', uploadError.message || uploadError);
+          }
+        } catch (e) {
+          console.warn('schedule-pin text-based bake error:', e.message || e);
         }
       }
     }
