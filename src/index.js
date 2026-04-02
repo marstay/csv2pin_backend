@@ -4355,9 +4355,9 @@ app.delete('/api/pinterest/scheduled-pins/:id/permanent', async (req, res) => {
       return res.status(404).json({ error: 'Scheduled pin not found' });
     }
 
-    // Only allow permanent deletion of cancelled or posted pins
-    if (!['cancelled', 'posted'].includes(existingPin.status)) {
-      return res.status(400).json({ error: 'Can only permanently delete cancelled or posted pins' });
+    // Only allow permanent deletion of cancelled, posted, or generated pins
+    if (!['cancelled', 'posted', 'generated'].includes(existingPin.status)) {
+      return res.status(400).json({ error: 'Can only permanently delete cancelled, posted, or generated pins' });
     }
 
     // Soft delete the pin (preserve for analytics)
