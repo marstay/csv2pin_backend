@@ -103,7 +103,7 @@ function resolveUserPhotoPinLimitForPlan(sub) {
 
 /**
  * @param {string} userId
- * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas — positive consume, negative refund
+ * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas, positive consume, negative refund
  */
 async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
   const key = String(userId);
@@ -2480,7 +2480,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
   }
 });
 
-// POST /api/urltopin/regenerate-metadata — regenerate only title or description (fast, no image)
+// POST /api/urltopin/regenerate-metadata, regenerate only title or description (fast, no image)
 app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
   try {
     const { url, articleData, styleId, type, currentTitle, currentDescription } = req.body || {};

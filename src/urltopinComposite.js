@@ -20,7 +20,7 @@ export function isAllowedUserImageUrl(urlString, supabaseUrlEnv) {
         const base = new URL(supabaseUrlEnv);
         if (host === base.hostname.toLowerCase()) return true;
       } catch {
-        /* invalid SUPABASE_URL env — still allowed .supabase.co above */
+        /* invalid SUPABASE_URL env, still allowed .supabase.co above */
       }
     }
     return false;
