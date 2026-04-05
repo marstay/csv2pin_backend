@@ -437,6 +437,71 @@ function extractMetaFromHtml(html, url) {
   return { title, description, domain, keyword };
 }
 
+/** Browser-like headers — bare Node fetch gets 403 from Medium and similar CDNs */
+const URL_SCRAPE_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+/**
+ * Load public article HTML: fetch with browser headers first; on 403/401/503/429 or network error,
+ * retry with Puppeteer (Medium often blocks datacenter fetch).
+ */
+async function fetchArticleHtml(url) {
+  try {
+    const resp = await fetch(url, { redirect: 'follow', headers: URL_SCRAPE_HEADERS });
+    if (resp.ok) {
+      return await resp.text();
+    }
+    const status = resp.status;
+    console.warn('fetchArticleHtml non-OK:', String(url).slice(0, 96), status);
+    if (status === 403 || status === 401 || status === 503 || status === 429) {
+      const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
+      if (puppetHtml) return puppetHtml;
+    }
+    return '';
+  } catch (e) {
+    console.warn('fetchArticleHtml error:', e.message || e);
+    const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
+    return puppetHtml || '';
+  }
+}
+
+async function fetchArticleHtmlViaPuppeteer(pageUrl) {
+  if (process.env.DISABLE_URLTOPIN_PUPPETEER === '1') {
+    return '';
+  }
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      timeout: 60000,
+    });
+    const page = await browser.newPage();
+    await page.setUserAgent(URL_SCRAPE_HEADERS['User-Agent']);
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': URL_SCRAPE_HEADERS['Accept-Language'],
+    });
+    await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+    await new Promise((r) => setTimeout(r, 2000));
+    return await page.content();
+  } catch (e) {
+    console.warn('fetchArticleHtmlViaPuppeteer:', e.message || e);
+    return '';
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+}
+
 /**
  * Fetch full article HTML and build richer base metadata + summary.
  * Falls back gracefully to meta tags only if fetch or parsing fails.
@@ -444,10 +509,7 @@ function extractMetaFromHtml(html, url) {
 async function fetchArticleBaseAndSummary(url, clientArticleData) {
   let html = '';
   try {
-    const resp = await fetch(url);
-    if (resp.ok) {
-      html = await resp.text();
-    }
+    html = await fetchArticleHtml(url);
   } catch (e) {
     console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
   }
@@ -1673,11 +1735,13 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     const { url, enrich } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
-    const response = await fetch(url, { redirect: 'follow' });
-    if (!response.ok) {
-      return res.status(500).json({ error: `Failed to fetch URL: ${response.status}` });
+    const html = await fetchArticleHtml(url);
+    if (!html || html.length < 200) {
+      return res.status(502).json({
+        error:
+          'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
+      });
     }
-    const html = await response.text();
     const meta = extractMetaFromHtml(html, url);
     if (enrich) {
       try {
