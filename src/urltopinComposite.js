@@ -111,7 +111,7 @@ function getTextTheme(renderOptions) {
   const preferred = normalizeHex(renderOptions?.textColor) || '#FFFFFF';
   const rgb = hexToRgb(preferred) || { r: 255, g: 255, b: 255 };
   const lum = relativeLuminance(rgb);
-  // "Dark text" means we should use light scrims and white strokes.
+  // "Dark text" means we should use light scrims and contrasting strokes (when outline is on).
   const isDarkText = lum < 0.35;
   return {
     textFill: preferred,
@@ -119,6 +119,28 @@ function getTextTheme(renderOptions) {
     stroke: isDarkText ? '#FFFFFF' : '#000000',
     isDarkText,
   };
+}
+
+/** SVG stroke around text: 'standard' (legibility), 'thin', or 'none' / 'clean' (no halo — works best with a solid text panel). */
+function textStrokeSvgAttrs(theme, renderOptions, role) {
+  const mode = String(renderOptions?.textOutline ?? 'none').toLowerCase();
+  if (mode === 'none' || mode === 'off' || mode === 'clean' || mode === 'no') {
+    return '';
+  }
+  const thin = mode === 'thin' || mode === 'subtle';
+  const w =
+    role === 'head'
+      ? thin
+        ? 1.5
+        : 4
+      : role === 'sub'
+        ? thin
+          ? 1
+          : 2.5
+        : thin
+          ? 0.85
+          : 1.75;
+  return ` stroke="${escapeXml(theme.stroke)}" stroke-width="${w}" paint-order="stroke fill"`;
 }
 
 function getFontFamily(renderOptions) {
@@ -204,7 +226,7 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
   // Thin stripes: use kit colors without hurting text contrast (subhead stays light on dark gradient).
   const accentBar = accent || primary || secondary || '#ffffff';
 
-  const overlayStrength = clamp01(renderOptions?.overlayStrength, 0.45); // 0..1
+  const overlayStrength = clamp01(renderOptions?.overlayStrength, 1); // 0..1; default full scrims
   const fontScale = clamp(renderOptions?.fontScale, 0.75, 1.6, 1.0);
   const fontFamily = getFontFamily(renderOptions);
   const theme = getTextTheme(renderOptions);
@@ -274,12 +296,16 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
   const wantFull = scrimMode === 'full';
 
   const scrimColor = theme.isDarkText ? '#FFFFFF' : '#000000';
-  const grad0 = wantFull ? (0.70 + 0.22 * overlayStrength).toFixed(2) : '0.00';
-  const grad1 = wantFull ? (0.34 + 0.22 * overlayStrength).toFixed(2) : '0.00';
-  const grad2 = wantFull ? (0.10 + 0.18 * overlayStrength).toFixed(2) : '0.00';
-  // Make the "behind text" scrim closer to footer strength.
-  const textScrimOpacity = (0.24 + 0.40 * overlayStrength).toFixed(2);
-  const footerScrimOpacity = (0.16 + 0.30 * overlayStrength).toFixed(2);
+  // At overlayStrength === 0: no scrims / no gradient tint (all opacities scale to 0).
+  const grad0 = wantFull ? (overlayStrength * (0.70 + 0.22 * overlayStrength)).toFixed(2) : '0.00';
+  const grad1 = wantFull ? (overlayStrength * (0.34 + 0.22 * overlayStrength)).toFixed(2) : '0.00';
+  const grad2 = wantFull ? (overlayStrength * (0.10 + 0.18 * overlayStrength)).toFixed(2) : '0.00';
+  // Text panel: 0 at slider min, fully opaque at max (quadratic keeps f'(0)>0 so low end isn’t stuck).
+  const textScrimOpacity = Math.min(1, overlayStrength * (0.24 + 0.76 * overlayStrength)).toFixed(2);
+  const footerScrimOpacity =
+    renderOptions?.footerBackgroundOpacity != null && Number.isFinite(Number(renderOptions.footerBackgroundOpacity))
+      ? Math.min(1, clamp01(renderOptions.footerBackgroundOpacity)).toFixed(2)
+      : Math.min(1, overlayStrength * (0.16 + 0.84 * overlayStrength)).toFixed(2);
   // Scrim: vertical from glyph metrics; horizontal from estimated line width × fontSize (reacts to text size slider).
   const textPad = clamp(renderOptions?.textPaddingPx, 0, 90, 28);
   const strokePad = Math.round(6 + (theme.isDarkText ? 2 : 0));
@@ -327,9 +353,7 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
     fill="${escapeXml(theme.textFill)}"
     font-family="${escapeXml(fontFamily)}"
     font-weight="700"
-    stroke="${escapeXml(theme.stroke)}"
-    stroke-width="4"
-    paint-order="stroke fill"
+    ${textStrokeSvgAttrs(theme, renderOptions, 'head')}
   >${tspansHead}</text>
   ${
     subLines.length
@@ -340,9 +364,7 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
     fill="${escapeXml(theme.subFill)}"
     font-family="${escapeXml(fontFamily)}"
     font-weight="600"
-    stroke="${escapeXml(theme.stroke)}"
-    stroke-width="2.5"
-    paint-order="stroke fill"
+    ${textStrokeSvgAttrs(theme, renderOptions, 'sub')}
   >${tspansSub}</text>`
       : ''
   }
@@ -357,9 +379,7 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
     font-family="${escapeXml(fontFamily)}"
     font-size="${footerSize}"
     font-weight="500"
-    stroke="${escapeXml(theme.stroke)}"
-    stroke-width="1.75"
-    paint-order="stroke fill"
+    ${textStrokeSvgAttrs(theme, renderOptions, 'foot')}
   >${escapeXml(footerLine)}</text>`
       : ''
   }

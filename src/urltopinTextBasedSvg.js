@@ -131,6 +131,24 @@ function getTextTheme(renderOptions, fallbackFill) {
   };
 }
 
+/** Match composite pins: default no outline; 'standard' uses preset stroke widths. */
+function textBasedStrokeAttrs(theme, renderOptions, role, headlineStroke, subStroke) {
+  const ro = renderOptions && typeof renderOptions === 'object' ? renderOptions : {};
+  const mode = String(ro.textOutline ?? 'none').toLowerCase();
+  if (mode === 'none' || mode === 'off' || mode === 'clean' || mode === 'no') return '';
+  const thin = mode === 'thin' || mode === 'subtle';
+  if (role === 'head') {
+    const w = thin ? Math.max(1, Math.round(headlineStroke * 0.35)) : headlineStroke;
+    return ` stroke="${escapeXml(theme.stroke)}" stroke-width="${w}" paint-order="stroke fill"`;
+  }
+  if (role === 'sub') {
+    const w = thin ? Math.max(1, Math.round(subStroke * 0.35)) : subStroke;
+    return ` stroke="${escapeXml(theme.stroke)}" stroke-width="${w}" paint-order="stroke fill"`;
+  }
+  const w = thin ? 0.85 : 1.75;
+  return ` stroke="${escapeXml(theme.stroke)}" stroke-width="${w}" paint-order="stroke fill"`;
+}
+
 function getFontFamily(renderOptions) {
   const v = String(renderOptions?.fontFamily || 'sans').toLowerCase();
   if (v === 'serif') return 'DejaVu Serif, Georgia, Times New Roman, serif';
@@ -309,7 +327,7 @@ export function buildTextBasedPinSvgString({
 
   const typoW = presetTypographyWeights(preset);
   const defaultColorHint = presetDefaultTextColor(preset);
-  const overlayStrength = clamp01(ro.overlayStrength, 0.45);
+  const overlayStrength = clamp01(ro.overlayStrength, 1);
   const fontScale = clamp(ro.fontScale, 0.75, 1.6, 1.0);
   const fontFamily = getFontFamily(ro);
   const theme = getTextTheme(ro, defaultColorHint);
@@ -360,11 +378,11 @@ export function buildTextBasedPinSvgString({
   const wantFull = scrimMode === 'full';
 
   const scrimColor = theme.isDarkText ? '#FFFFFF' : '#000000';
-  const grad0 = wantFull ? (0.7 + 0.22 * overlayStrength).toFixed(2) : '0.00';
-  const grad1 = wantFull ? (0.34 + 0.22 * overlayStrength).toFixed(2) : '0.00';
-  const grad2 = wantFull ? (0.1 + 0.18 * overlayStrength).toFixed(2) : '0.00';
-  const textScrimOpacity = (0.24 + 0.4 * overlayStrength).toFixed(2);
-  const footerScrimOpacity = (0.16 + 0.3 * overlayStrength).toFixed(2);
+  const grad0 = wantFull ? (overlayStrength * (0.7 + 0.22 * overlayStrength)).toFixed(2) : '0.00';
+  const grad1 = wantFull ? (overlayStrength * (0.34 + 0.22 * overlayStrength)).toFixed(2) : '0.00';
+  const grad2 = wantFull ? (overlayStrength * (0.1 + 0.18 * overlayStrength)).toFixed(2) : '0.00';
+  const textScrimOpacity = Math.min(1, overlayStrength * (0.24 + 0.76 * overlayStrength)).toFixed(2);
+  const footerScrimOpacity = Math.min(1, overlayStrength * (0.16 + 0.84 * overlayStrength)).toFixed(2);
 
   const textPad = clamp(ro.textPaddingPx, 0, 90, 28);
   const strokePad = Math.round(6 + (theme.isDarkText ? 2 : 0));
@@ -455,9 +473,7 @@ export function buildTextBasedPinSvgString({
     fill="${escapeXml(theme.subFill)}"
     font-family="${escapeXml(fontFamily)}"
     font-weight="${typoW.subWeight}"
-    stroke="${escapeXml(theme.stroke)}"
-    stroke-width="${subStroke}"
-    paint-order="stroke fill"
+    ${textBasedStrokeAttrs(theme, ro, 'sub', headlineStroke, subStroke)}
   >${tspansSub}</text>`
       : ''
   }
@@ -472,9 +488,7 @@ export function buildTextBasedPinSvgString({
     font-family="${escapeXml(fontFamily)}"
     font-size="${footerSize}"
     font-weight="500"
-    stroke="${escapeXml(theme.stroke)}"
-    stroke-width="1.75"
-    paint-order="stroke fill"
+    ${textBasedStrokeAttrs(theme, ro, 'foot', headlineStroke, subStroke)}
   >${escapeXml(footerLine)}</text>`
       : ''
   }
