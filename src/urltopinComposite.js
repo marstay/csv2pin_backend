@@ -179,7 +179,7 @@ function estimateLinesWidth(lines, fontSize, charRatio) {
  * @param {string} opts.sourceImageUrl
  * @param {{ headline?: string, subheadline?: string, source?: string }} opts.overlayText
  * @param {{ primaryColor?: string|null, secondaryColor?: string|null, accentColor?: string|null, brandName?: string|null } | null} opts.brand
- * @param {{ overlayStrength?: number, fontFamily?: 'sans'|'serif'|'mono', fontScale?: number, textColor?: string, position?: 'upper'|'middle'|'lower' } | null} [opts.renderOptions]
+ * @param {{ overlayStrength?: number, fontFamily?: 'sans'|'serif'|'mono', fontScale?: number, textColor?: string, position?: 'upper'|'middle'|'lower', overlayScrimColor?: string } | null} [opts.renderOptions]
  * @returns {Promise<Buffer>} PNG buffer
  */
 export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand, renderOptions }) {
@@ -295,7 +295,9 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
   const wantFooterScrim = scrimMode === 'footer' || scrimMode === 'text_footer';
   const wantFull = scrimMode === 'full';
 
-  const scrimColor = theme.isDarkText ? '#FFFFFF' : '#000000';
+  const autoScrim = theme.isDarkText ? '#FFFFFF' : '#000000';
+  const customScrim = normalizeHex(renderOptions?.overlayScrimColor);
+  const scrimColor = customScrim || autoScrim;
   // At overlayStrength === 0: no scrims / no gradient tint (all opacities scale to 0).
   const grad0 = wantFull ? (overlayStrength * (0.70 + 0.22 * overlayStrength)).toFixed(2) : '0.00';
   const grad1 = wantFull ? (overlayStrength * (0.34 + 0.22 * overlayStrength)).toFixed(2) : '0.00';
