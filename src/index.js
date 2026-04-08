@@ -506,12 +506,23 @@ async function fetchArticleHtmlViaPuppeteer(pageUrl) {
  * Fetch full article HTML and build richer base metadata + summary.
  * Falls back gracefully to meta tags only if fetch or parsing fails.
  */
-async function fetchArticleBaseAndSummary(url, clientArticleData) {
+async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
+  const fast = !!opts?.fast;
+  const hasClientMeta =
+    clientArticleData &&
+    typeof clientArticleData === 'object' &&
+    (clientArticleData.title || clientArticleData.description || clientArticleData.domain);
+
+  // In "fast" mode (used for strategic_single fan-out requests), avoid refetching full HTML.
+  // We already scraped client-side and pass basic metadata; the slight summary quality drop is
+  // worth the latency win and reduces user abandonment.
   let html = '';
-  try {
-    html = await fetchArticleHtml(url);
-  } catch (e) {
-    console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
+  if (!fast || !hasClientMeta) {
+    try {
+      html = await fetchArticleHtml(url);
+    } catch (e) {
+      console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
+    }
   }
 
   const metaFromHtml = extractMetaFromHtml(html || '', url);
@@ -1866,7 +1877,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       req.body?.renderOptions && typeof req.body.renderOptions === 'object' ? req.body.renderOptions : null;
     const bodyVariationSeed = Number(req.body?.variationSeed);
 
-    const { base, articleSummary } = req._fetchedArticle || await fetchArticleBaseAndSummary(url, articleData);
+    const fastForFanOut = isStrategicSingle && !!articleData;
+    const { base, articleSummary } =
+      req._fetchedArticle || (await fetchArticleBaseAndSummary(url, articleData, fastForFanOut ? { fast: true } : null));
     const year = new Date().getFullYear();
     const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
