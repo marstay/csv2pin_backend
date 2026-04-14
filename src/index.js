@@ -591,10 +591,7 @@ async function processScheduledPins() {
     // Get pins that are due to be posted
     const { data: pinsToPost, error: fetchError } = await supabaseAdmin
       .from('scheduled_pins')
-      .select(`
-        *,
-        pinterest_accounts(access_token)
-      `)
+      .select('*')
       .in('status', ['scheduled', 'failed'])
       .lte('scheduled_for', new Date().toISOString())
       .or('next_retry_at.is.null,next_retry_at.lte.' + new Date().toISOString())
@@ -665,10 +662,26 @@ async function processScheduledPin(pin) {
       return;
     }
 
-    // Get access token
-    const accessToken = pin.pinterest_accounts?.access_token;
+    const accountId = pin.pinterest_account_id;
+    if (!accountId) {
+      await handlePinError(pin.id, 'No Pinterest account linked to this scheduled pin');
+      return;
+    }
+
+    const { data: accRow, error: accFetchErr } = await supabaseAdmin
+      .from('pinterest_accounts')
+      .select('id, access_token, refresh_token, token_expires_at')
+      .eq('id', accountId)
+      .single();
+
+    if (accFetchErr || !accRow) {
+      await handlePinError(pin.id, 'Pinterest account not found for scheduled pin');
+      return;
+    }
+
+    let { accessToken, error: tokErr } = await ensureValidPinterestAccessToken(accRow);
     if (!accessToken) {
-      await handlePinError(pin.id, 'No Pinterest access token found');
+      await handlePinError(pin.id, tokErr || 'No Pinterest access token');
       return;
     }
 
@@ -686,17 +699,33 @@ async function processScheduledPin(pin) {
     
     console.log(`📤 Posting to Pinterest API for pin: ${pin.id}`);
     
-    const pinterestRes = await fetch('https://api.pinterest.com/v5/pins', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-    });
+    const postPin = (token) =>
+      fetch('https://api.pinterest.com/v5/pins', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      });
 
-    const pinData = await pinterestRes.json();
-    
+    let pinterestRes = await postPin(accessToken);
+    let pinData = await pinterestRes.json();
+
+    if (!pinterestRes.ok && pinterestResponseIsAuthFailure(pinterestRes.status, pinData)) {
+      const { data: accFresh } = await supabaseAdmin
+        .from('pinterest_accounts')
+        .select('id, access_token, refresh_token, token_expires_at')
+        .eq('id', accountId)
+        .single();
+      const newAccess = await pinterestRefreshAfterAuthFailure(accFresh || accRow);
+      if (newAccess) {
+        console.log(`Retrying Pinterest post for pin ${pin.id} after token refresh`);
+        pinterestRes = await postPin(newAccess);
+        pinData = await pinterestRes.json();
+      }
+    }
+
     if (pinterestRes.ok) {
       // Success - update pin as posted with analytics data
       const postedAt = new Date();
@@ -1600,12 +1629,23 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
   const source = overlayText?.source || domain;
-  const brandTail = brand?.brandName
+  const brandColorParts = [];
+  if (brand?.primaryColor) brandColorParts.push(`primary ${brand.primaryColor}`);
+  if (brand?.secondaryColor) brandColorParts.push(`secondary ${brand.secondaryColor}`);
+  if (brand?.accentColor) brandColorParts.push(`accent ${brand.accentColor}`);
+  const brandColorHint = brandColorParts.length
+    ? promptTier(
+        ` Use this brand color palette in backgrounds, accents, or typography: ${brandColorParts.join(', ')}.`,
+        ` Palette: ${brandColorParts.join(', ')}.`
+      )
+    : '';
+  const brandNameHint = brand?.brandName
     ? promptTier(
         ` Use the brand name ${brand.brandName} subtly in the design.`,
         ` Brand: ${brand.brandName}.`
       )
     : '';
+  const brandTail = brandColorHint + brandNameHint;
   const nicheTail =
     niche && NICHE_VISUAL_HINTS[niche]
       ? promptTier(` ${NICHE_VISUAL_HINTS[niche]}`, '')
@@ -3565,6 +3605,144 @@ async function exchangePinterestCodeForToken(code, redirectUri) {
   }
 }
 
+/** Seconds before access_token expiry to proactively refresh */
+const PINTEREST_TOKEN_REFRESH_BUFFER_SEC = 300;
+
+async function exchangePinterestRefreshToken(refreshToken) {
+  if (!refreshToken || !process.env.PINTEREST_CLIENT_ID || !process.env.PINTEREST_CLIENT_SECRET) {
+    throw new Error('Missing refresh token or Pinterest client credentials');
+  }
+  const basicAuth = Buffer.from(
+    `${process.env.PINTEREST_CLIENT_ID}:${process.env.PINTEREST_CLIENT_SECRET}`
+  ).toString('base64');
+
+  const params = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+  });
+
+  let response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+      Authorization: `Basic ${basicAuth}`,
+    },
+    body: params.toString(),
+  });
+
+  let text = await response.text();
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch {
+    result = { error: 'Invalid JSON response', response: text };
+  }
+
+  if (!response.ok && response.status === 400) {
+    const paramsWithCreds = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: process.env.PINTEREST_CLIENT_ID,
+      client_secret: process.env.PINTEREST_CLIENT_SECRET,
+    });
+    response = await fetch('https://api.pinterest.com/v5/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+      body: paramsWithCreds.toString(),
+    });
+    text = await response.text();
+    try {
+      result = JSON.parse(text);
+    } catch {
+      result = { error: 'Invalid JSON response', response: text };
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(`Pinterest refresh error: ${response.status} - ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
+async function applyPinterestTokenResponseToAccount(accountId, tokenData) {
+  if (!accountId || !tokenData?.access_token) return;
+  const expiresAt =
+    tokenData.expires_in != null
+      ? new Date(Date.now() + Number(tokenData.expires_in) * 1000).toISOString()
+      : null;
+  const row = {
+    access_token: tokenData.access_token,
+    updated_at: new Date().toISOString(),
+  };
+  if (tokenData.refresh_token) row.refresh_token = tokenData.refresh_token;
+  if (expiresAt) row.token_expires_at = expiresAt;
+
+  const { error } = await supabaseAdmin.from('pinterest_accounts').update(row).eq('id', accountId);
+  if (error) console.error('applyPinterestTokenResponseToAccount:', error.message || error);
+}
+
+function pinterestAccountNeedsProactiveRefresh(account) {
+  if (!account?.refresh_token) return false;
+  if (!account.token_expires_at) return false;
+  const expMs = new Date(account.token_expires_at).getTime();
+  if (Number.isNaN(expMs)) return false;
+  return Date.now() > expMs - PINTEREST_TOKEN_REFRESH_BUFFER_SEC * 1000;
+}
+
+function pinterestResponseIsAuthFailure(status, pinData) {
+  if (status === 401 || status === 403) return true;
+  const msg = String(pinData?.message || pinData?.error || '').toLowerCase();
+  return msg.includes('authentication') || msg.includes('unauthorized') || msg.includes('invalid_token');
+}
+
+/**
+ * Returns a usable access token; refreshes OAuth token when expired/near expiry if refresh_token is stored.
+ * @param {{ id: string, access_token?: string|null, refresh_token?: string|null, token_expires_at?: string|null }} account
+ */
+async function ensureValidPinterestAccessToken(account) {
+  if (!account?.id) {
+    return { accessToken: null, error: 'Invalid Pinterest account row' };
+  }
+  let accessToken = account.access_token || null;
+  let refreshToken = account.refresh_token || null;
+
+  if (pinterestAccountNeedsProactiveRefresh(account) && refreshToken) {
+    try {
+      const tokenData = await exchangePinterestRefreshToken(refreshToken);
+      await applyPinterestTokenResponseToAccount(account.id, tokenData);
+      accessToken = tokenData.access_token;
+      refreshToken = tokenData.refresh_token || refreshToken;
+    } catch (e) {
+      console.error('Pinterest proactive token refresh failed:', e.message || e);
+      return { accessToken: null, error: e.message || 'Token refresh failed' };
+    }
+  }
+
+  if (!accessToken) {
+    return { accessToken: null, error: 'No Pinterest access token' };
+  }
+  return { accessToken, refreshToken, error: null };
+}
+
+/**
+ * After Pinterest returns auth error: try refresh once and return new access token (updates DB).
+ */
+async function pinterestRefreshAfterAuthFailure(account) {
+  if (!account?.id || !account.refresh_token) return null;
+  try {
+    const tokenData = await exchangePinterestRefreshToken(account.refresh_token);
+    await applyPinterestTokenResponseToAccount(account.id, tokenData);
+    return tokenData.access_token || null;
+  } catch (e) {
+    console.error('Pinterest reactive token refresh failed:', e.message || e);
+    return null;
+  }
+}
+
 
 // Handle Pinterest OAuth2 callback
 app.get('/api/pinterest/callback', async (req, res) => {
@@ -3625,10 +3803,20 @@ app.post('/api/pinterest/oauth', async (req, res) => {
       } catch (e) {
         console.warn('Failed to fetch Pinterest account info:', e?.message || e);
       }
-      // Save token to pinterest_accounts
+      const tokenExpiresAt =
+        tokenData.expires_in != null
+          ? new Date(Date.now() + Number(tokenData.expires_in) * 1000).toISOString()
+          : null;
+      const insertRow = {
+        user_id: user.id,
+        access_token: tokenData.access_token,
+        account_name: accountName,
+        refresh_token: tokenData.refresh_token || null,
+        ...(tokenExpiresAt ? { token_expires_at: tokenExpiresAt } : {}),
+      };
       const { error: insertError } = await supabaseAdmin
         .from('pinterest_accounts')
-        .insert({ user_id: user.id, access_token: tokenData.access_token, account_name: accountName });
+        .insert(insertRow);
       if (insertError) {
         console.error('Error saving pinterest account:', insertError);
       }
@@ -3722,11 +3910,13 @@ async function getPinterestAccessTokenForUser(userId, accountId) {
   }
   const { data: account } = await supabaseAdmin
     .from('pinterest_accounts')
-    .select('access_token')
+    .select('id, access_token, refresh_token, token_expires_at')
     .eq('id', accountId)
     .eq('user_id', userId)
     .single();
-  return account?.access_token || null;
+  if (!account) return null;
+  const { accessToken } = await ensureValidPinterestAccessToken(account);
+  return accessToken || null;
 }
 
 app.get('/api/pinterest/boards', async (req, res) => {
@@ -4307,24 +4497,29 @@ app.get('/api/pinterest/status', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
-  // Load accounts
   const { data: accounts, error: accError } = await supabaseAdmin
     .from('pinterest_accounts')
-    .select('id, account_name, access_token');
+    .select('id, account_name, access_token')
+    .eq('user_id', user.id);
   const hasToken = Array.isArray(accounts) && accounts.some(a => !!a.access_token);
   let tokenValid = false;
   let pinterestError = null;
 
-  if (hasToken) {
+  if (hasToken && accounts[0]?.id) {
     try {
-      const anyToken = accounts.find(a => a.access_token)?.access_token;
-      const testRes = await fetch('https://api.pinterest.com/v5/user_account', {
-        headers: {
-          'Authorization': `Bearer ${anyToken}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      if (testRes.ok) tokenValid = true; else pinterestError = await testRes.json();
+      const accessToken = await getPinterestAccessTokenForUser(user.id, accounts[0].id);
+      if (!accessToken) {
+        pinterestError = { message: 'No usable Pinterest access token' };
+      } else {
+        const testRes = await fetch('https://api.pinterest.com/v5/user_account', {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+        });
+        if (testRes.ok) tokenValid = true;
+        else pinterestError = await testRes.json().catch(() => ({ message: testRes.statusText }));
+      }
     } catch (error) {
       pinterestError = { message: error.message };
     }
