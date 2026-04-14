@@ -3509,17 +3509,24 @@ app.post('/api/csv', async (req, res) => {
 
 // --- Pinterest OAuth2 Integration ---
 // Redirect user to Pinterest OAuth2
+const PINTEREST_OAUTH_STATE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 app.get('/api/pinterest/login', (req, res) => {
   console.log('--- Pinterest OAuth Login Initiated ---');
   console.log('client_id:', process.env.PINTEREST_CLIENT_ID);
   console.log('redirect_uri:', process.env.PINTEREST_REDIRECT_URI);
   console.log('scope:', 'pins:write boards:read boards:write pins:read user_accounts:read');
+  const reconnect = typeof req.query.reconnect === 'string' ? req.query.reconnect.trim() : '';
+  let state = 'secureRandomState123'; // TODO: Use a real random state for security
+  if (reconnect && PINTEREST_OAUTH_STATE_UUID.test(reconnect)) {
+    state = `reconnect:${reconnect}`;
+  }
   const params = new URLSearchParams({
     client_id: process.env.PINTEREST_CLIENT_ID,
     redirect_uri: process.env.PINTEREST_REDIRECT_URI,
     response_type: 'code',
     scope: 'pins:write boards:read boards:write pins:read user_accounts:read', // added user_accounts:read
-    state: 'secureRandomState123', // TODO: Use a real random state for security
+    state,
   });
   const redirectUrl = `https://www.pinterest.com/oauth/?${params.toString()}`;
   console.log('Redirecting to:', redirectUrl);
@@ -3753,34 +3760,96 @@ app.get('/api/pinterest/callback', async (req, res) => {
   if (!code) return res.status(400).send('Missing code');
   // Redirect to frontend with code for user association (use env FRONTEND_URL)
   const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
-  res.redirect(`${FRONTEND_URL.replace(/\/$/, '')}/pinterest/finish?code=${code}`);
+  const finish = new URL(`${FRONTEND_URL.replace(/\/$/, '')}/pinterest/finish`);
+  finish.searchParams.set('code', code);
+  if (state && typeof state === 'string') finish.searchParams.set('state', state);
+  res.redirect(finish.toString());
 });
 
 app.post('/api/pinterest/oauth', async (req, res) => {
-  const { code, redirectUri } = req.body;
+  const { code, redirectUri, reconnect_account_id: reconnectAccountIdBody } = req.body;
   const authHeader = req.headers.authorization;
   if (!code || !redirectUri) return res.status(400).json({ error: 'Missing code or redirectUri' });
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const reconnectRaw =
+    typeof reconnectAccountIdBody === 'string' ? reconnectAccountIdBody.trim() : '';
+  const reconnectAccountId =
+    reconnectRaw && PINTEREST_OAUTH_STATE_UUID.test(reconnectRaw) ? reconnectRaw : null;
+
   // Log the values sent to Pinterest for debugging
   console.log({
     client_id: process.env.PINTEREST_CLIENT_ID,
     client_secret: process.env.PINTEREST_CLIENT_SECRET ? process.env.PINTEREST_CLIENT_SECRET.slice(0,3) + '...' + process.env.PINTEREST_CLIENT_SECRET.slice(-3) : undefined,
     redirect_uri: redirectUri,
-    code
+    code,
+    reconnect: !!reconnectAccountId,
   });
   try {
+    if (reconnectAccountId) {
+      const { data: owned, error: ownErr } = await supabaseAdmin
+        .from('pinterest_accounts')
+        .select('id')
+        .eq('id', reconnectAccountId)
+        .eq('user_id', user.id)
+        .single();
+      if (ownErr || !owned) {
+        return res.status(404).json({ error: 'Pinterest account not found for reconnect' });
+      }
+    }
+
     const tokenData = await exchangePinterestCodeForToken(code, redirectUri);
     if (tokenData.access_token) {
-      // Enforce plan limits
+      // Fetch account info for labeling
+      let accountName = '';
+      try {
+        const accRes = await fetch('https://api.pinterest.com/v5/user_account', {
+          headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' },
+        });
+        const acc = await accRes.json();
+        accountName = acc?.username || acc?.profile?.username || 'Pinterest Account';
+      } catch (e) {
+        console.warn('Failed to fetch Pinterest account info:', e?.message || e);
+      }
+      const tokenExpiresAt =
+        tokenData.expires_in != null
+          ? new Date(Date.now() + Number(tokenData.expires_in) * 1000).toISOString()
+          : null;
+
+      if (reconnectAccountId) {
+        const updateRow = {
+          access_token: tokenData.access_token,
+          account_name: accountName,
+          refresh_token: tokenData.refresh_token || null,
+          updated_at: new Date().toISOString(),
+          ...(tokenExpiresAt ? { token_expires_at: tokenExpiresAt } : {}),
+        };
+        const { error: updErr } = await supabaseAdmin
+          .from('pinterest_accounts')
+          .update(updateRow)
+          .eq('id', reconnectAccountId)
+          .eq('user_id', user.id);
+        if (updErr) {
+          console.error('Error updating pinterest account on reconnect:', updErr);
+          return res.status(500).json({ error: updErr.message || 'Failed to save tokens' });
+        }
+        return res.json({
+          access_token: tokenData.access_token,
+          account_name: accountName,
+          reconnected: true,
+        });
+      }
+
+      // Enforce plan limits (new link only)
       const { data: profile } = await supabaseAdmin
         .from('profiles')
         .select('plan_type')
         .eq('id', user.id)
         .single();
-      const planType = (profile?.plan_type || 'free');
+      const planType = profile?.plan_type || 'free';
       const { data: existing } = await supabaseAdmin
         .from('pinterest_accounts')
         .select('id')
@@ -3792,21 +3861,6 @@ app.post('/api/pinterest/oauth', async (req, res) => {
         return res.status(403).json({ error: `Plan limit reached. Your plan (${planType}) allows ${limit === Infinity ? 'unlimited' : limit} account(s).` });
       }
 
-      // Fetch account info for labeling
-      let accountName = '';
-      try {
-        const accRes = await fetch('https://api.pinterest.com/v5/user_account', {
-          headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'Accept': 'application/json' }
-        });
-        const acc = await accRes.json();
-        accountName = acc?.username || acc?.profile?.username || 'Pinterest Account';
-      } catch (e) {
-        console.warn('Failed to fetch Pinterest account info:', e?.message || e);
-      }
-      const tokenExpiresAt =
-        tokenData.expires_in != null
-          ? new Date(Date.now() + Number(tokenData.expires_in) * 1000).toISOString()
-          : null;
       const insertRow = {
         user_id: user.id,
         access_token: tokenData.access_token,
