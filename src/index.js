@@ -30,6 +30,31 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DODO_BASE_URL = (process.env.DODO_BASE_URL || 'https://test.dodopayments.com').replace(/\/$/, '');
 const DODO_API_KEY = process.env.DODO_API_KEY || process.env.DODO_PAYMENTS_API_KEY || '';
 
+/**
+ * Partner / influencer links: ?ref=slug on /pricing (stored in sessionStorage, sent as referralKey).
+ * Map slugs to Dodo discount *codes* (customer-facing strings), not dsc_ ids.
+ * Env example: DODO_PARTNER_DISCOUNT_MAP={"jane":"JANE20","firstusers":"WELCOME50"}
+ */
+function resolvePartnerDiscountCode(referralKey) {
+  const rawKey = String(referralKey || '').trim();
+  if (!rawKey) return null;
+  const raw = process.env.DODO_PARTNER_DISCOUNT_MAP || '';
+  if (!raw.trim()) return null;
+  try {
+    const map = JSON.parse(raw);
+    if (!map || typeof map !== 'object') return null;
+    const exact = map[rawKey];
+    if (typeof exact === 'string' && exact.trim()) return exact.trim();
+    const lower = rawKey.toLowerCase();
+    for (const [k, v] of Object.entries(map)) {
+      if (String(k).toLowerCase() === lower && typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // --- Plan & usage helpers (pin_usage / metadata_usage) ---
 
 const PLAN_PIN_LIMITS = {
@@ -3201,10 +3226,23 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       return res.status(500).json({ error: 'Dodo Payments API key not configured' });
     }
 
-    const { planType } = req.body || {};
+    const { planType, discountCode, couponCode, referralKey } = req.body || {};
     if (!planType) {
       return res.status(400).json({ error: 'Missing planType' });
     }
+
+    const referralSlug = String(referralKey || '')
+      .trim()
+      .toLowerCase();
+
+    // Dodo checkout expects the human-readable discount *code* (e.g. LAUNCH20), not the dashboard id (dsc_...).
+    // Priority: typed coupon → partner ?ref= slug map → global env default.
+    const fromClient = String(discountCode || couponCode || '')
+      .trim();
+    const fromPartner = referralSlug ? resolvePartnerDiscountCode(referralSlug) : null;
+    const fromEnv = String(process.env.DODO_CHECKOUT_DEFAULT_DISCOUNT_CODE || '')
+      .trim();
+    const discount_code = fromClient || fromPartner || fromEnv || undefined;
 
     // Map internal plan types to Dodo product IDs via environment variables
     const productMap = {
@@ -3235,10 +3273,19 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       metadata: {
         supabase_user_id: req.user.id,
         app_plan_type: planType,
+        ...(referralSlug ? { referral_key: referralSlug } : {}),
       },
     // Redirect back to app after success/failure
     return_url: `${frontendBase.replace(/\/$/, '')}/payment-success?plan=${encodeURIComponent(planType)}`,
+    // Let customers enter or change a code on the hosted checkout; pre-apply when we have one.
+    feature_flags: {
+      allow_discount_code: true,
+    },
     };
+
+    if (discount_code) {
+      body.discount_code = discount_code;
+    }
 
     const resp = await fetch(`${DODO_BASE_URL}/checkouts`, {
       method: 'POST',
