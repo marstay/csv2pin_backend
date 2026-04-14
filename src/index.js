@@ -1287,6 +1287,35 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
   }
 }
 
+/** Kie.ai / Nano Banana task states vary by model version; normalize and treat unknown in-progress names safely. */
+function normalizeNanoBananaState(state) {
+  if (state == null) return '';
+  return String(state).trim().toLowerCase();
+}
+
+const NANO_BANANA_IN_PROGRESS_STATES = new Set([
+  'waiting',
+  'wait',
+  'pending',
+  'queuing',
+  'queueing',
+  'queued',
+  'generating',
+  'running',
+  'processing',
+  'in_progress',
+  'in-progress',
+  'working',
+  'started',
+  'submitted',
+  'created',
+]);
+
+function isNanoBananaStateInProgress(stateNorm) {
+  if (!stateNorm) return true; // missing state: keep polling
+  return NANO_BANANA_IN_PROGRESS_STATES.has(stateNorm);
+}
+
 async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) {
   if (!NANO_BANANA_API_URL || !NANO_BANANA_API_KEY) {
     console.warn('Nano Banana 2 API not configured (NANO_BANANA_API_URL / NANO_BANANA_API_KEY missing)');
@@ -1298,9 +1327,31 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
     : [];
 
   const baseUrl = NANO_BANANA_API_URL.replace(/\/$/, ''); // e.g. https://api.kie.ai/api/v1/jobs
-  const maxRetries = 3; // Retry entire flow up to 3 times on transient failures
-  const createTaskTimeoutMs = 25000;
-  const recordInfoTimeoutMs = 15000;
+  const maxRetries = Math.max(
+    1,
+    parseInt(process.env.NANO_BANANA_MAX_FLOW_RETRIES || '3', 10) || 3
+  );
+  const createTaskTimeoutMs = Math.max(
+    5000,
+    parseInt(process.env.NANO_BANANA_CREATE_TIMEOUT_MS || '25000', 10) || 25000
+  );
+  const recordInfoTimeoutMs = Math.max(
+    5000,
+    parseInt(process.env.NANO_BANANA_POLL_REQUEST_TIMEOUT_MS || '20000', 10) || 20000
+  );
+  const pollDelayMs = Math.max(
+    800,
+    parseInt(process.env.NANO_BANANA_POLL_INTERVAL_MS || '2000', 10) || 2000
+  );
+  const maxPollAttempts = Math.max(
+    10,
+    parseInt(process.env.NANO_BANANA_POLL_MAX_ATTEMPTS || '120', 10) || 120
+  );
+  /** If > 0, abandon task and start a new createTask when state stays identical this many polls (Kie jobs sometimes hang in `running`). */
+  const stuckSameStatePolls = Math.max(
+    0,
+    parseInt(process.env.NANO_BANANA_STUCK_SAME_STATE_POLLS || '40', 10) || 0
+  );
 
   for (let retry = 0; retry < maxRetries; retry++) {
     try {
@@ -1343,12 +1394,12 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
 
       const taskId = createJson.data.taskId;
 
-      // 2) Poll recordInfo until success / fail / timeout
-      const maxAttempts = 45; // ~67.5s (45 * 1.5s) for slow generations
-      const delayMs = 1500;
+      // 2) Poll recordInfo until success / fail / timeout (defaults ~4 min at 120 * 2s)
+      let lastProgressState = null;
+      let sameProgressStateCount = 0;
 
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        await new Promise((r) => setTimeout(r, delayMs));
+      for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+        await new Promise((r) => setTimeout(r, pollDelayMs));
 
         let infoRes;
         let infoJson = {};
@@ -1380,17 +1431,47 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
           continue;
         }
 
-        const state = infoJson.data.state;
-        if (state === 'waiting' || state === 'queuing' || state === 'generating') {
+        const stateNorm = normalizeNanoBananaState(infoJson.data.state);
+
+        if (isNanoBananaStateInProgress(stateNorm)) {
+          if (stateNorm === lastProgressState) {
+            sameProgressStateCount += 1;
+          } else {
+            lastProgressState = stateNorm;
+            sameProgressStateCount = 1;
+          }
+          if (
+            stuckSameStatePolls > 0 &&
+            sameProgressStateCount >= stuckSameStatePolls
+          ) {
+            console.warn(
+              `Nano Banana 2 task ${taskId} unchanged in "${stateNorm}" for ${sameProgressStateCount} polls; abandoning and retrying new task` +
+                (logLabel ? ` (style: ${logLabel})` : '')
+            );
+            break;
+          }
+          if (
+            attempt > 0 &&
+            attempt % 15 === 0 &&
+            stateNorm
+          ) {
+            console.warn(
+              `Nano Banana 2 still in progress: state=${stateNorm} poll ${attempt}/${maxPollAttempts}` +
+                (logLabel ? ` (${logLabel})` : '')
+            );
+          }
           continue;
         }
 
-        if (state === 'fail') {
+        lastProgressState = null;
+        sameProgressStateCount = 0;
+
+        if (stateNorm === 'fail' || stateNorm === 'failed' || stateNorm === 'error') {
           console.error('Nano Banana 2 generation failed:', infoJson.data.failCode, infoJson.data.failMsg);
           return null; // Don't retry on explicit API failure
         }
 
-        if (state === 'success') {
+        if (stateNorm === 'success' || stateNorm === 'succeeded' || stateNorm === 'completed' || stateNorm === 'done') {
           try {
             const resultJsonStr = infoJson.data.resultJson || '{}';
             const parsed = JSON.parse(resultJsonStr);
@@ -1404,6 +1485,12 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
           console.warn('Nano Banana 2 success but no resultUrls found');
           return null;
         }
+
+        console.warn(
+          'Nano Banana 2 unexpected state after poll:',
+          infoJson.data.state,
+          infoJson.data
+        );
       }
 
       console.warn('Nano Banana 2 generation timed out' + (logLabel ? ` (style: ${logLabel})` : ''));
@@ -1485,9 +1572,21 @@ async function generateStyleOnImageText({ styleId, topic, domain, keyword, year,
 }
 
 const ILLUSTRATED_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
-const REALISTIC_PREFIX = 'Photorealistic, high-quality photograph. Natural lighting, lifelike imagery, professional photography style. ';
-const SCROLL_STOPPING_RULE =
+/** Set to `false` to restore longer, more prescriptive prompts (slower on some image APIs). */
+const NANO_BANANA_SIMPLE_PROMPTS = process.env.NANO_BANANA_SIMPLE_PROMPTS !== 'false';
+
+const REALISTIC_PREFIX_LONG =
+  'Photorealistic, high-quality photograph. Natural lighting, lifelike imagery, professional photography style. ';
+const REALISTIC_PREFIX_SHORT = 'Photorealistic, natural light. ';
+
+const SCROLL_STOPPING_RULE_LONG =
   'The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche. ';
+const SCROLL_STOPPING_RULE_SHORT = 'Bold, high-contrast, easy to read on mobile. ';
+
+/** Pick long vs short prompt fragment (Nano Banana / Kie). */
+function promptTier(longText, shortText) {
+  return NANO_BANANA_SIMPLE_PROMPTS ? shortText : longText;
+}
 
 const NICHE_VISUAL_HINTS = {
   recipe: 'Prioritize food, ingredients, kitchen scenes, storage containers, and real cooking or prep visuals rather than abstract icons.',
@@ -1501,25 +1600,38 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
   const source = overlayText?.source || domain;
-  const brandTail = brand?.brandName ? ` Use the brand name ${brand.brandName} subtly in the design.` : '';
-  const nicheTail = niche && NICHE_VISUAL_HINTS[niche] ? ` ${NICHE_VISUAL_HINTS[niche]}` : '';
+  const brandTail = brand?.brandName
+    ? promptTier(
+        ` Use the brand name ${brand.brandName} subtly in the design.`,
+        ` Brand: ${brand.brandName}.`
+      )
+    : '';
+  const nicheTail =
+    niche && NICHE_VISUAL_HINTS[niche]
+      ? promptTier(` ${NICHE_VISUAL_HINTS[niche]}`, '')
+      : '';
   const tail = nicheTail + brandTail;
   const useRealistic = !ILLUSTRATED_STYLES.has(styleId);
-  const baseIntro =
-    'Vertical Pinterest pin 1000x1500 px. ' +
-    SCROLL_STOPPING_RULE +
-    (useRealistic ? REALISTIC_PREFIX : '');
+  const baseIntro = promptTier(
+    'Vertical Pinterest pin 1000x1500 px. ' + SCROLL_STOPPING_RULE_LONG + (useRealistic ? REALISTIC_PREFIX_LONG : ''),
+    'Vertical 2:3 Pinterest pin. ' + SCROLL_STOPPING_RULE_SHORT + (useRealistic ? REALISTIC_PREFIX_SHORT : '')
+  );
   const numSteps = typeof stepCount === 'number' ? stepCount : (styleId === 'step_cards_3' || styleId === 'grid_3_images' ? 3 : styleId === 'grid_4_images' ? 4 : styleId === 'timeline_infographic' ? 5 : null);
 
   switch (styleId) {
-    case 'before_after':
+       case 'before_after':
       return (
         baseIntro +
-        `Split layout with a clear “Before” left half and “After” right half about "${keyword || topic}". ` +
-        `Show the on-image main text "${headline}" across the top center. ` +
-        `Label the left side "Before" and the right side "After" with short, readable labels. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the main text. ` : '') +
-        `At the bottom, add small, readable source text "${source}".` +
+        promptTier(
+          `Split layout with a clear “Before” left half and “After” right half about "${keyword || topic}". ` +
+            `Show the on-image main text "${headline}" across the top center. ` +
+            `Label the left side "Before" and the right side "After" with short, readable labels. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the main text. ` : '') +
+            `At the bottom, add small, readable source text "${source}".`,
+          `Before | After split about "${keyword || topic}". Top text: "${headline}". ` +
+            (subheadline ? `Sub: "${subheadline}". ` : '') +
+            `Footer: "${source}".`
+        ) +
         tail
       );
     case 'timeline_infographic': {
@@ -1527,157 +1639,242 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       const stepLabels = Array.from({ length: steps }, (_, i) => `Step ${i + 1}`).join(', ');
       return (
         baseIntro +
-        `Clean vertical infographic timeline with exactly ${steps} steps explaining "${keyword || topic}". ` +
-        `Label steps as: ${stepLabels}. ` +
-        `At the top of the pin, place the main title text "${headline}". ` +
-        (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
-        `Each step box has a very short label, and the background stays simple and low-contrast so the text is readable. ` +
-        `At the bottom, include small source text "${source}".` +
+        promptTier(
+          `Clean vertical infographic timeline with exactly ${steps} steps explaining "${keyword || topic}". ` +
+            `Label steps as: ${stepLabels}. ` +
+            `At the top of the pin, place the main title text "${headline}". ` +
+            (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
+            `Each step box has a very short label, and the background stays simple and low-contrast so the text is readable. ` +
+            `At the bottom, include small source text "${source}".`,
+          `${steps}-step vertical infographic for "${keyword || topic}". Title: "${headline}". ` +
+            (subheadline ? `Subtitle: "${subheadline}". ` : '') +
+            `Numbered steps ${stepLabels}, short labels only, flat simple background. Footer: "${source}".`
+        ) +
         tail
       );
     }
     case 'grid_4_images':
       return (
         baseIntro +
-        `2×2 grid of four related photographs about "${keyword || topic}" with thin white gutters. ` +
-        `Place the main headline "${headline}" in a banner at the top of the pin. ` +
-        (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `At the very bottom, add small source text "${source}".` +
+        promptTier(
+          `2×2 grid of four related photographs about "${keyword || topic}" with thin white gutters. ` +
+            `Place the main headline "${headline}" in a banner at the top of the pin. ` +
+            (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `At the very bottom, add small source text "${source}".`,
+          `2×2 photo grid, "${keyword || topic}". Top banner: "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'offset_collage_3':
       return (
         baseIntro +
-        `Asymmetrical collage: one large hero photograph on the left and two smaller stacked photographs on the right, all about "${keyword || topic}". ` +
-        `Place the main text "${headline}" over a solid or semi-transparent area in the top-right region so it is very readable. ` +
-        (subheadline ? `Add a short supporting line "${subheadline}" below the headline. ` : '') +
-        `Include small source text "${source}" near the bottom edge.` +
+        promptTier(
+          `Asymmetrical collage: one large hero photograph on the left and two smaller stacked photographs on the right, all about "${keyword || topic}". ` +
+            `Place the main text "${headline}" over a solid or semi-transparent area in the top-right region so it is very readable. ` +
+            (subheadline ? `Add a short supporting line "${subheadline}" below the headline. ` : '') +
+            `Include small source text "${source}" near the bottom edge.`,
+          `Collage: 1 large + 2 small photos, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'clean_appetizing':
       return (
         baseIntro +
-        `Soft neutral background with subtle texture. Simple, clear focal object or photograph that represents "${keyword || topic}". Clean, modern blog-style design with plenty of white space. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Soft neutral background with subtle texture. Simple, clear focal object or photograph that represents "${keyword || topic}". Clean, modern blog-style design with plenty of white space. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Clean food-blog style, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'curiosity_shock':
       return (
         baseIntro +
-        `Bold, dramatic, high-contrast image. Strong central subject that represents or relates to "${keyword || topic}" and creates shock and curiosity. The visual must be semantically relevant to the article topic—e.g. for tech/WordPress show a laptop, screen, or workspace; for food show ingredients or cooking. Dramatic lighting. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Bold, dramatic, high-contrast image. Strong central subject that represents or relates to "${keyword || topic}" and creates shock and curiosity. The visual must be semantically relevant to the article topic—e.g. for tech/WordPress show a laptop, screen, or workspace; for food show ingredients or cooking. Dramatic lighting. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Dramatic high-contrast scene for "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'money_saving':
       return (
         baseIntro +
-        `Visual value motif: imagery suggesting saving time, money, or results. Clean layout with practical elements related to "${keyword || topic}". Bright but simple. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Visual value motif: imagery suggesting saving time, money, or results. Clean layout with practical elements related to "${keyword || topic}". Bright but simple. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Value/savings theme, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'minimal_typography':
       return (
         baseIntro +
-        `Minimalist layout: pure white or light background, lots of whitespace. Single strong visual object representing "${keyword || topic}". High-contrast, typography-forward. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Minimalist layout: pure white or light background, lots of whitespace. Single strong visual object representing "${keyword || topic}". High-contrast, typography-forward. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Minimal white space + one object, "${keyword || topic}". Big type: "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'question_style':
       return (
         baseIntro +
-        `Image that visually represents a question or dilemma about "${keyword || topic}", with subtle question-mark elements or split choices. The scene or subject must relate to the article topic. Clean background. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Image that visually represents a question or dilemma about "${keyword || topic}", with subtle question-mark elements or split choices. The scene or subject must relate to the article topic. Clean background. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Question/dilemma visual, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'cozy_baking':
       return (
         baseIntro +
-        `Lifestyle context scene: someone interacting with "${keyword || topic}" in an appropriate everyday setting. The setting must match the topic—e.g. for tech/WordPress/digital topics show a laptop, screen, or workspace; for food/recipes show a kitchen; for wellness show a calm home setting. Warm natural light. Warm, inviting, lifestyle photography. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Lifestyle context scene: someone interacting with "${keyword || topic}" in an appropriate everyday setting. The setting must match the topic—e.g. for tech/WordPress/digital topics show a laptop, screen, or workspace; for food/recipes show a kitchen; for wellness show a calm home setting. Warm natural light. Warm, inviting, lifestyle photography. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Warm lifestyle scene, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'viral_curiosity':
       return (
         baseIntro +
-        `Story-like composition: focused close-up of a hand holding something that represents "${keyword || topic}" (e.g. document, device, product). Slightly dramatic lighting. Mysterious, story-driven, personal experiment feel. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Story-like composition: focused close-up of a hand holding something that represents "${keyword || topic}" (e.g. document, device, product). Slightly dramatic lighting. Mysterious, story-driven, personal experiment feel. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Story-style close-up, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'clumpy_fix':
       return (
         baseIntro +
-        `Practical, simple layout: light surface with a clear object representing "${keyword || topic}" and a small related element (tool, document). Minimal props, lots of breathing room. Non-dramatic. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Practical, simple layout: light surface with a clear object representing "${keyword || topic}" and a small related element (tool, document). Minimal props, lots of breathing room. Non-dramatic. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Simple how-to flat lay, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'minimal_elegant':
       return (
         baseIntro +
-        `Soft beige or light gray background. Elegant overhead shot of a single, simple object that is semantically relevant to "${keyword || topic}"—e.g. for tech/WordPress show a laptop, tablet, or document; for food show ingredients or a dish; for wellness show a journal or plant. Delicate shadows. Minimal, premium feel. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Soft beige or light gray background. Elegant overhead shot of a single, simple object that is semantically relevant to "${keyword || topic}"—e.g. for tech/WordPress show a laptop, tablet, or document; for food show ingredients or a dish; for wellness show a journal or plant. Delicate shadows. Minimal, premium feel. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Elegant minimal overhead, one object, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'step_cards_3':
       return (
         baseIntro +
-        `Three tall step cards stacked vertically, each with an icon or small image and short label (Step 1, Step 2, Step 3) for "${keyword || topic}". Simple flat or lightly textured background. ` +
-        `At the top, place the main title text "${headline}". ` +
-        (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
-        `At the bottom, include small source text "${source}".` +
+        promptTier(
+          `Three tall step cards stacked vertically, each with an icon or small image and short label (Step 1, Step 2, Step 3) for "${keyword || topic}". Simple flat or lightly textured background. ` +
+            `At the top, place the main title text "${headline}". ` +
+            (subheadline ? `Optionally place a short subheadline "${subheadline}" just below the title. ` : '') +
+            `At the bottom, include small source text "${source}".`,
+          `3 vertical step cards for "${keyword || topic}". Title "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'grid_3_images':
       return (
         baseIntro +
-        `Clean layout with a grid of three related photographs representing "${keyword || topic}" (e.g. three variations, steps, or examples). Thin white borders between panels. ` +
-        `Place the main headline "${headline}" in a banner at the top. ` +
-        (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `At the very bottom, add small source text "${source}".` +
+        promptTier(
+          `Clean layout with a grid of three related photographs representing "${keyword || topic}" (e.g. three variations, steps, or examples). Thin white borders between panels. ` +
+            `Place the main headline "${headline}" in a banner at the top. ` +
+            (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `At the very bottom, add small source text "${source}".`,
+          `3-panel photo grid, "${keyword || topic}". Top: "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'stacked_strips':
       return (
         baseIntro +
-        `Three horizontal photograph strips stacked vertically on one side. Each strip shows a different scene or detail related to "${keyword || topic}". Clean editorial feel. ` +
-        `Place the main text "${headline}" over a solid or semi-transparent area. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" below the headline. ` : '') +
-        `Include small source text "${source}" at the bottom.` +
+        promptTier(
+          `Three horizontal photograph strips stacked vertically on one side. Each strip shows a different scene or detail related to "${keyword || topic}". Clean editorial feel. ` +
+            `Place the main text "${headline}" over a solid or semi-transparent area. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" below the headline. ` : '') +
+            `Include small source text "${source}" at the bottom.`,
+          `3 horizontal photo strips, "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     case 'circle_cluster_4':
       return (
         baseIntro +
-        `Four circular photographs arranged around a central text area, each showing a different aspect of "${keyword || topic}". Clean light background. ` +
-        `Place the main headline "${headline}" in the center. ` +
-        (subheadline ? `Add a short subheadline "${subheadline}" below. ` : '') +
-        `Add small source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Four circular photographs arranged around a central text area, each showing a different aspect of "${keyword || topic}". Clean light background. ` +
+            `Place the main headline "${headline}" in the center. ` +
+            (subheadline ? `Add a short subheadline "${subheadline}" below. ` : '') +
+            `Add small source text "${source}" at the bottom of the pin.`,
+          `4 circular photos around center text, "${keyword || topic}". Center: "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
     default:
       return (
         baseIntro +
-        `Eye-catching but not cluttered design about "${keyword || topic}". Use real-life photography or photorealistic imagery. ` +
-        `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
-        (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
-        `Add small, readable source text "${source}" at the bottom of the pin.` +
+        promptTier(
+          `Eye-catching but not cluttered design about "${keyword || topic}". Use real-life photography or photorealistic imagery. ` +
+            `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
+            (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
+            `Add small, readable source text "${source}" at the bottom of the pin.`,
+          `Eye-catching pin about "${keyword || topic}". Headline "${headline}". ` +
+            (subheadline ? `"${subheadline}". ` : '') +
+            `Footer "${source}".`
+        ) +
         tail
       );
   }
@@ -2009,30 +2206,16 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }));
     }
 
-    const styleSpecificGuidance = {
-      before_after:
-        'Make the “Before” and “After” areas visually balanced and clearly separated. Avoid generic full-bleed photos; instead, clearly label each side and ensure the change from problem to solution is obvious even at a glance.',
-      timeline_infographic:
-        'The design must look like a clear vertical infographic timeline, not like a regular photo pin. Use simple shapes, lines and icons for each step, with short labels, and avoid busy photographic backgrounds that would make the steps hard to read.',
-    };
-
-    const styleSpecificSystemGuidance = {
-      before_after:
-        'When the requested style is a BEFORE/AFTER layout, you MUST describe two clearly separated halves labelled “Before” and “After”, showing the problem state vs the improved state for this topic. Do not describe a single generic background photo; focus instead on the contrast between the two labelled halves, while still keeping the on-image text large and readable.',
-      timeline_infographic:
-        'When the requested style is a TIMELINE INFOGRAPHIC, you MUST describe a vertical infographic timeline made of multiple clearly numbered or labelled steps (for example: Step 1, Step 2, Step 3...). Do not describe a photographic scene as the main background. Instead, use a simple flat or lightly textured background, vertical connectors or arrows, and boxes or circles for each step, with short labels that summarize each stage of the article. The steps themselves are the main visual focus.',
-    };
-
     const useDummyImages = process.env.USE_DUMMY_IMAGES === 'true';
 
     for (let i = 0; i < effectiveStyles.length; i++) {
       const id = effectiveStyles[i];
       const strategicMeta = strategicMetadataByIndex[i];
-      const baseStyleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
-      const nicheHint = niche && nicheVisualHints[niche] ? ` Niche-specific visual guidance: ${nicheVisualHints[niche]}` : '';
-      const strategyHint = strategicMeta?.image_prompt_hint ? ` Strategy visual (must respect this): ${strategicMeta.image_prompt_hint}.` : '';
-      const styleDescription = baseStyleDescription + nicheHint + strategyHint;
       if (useUserComposite) {
+        const baseStyleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
+        const nicheHint = niche && nicheVisualHints[niche] ? ` Niche-specific visual guidance: ${nicheVisualHints[niche]}` : '';
+        const strategyHint = strategicMeta?.image_prompt_hint ? ` Strategy visual (must respect this): ${strategicMeta.image_prompt_hint}.` : '';
+        const styleDescription = baseStyleDescription + nicheHint + strategyHint;
         stylePrompts.push({
           id,
           label: id,
@@ -2041,127 +2224,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         });
         continue;
       }
-      try {
-        const isTimeline = id === 'timeline_infographic';
-
-        const systemPrompt =
-          'You create detailed text-to-image prompts that generate full Pinterest pin images, including BOTH background visuals and on-image text. ' +
-          'Each prompt must clearly state at the beginning: "Vertical Pinterest pin 1000x1500 px". ' +
-          'Add this to ALL prompts: "The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche." ' +
-          (isTimeline
-            ? 'Describe a vertical infographic-style Pinterest pin where the main visual is a stack of clearly separated steps in a vertical timeline. The background must stay simple and low-contrast so the step boxes, connectors and labels are the main focus. Use very short on-image text: a short title and short labels for each step only. '
-            : 'Describe a 9:16 Pinterest pin: eye-catching but not cluttered background, clear focal point, and bold, highly readable typography. Explicitly describe the main headline text, any subheadline, and small branding or source text that includes the website URL at the bottom of the pin (e.g. bottom center). ') +
-          (brandPrimary || brandSecondary || brandAccent || brandName || brandLogoUrl
-            ? 'Make sure the visual style and on-image text respect the provided brand colors, brand name and logo placement so that the pin looks fully on-brand. '
-            : '') +
-          (styleSpecificSystemGuidance[id] ? styleSpecificSystemGuidance[id] + ' ' : '') +
-          'The entire design must remain readable on mobile screens and feel like a high-performing Pinterest pin. ' +
-          'The prompt must be between 1 and 3 sentences, plain text only. Never write more than 3 sentences.';
-
-        const userPromptBase =
-          `Article title: ${topic}\n` +
-          (base.description ? `Article description: ${base.description}\n` : '') +
-          (articleSummary ? `Article key ideas (short summary): ${articleSummary.slice(0, 400)}\n` : '') +
-          (keyIdeas && keyIdeas.length
-            ? `Key ideas to highlight visually:\n- ${keyIdeas.join('\n- ')}\n`
-            : '') +
-          (keyword ? `Main keyword or ingredient: ${keyword}\n` : '') +
-          `Domain / branding: ${domain}\n` +
-          `Year/context: ${year}\n` +
-          (brandName ? `Brand name: ${brandName}\n` : '') +
-          (brandPrimary ? `Brand primary color: ${brandPrimary}\n` : '') +
-          (brandSecondary ? `Brand secondary color: ${brandSecondary}\n` : '') +
-          (brandAccent ? `Brand accent color: ${brandAccent}\n` : '') +
-          (brandLogoUrl ? `Brand logo reference URL: ${brandLogoUrl}\n` : '') +
-          `Desired visual style for the Pinterest pin: ${styleDescription}\n` +
-          (styleSpecificGuidance[id] ? `Additional layout requirements: ${styleSpecificGuidance[id]}\n` : '') +
-          '\n';
-
-        const userPromptTimeline =
-          'Write a single, self-contained text-to-image prompt for a complete Pinterest pin that looks like a vertical infographic timeline. ' +
-          'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
-          'Include this exact requirement in the prompt: "The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche." ' +
-          'Describe a simple, low-contrast background plus the vertical stack of step boxes or circles, their connectors or arrows, and the very short labels for each step. ' +
-          'Optionally mention a short title at the top and small source text with the website URL at the bottom, but avoid long headline paragraphs. ';
-
-        const userPromptDefault =
-          'Write a single, self-contained text-to-image prompt for a complete Pinterest pin (background plus on-image text). ' +
-          'Start the prompt with the exact phrase: "Vertical Pinterest pin 1000x1500 px". ' +
-          'Include this exact requirement in the prompt: "The image must immediately stand out in a Pinterest feed and create a strong visual contrast compared to typical pins in this niche." ' +
-          'Describe the background scene, the exact headline and subheadline text to show, their position on the pin, and how the typography should look. ' +
-          'Also describe small source text at the bottom that displays the website URL (use the domain provided above). ';
-
-        const userPromptBrandTail =
-          brandPrimary || brandSecondary || brandAccent || brandName || brandLogoUrl
-            ? 'In the prompt, explicitly mention using the brand colors, logo and name so the final image clearly matches this brand.'
-            : '';
-
-        const userPrompt =
-          userPromptBase +
-          (isTimeline ? userPromptTimeline : userPromptDefault) +
-          userPromptBrandTail;
-
-        const completion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          temperature: 0.8,
-          max_tokens: 260,
-        });
-
-        let imagePrompt =
-          completion.choices?.[0]?.message?.content?.trim() ||
-          `Vertical Pinterest pin 1000x1500 px, ${styleDescription} about "${topic}". Main concept: ${keyword ||
-            'blog article'}. No text in the image.`;
-
-        // For certain layout-heavy styles, enforce a deterministic prompt shape with consistent step count
-        const stepCount = strategicMeta?.step_count;
-        const numSteps = typeof stepCount === 'number' ? stepCount : (id === 'step_cards_3' || id === 'grid_3_images' || id === 'stacked_strips' ? 3 : id === 'grid_4_images' || id === 'circle_cluster_4' ? 4 : id === 'timeline_infographic' ? 5 : 5);
-        if (id === 'timeline_infographic') {
-          const stepLabels = Array.from({ length: numSteps }, (_, i) => `Step ${i + 1}`).join(', ');
-          imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
-            `Simple, light background with very low contrast so text and shapes are easy to read. ` +
-            `A vertical infographic timeline runs from top to bottom with exactly ${numSteps} clearly separated steps in boxes or circles, connected by a thin line or arrows. ` +
-            `Each step box has a very short label (a few words) that summarizes a stage of "${topic}", using icons or small illustrations instead of detailed photos. ` +
-            `Label steps as: ${stepLabels}. ` +
-            `At the very top, include a short title about "${topic}", and at the very bottom, small, readable source text that shows "${domain}".`;
-        } else if (id === 'step_cards_3') {
-          imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
-            `Three tall step cards stacked vertically, each labelled "Step 1", "Step 2", "Step 3" for "${topic}". ` +
-            `Soft neutral background. Concise headline at top, small "${domain}" at bottom.`;
-        } else if (id === 'grid_3_images') {
-          imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
-            `Grid of exactly 3 related images for "${topic}". ` +
-            `Short headline at top, small "${domain}" at bottom.`;
-        } else if (id === 'grid_4_images') {
-          imagePrompt =
-            `Vertical Pinterest pin 1000x1500 px. ${SCROLL_STOPPING_RULE}` +
-            `2×2 grid of exactly 4 related images for "${topic}". ` +
-            `Short headline at top, small "${domain}" at bottom.`;
-        }
-
-
-        stylePrompts.push({
-          id,
-          label: id,
-          prompt: imagePrompt,
-          index: i,
-        });
-      } catch (promptErr) {
-        console.warn('urltopin prompt generation error:', promptErr.message || promptErr);
-        stylePrompts.push({
-          id,
-          label: id,
-          prompt: `Vertical Pinterest pin 1000x1500 px. High quality, modern design about "${topic}". Domain text: ${domain}. Year: ${year}. Main concept keyword: ${keyword ||
-            'blog article'}. No text baked into the image, only background photography and design.`,
-          index: i,
-        });
-      }
+      // AI and text-based pins: the string sent to Nano Banana is built later via buildOverlayImagePrompt
+      // (AI) or a fixed tag (text). Skip the old GPT-4o-mini image-prompt pass — it was unused for generation
+      // and added latency + cost per style.
+      stylePrompts.push({
+        id,
+        label: id,
+        prompt: useTextBased ? `[text_based_pin:${id}]` : `[ai_overlay:${id}]`,
+        index: i,
+      });
     }
 
     // Pre-generate title and description for all styles in parallel (so AI desc doesn't block after each image)
