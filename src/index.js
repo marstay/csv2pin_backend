@@ -422,6 +422,101 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
+/** Hostnames commonly used for URL shortening / tracking — path is required for identity, not just hostname. */
+const URL_SHORTENER_HOSTNAMES = new Set([
+  'a.co',
+  'amzn.to',
+  'amzn.eu',
+  'bit.ly',
+  'bitly.com',
+  'bitly.ws',
+  't.co',
+  'goo.gl',
+  'ow.ly',
+  'tinyurl.com',
+  'buff.ly',
+  'rebrand.ly',
+  'rb.gy',
+  'is.gd',
+  'cutt.ly',
+  'tiny.cc',
+  'lnkd.in',
+  'youtu.be',
+  'fb.me',
+  'l.facebook.com',
+  'spr.ly',
+  'smarturl.it',
+  'surl.li',
+  'short.link',
+  'shorturl.at',
+  'pst.cr',
+  'vm.tiktok.com',
+]);
+
+function normalizeUrlHostname(host) {
+  return String(host || '')
+    .trim()
+    .replace(/^www\./i, '')
+    .toLowerCase();
+}
+
+function isLikelyUrlShortenerHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (URL_SHORTENER_HOSTNAMES.has(h)) return true;
+  // Very short branded hosts on TLDs often used for redirects (e.g. a.co, x.co)
+  if (/^[a-z0-9]{1,4}\.co$/i.test(h)) return true;
+  if (/^[a-z0-9]{1,4}\.(me|io|ly)$/i.test(h)) return true;
+  return false;
+}
+
+/** Footer / “source” line: host + path (no scheme, no query), truncated — correct for short links. */
+function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
+  try {
+    const u = new URL(String(urlString || '').trim());
+    const host = normalizeUrlHostname(u.hostname);
+    let path = u.pathname || '';
+    if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    if (!path || path === '/') return host.slice(0, maxLen);
+    return `${host}${path}`.slice(0, maxLen);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Keyword from URL path for prompts — skip shorteners and opaque slug segments (e.g. asdf123).
+ */
+function deriveKeywordFromArticleUrl(urlString) {
+  try {
+    const u = new URL(String(urlString || '').trim());
+    const host = normalizeUrlHostname(u.hostname);
+    if (isLikelyUrlShortenerHost(host)) return '';
+
+    const parts = (u.pathname || '').split('/').filter(Boolean);
+    const last = parts[parts.length - 1] || '';
+    if (!last) return '';
+
+    // Opaque ID-like final segment (no word separators): not a readable topic
+    if (
+      parts.length >= 1 &&
+      /^[a-z0-9]{5,14}$/i.test(last) &&
+      !/[-_]/.test(last)
+    ) {
+      return '';
+    }
+
+    let keyword = last
+      .replace(/[-_]/g, ' ')
+      .replace(/\.[a-zA-Z0-9]+$/, '')
+      .trim();
+    if (keyword.length < 3) return '';
+    return keyword;
+  } catch {
+    return '';
+  }
+}
+
 function extractMetaFromHtml(html, url) {
   let title = '';
   let description = '';
@@ -448,18 +543,19 @@ function extractMetaFromHtml(html, url) {
 
   let domain = '';
   let keyword = '';
+  let linkDisplay = '';
   try {
     const u = new URL(url);
-    domain = u.hostname;
-    const parts = (u.pathname || '').split('/').filter(Boolean);
-    const last = parts[parts.length - 1] || '';
-    keyword = last.replace(/[-_]/g, ' ').replace(/\.[a-zA-Z0-9]+$/, '').trim();
+    domain = u.hostname.replace(/^www\./i, '');
+    linkDisplay = buildLinkDisplayLabelFromUrl(url, 80);
+    keyword = deriveKeywordFromArticleUrl(url);
   } catch (_) {
     domain = '';
     keyword = '';
+    linkDisplay = '';
   }
 
-  return { title, description, domain, keyword };
+  return { title, description, domain, keyword, linkDisplay };
 }
 
 /** Browser-like headers — bare Node fetch gets 403 from Medium and similar CDNs */
@@ -555,6 +651,11 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     ...metaFromHtml,
     ...(clientArticleData || {}),
   };
+  // Canonical article URL always wins for display + keyword (fixes short links & opaque path slugs).
+  const derivedDisplay = buildLinkDisplayLabelFromUrl(url, 80);
+  const derivedKw = deriveKeywordFromArticleUrl(url);
+  base.linkDisplay = derivedDisplay || base.linkDisplay || '';
+  base.keyword = derivedKw;
 
   // Very lightweight body text extraction from HTML
   let bodyText = '';
@@ -2200,7 +2301,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const { base, articleSummary } =
       req._fetchedArticle || (await fetchArticleBaseAndSummary(url, articleData, fastForFanOut ? { fast: true } : null));
     const year = new Date().getFullYear();
-    const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
+    const domain =
+      (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
@@ -2757,8 +2859,13 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     if (!url || !styleId || !type || (type !== 'title' && type !== 'description')) {
       return res.status(400).json({ error: 'Missing or invalid url, styleId, or type (must be "title" or "description")' });
     }
-    const base = articleData || extractMetaFromHtml('', url);
-    const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
+    const base = { ...extractMetaFromHtml('', url), ...(articleData || {}) };
+    const derivedDisplay = buildLinkDisplayLabelFromUrl(url, 80);
+    const derivedKw = deriveKeywordFromArticleUrl(url);
+    base.linkDisplay = derivedDisplay || base.linkDisplay || '';
+    base.keyword = derivedKw;
+    const domain =
+      (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
@@ -2863,9 +2970,14 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       return res.status(500).json({ error: 'Failed to render text-based pin' });
     }
 
-    const base = articleData || extractMetaFromHtml('', url);
+    const base = { ...extractMetaFromHtml('', url), ...(articleData || {}) };
+    const derivedDisplay = buildLinkDisplayLabelFromUrl(url, 80);
+    const derivedKw = deriveKeywordFromArticleUrl(url);
+    base.linkDisplay = derivedDisplay || base.linkDisplay || '';
+    base.keyword = derivedKw;
     const year = new Date().getFullYear();
-    const domain = (base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
+    const domain =
+      (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
