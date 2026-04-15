@@ -4665,6 +4665,86 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   }
 });
 
+// Post a specific scheduled pin immediately
+app.post('/api/pinterest/scheduled-pins/:id/post-now', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { id } = req.params;
+
+  try {
+    const { data: pin, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .is('deleted_at', null)
+      .single();
+
+    if (fetchError || !pin) {
+      return res.status(404).json({ error: 'Scheduled pin not found' });
+    }
+
+    if (pin.status === 'posted') {
+      return res.status(400).json({ error: 'Pin already posted' });
+    }
+    if (pin.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot post a cancelled pin' });
+    }
+
+    // Ensure it's eligible to run now
+    const nowIso = new Date().toISOString();
+    const { error: prepErr } = await supabaseAdmin
+      .from('scheduled_pins')
+      .update({
+        status: 'scheduled',
+        scheduled_for: nowIso,
+        next_retry_at: null,
+        updated_at: nowIso,
+      })
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .is('deleted_at', null);
+
+    if (prepErr) {
+      console.error('post-now prep update error:', prepErr);
+      return res.status(500).json({ error: 'Failed to prepare pin for posting' });
+    }
+
+    // Re-fetch to get latest row and run the existing processing logic.
+    const { data: freshPin, error: freshErr } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .is('deleted_at', null)
+      .single();
+
+    if (freshErr || !freshPin) {
+      return res.status(500).json({ error: 'Failed to load pin for posting' });
+    }
+
+    await processScheduledPin(freshPin);
+
+    // Return updated state
+    const { data: finalPin } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', user.id)
+      .is('deleted_at', null)
+      .single();
+
+    return res.json({ success: true, scheduled_pin: finalPin });
+  } catch (error) {
+    console.error('post-now error:', error);
+    return res.status(500).json({ error: 'Failed to post now', details: error.message });
+  }
+});
+
 // Cancel/delete a scheduled pin
 app.delete('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   const authHeader = req.headers.authorization;
