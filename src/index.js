@@ -1866,12 +1866,14 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
         ` Palette: ${brandColorParts.join(', ')}.`
       )
     : '';
-  const brandNameHint = brand?.brandName
-    ? promptTier(
-        ` Use the brand name ${brand.brandName} subtly in the design.`,
-        ` Brand: ${brand.brandName}.`
-      )
-    : '';
+  const footerSourceOnly = overlayText?.footerSourceOnly === true;
+  const brandNameHint =
+    footerSourceOnly || !brand?.brandName
+      ? ''
+      : promptTier(
+          ` Use the brand name ${brand.brandName} subtly in the design.`,
+          ` Brand: ${brand.brandName}.`
+        );
   const brandTail = brandColorHint + brandNameHint;
   const nicheTail =
     niche && NICHE_VISUAL_HINTS[niche]
@@ -2999,6 +3001,11 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
     }
 
+    const overlayForRender =
+      overlayText && typeof overlayText === 'object'
+        ? { ...overlayText, footerSourceOnly: true }
+        : overlayText;
+
     const modeNorm = typeof imageGenerationMode === 'string' ? imageGenerationMode.trim().toLowerCase() : '';
     const textBasedNorm = normalizeTextBasedInput(rawTextBased);
 
@@ -3015,7 +3022,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
         const vs = Number(rawVariationSeed);
         const variationSeed = Number.isFinite(vs) ? vs : 0;
         const png = await renderTextBasedPin({
-          overlayText,
+          overlayText: overlayForRender,
           brand,
           textBased: textBasedNorm,
           variationSeed,
@@ -3065,7 +3072,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       domain,
       keyword,
       year,
-      overlayText,
+      overlayText: overlayForRender,
       brand,
     });
 
@@ -3080,7 +3087,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
         });
       }
       try {
-        const png = await buildUserPhotoPinBuffer(trimmedUserImg, overlayText, brand, renderOptions || null);
+        const png = await buildUserPhotoPinBuffer(trimmedUserImg, overlayForRender, brand, renderOptions || null);
         const fileName = `urltopin-user-${req.user.id}-${Date.now()}-regen-${styleId}.png`;
         const { error: uploadError } = await supabaseAdmin.storage
           .from('ai-images')

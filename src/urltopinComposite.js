@@ -215,10 +215,11 @@ export async function compositeUserPhotoPin({ sourceImageUrl, overlayText, brand
   const subLines = wrapLines(overlayText?.subheadline || '', 28, 2);
   const sourceLine = String(overlayText?.source || '').trim().slice(0, 80);
   const brandNameLine = String(brand?.brandName || '').trim().slice(0, 80);
-  const footerLine =
-    sourceLine && brandNameLine && sourceLine.toLowerCase() !== brandNameLine.toLowerCase()
-      ? `${brandNameLine} · ${sourceLine}`.slice(0, 90)
-      : sourceLine || brandNameLine;
+  const footerSourceOnly = overlayText?.footerSourceOnly === true;
+  // Default: brand/CTA replaces raw URL on the pin. Regenerate-with-text can force footer = source line only.
+  const footerLine = footerSourceOnly
+    ? sourceLine.slice(0, 90)
+    : (brandNameLine || sourceLine).slice(0, 90);
 
   const primary = normalizeHex(brand?.primaryColor);
   const secondary = normalizeHex(brand?.secondaryColor);

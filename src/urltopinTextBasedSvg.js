@@ -320,10 +320,10 @@ export function buildTextBasedPinSvgString({
   const subLines = wrapLines(overlayText?.subheadline || '', 28, 2);
   const sourceLine = String(overlayText?.source || '').trim().slice(0, 80);
   const brandNameLine = String(brand?.brandName || '').trim().slice(0, 80);
-  const footerLine =
-    sourceLine && brandNameLine && sourceLine.toLowerCase() !== brandNameLine.toLowerCase()
-      ? `${brandNameLine} · ${sourceLine}`.slice(0, 90)
-      : sourceLine || brandNameLine;
+  const footerSourceOnly = overlayText?.footerSourceOnly === true;
+  const footerLine = footerSourceOnly
+    ? sourceLine.slice(0, 90)
+    : (brandNameLine || sourceLine).slice(0, 90);
 
   const typoW = presetTypographyWeights(preset);
   const defaultColorHint = presetDefaultTextColor(preset);
