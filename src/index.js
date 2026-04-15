@@ -697,6 +697,41 @@ function isAmazonProductPageForNanoReference(urlString) {
   }
 }
 
+/** Nano Banana + Amazon reference images often 422 or look wrong on these infographic layouts. */
+const AMAZON_REF_EXCLUDED_INFOGRAPHIC_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
+
+const AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS = [
+  'minimal_elegant',
+  'before_after',
+  'curiosity_shock',
+  'offset_collage_3',
+  'clean_appetizing',
+];
+
+function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategicPlan) {
+  if (!Array.isArray(effectiveStyles) || effectiveStyles.length === 0) {
+    return { styles: effectiveStyles, plan: strategicPlan };
+  }
+  const styles = [...effectiveStyles];
+  const plan = strategicPlan ? strategicPlan.map((p) => ({ ...p })) : null;
+  let fb = 0;
+  for (let i = 0; i < styles.length; i++) {
+    if (!AMAZON_REF_EXCLUDED_INFOGRAPHIC_STYLES.has(styles[i])) continue;
+    const replacement =
+      AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[fb % AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS.length];
+    fb++;
+    styles[i] = replacement;
+    if (plan && plan[i]) plan[i].layoutId = replacement;
+  }
+  return { styles, plan };
+}
+
+function replaceInfographicStyleIdForAmazonNanoRefs(styleId, hasReferenceImages) {
+  if (!hasReferenceImages || !styleId) return styleId;
+  if (!AMAZON_REF_EXCLUDED_INFOGRAPHIC_STYLES.has(styleId)) return styleId;
+  return AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[0];
+}
+
 function isAllowedAmazonCdnImageUrl(urlString) {
   try {
     const u = new URL(urlString);
@@ -2665,6 +2700,36 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
+    let amazonNanoImageInputs = [];
+    if (
+      process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
+      !useTextBased &&
+      !useUserComposite &&
+      process.env.USE_DUMMY_IMAGES !== 'true' &&
+      isAmazonProductPageForNanoReference(url)
+    ) {
+      try {
+        const azHtml = await fetchArticleHtml(url);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
+        if (candidates.length > 0) {
+          amazonNanoImageInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+          if (amazonNanoImageInputs.length > 0) {
+            console.log(
+              `urltopin: Nano Banana Amazon reference images: ${amazonNanoImageInputs.length} (${String(url).slice(0, 96)})`
+            );
+          }
+        }
+      } catch (e) {
+        console.warn('urltopin Amazon product images for Nano:', e.message || e);
+      }
+    }
+
+    if (amazonNanoImageInputs.length > 0) {
+      const remapped = remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, req._strategicPlan || null);
+      effectiveStyles = remapped.styles;
+      if (remapped.plan) req._strategicPlan = remapped.plan;
+    }
+
     const brandPrimary = brand?.primaryColor || null;
     const brandSecondary = brand?.secondaryColor || null;
     const brandAccent = brand?.accentColor || null;
@@ -2893,30 +2958,6 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     /** Bottom-of-pin line: user brand/CTA replaces raw URL when set (AI prompt + overlays stay consistent). */
     const pinFooterSourceLine = String(brandName || '').trim().slice(0, 80) || domain;
-
-    let amazonNanoImageInputs = [];
-    if (
-      process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
-      !useTextBased &&
-      !useUserComposite &&
-      !useDummyImages &&
-      isAmazonProductPageForNanoReference(url)
-    ) {
-      try {
-        const azHtml = await fetchArticleHtml(url);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
-        if (candidates.length > 0) {
-          amazonNanoImageInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
-          if (amazonNanoImageInputs.length > 0) {
-            console.log(
-              `urltopin: Nano Banana Amazon reference images: ${amazonNanoImageInputs.length} (${String(url).slice(0, 96)})`
-            );
-          }
-        }
-      } catch (e) {
-        console.warn('urltopin Amazon product images for Nano:', e.message || e);
-      }
-    }
 
     const pinPromises = stylePrompts.map(async (sp) => {
       const metaKey = sp.index != null && ((isStrategic || isStrategicSingle) || effectiveStyles.length > 1) ? `${sp.id}::${sp.index}` : sp.id;
@@ -3392,8 +3433,29 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
-    const imagePrompt = buildOverlayImagePrompt({
+    let regenAmazonNanoInputs = [];
+    if (
+      process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
+      isAmazonProductPageForNanoReference(url)
+    ) {
+      try {
+        const azHtml = await fetchArticleHtml(url);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
+        if (candidates.length > 0) {
+          regenAmazonNanoInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+        }
+      } catch (e) {
+        console.warn('urltopin regenerate Amazon refs:', e.message || e);
+      }
+    }
+
+    const nanoStyleId = replaceInfographicStyleIdForAmazonNanoRefs(
       styleId,
+      regenAmazonNanoInputs.length > 0
+    );
+
+    const imagePrompt = buildOverlayImagePrompt({
+      styleId: nanoStyleId,
       topic,
       domain,
       keyword,
@@ -3448,22 +3510,6 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       });
     }
 
-    let regenAmazonNanoInputs = [];
-    if (
-      process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
-      isAmazonProductPageForNanoReference(url)
-    ) {
-      try {
-        const azHtml = await fetchArticleHtml(url);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
-        if (candidates.length > 0) {
-          regenAmazonNanoInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
-        }
-      } catch (e) {
-        console.warn('urltopin regenerate Amazon refs:', e.message || e);
-      }
-    }
-
     let imagePromptForNano = imagePrompt;
     if (regenAmazonNanoInputs.length > 0) {
       imagePromptForNano +=
@@ -3478,7 +3524,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
 
     let imageUrl = '';
     try {
-      imageUrl = await generateImageWithNanoBanana(imagePromptForNano, styleId, regenNanoOpts);
+      imageUrl = await generateImageWithNanoBanana(imagePromptForNano, nanoStyleId, regenNanoOpts);
       if (!imageUrl) {
         try {
           const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
@@ -3508,6 +3554,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     return res.json({
       imageUrl,
       imagePrompt: imagePromptForNano,
+      ...(nanoStyleId !== styleId && { layoutIdUsed: nanoStyleId }),
       ...(regenAmazonNanoInputs.length > 0 && {
         nanoBananaReferenceCount: regenAmazonNanoInputs.length,
         nanoBananaReferenceSource: 'amazon_product',
