@@ -517,6 +517,74 @@ function deriveKeywordFromArticleUrl(urlString) {
   }
 }
 
+function isAmazonRelatedHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (h === 'a.co' || h === 'amzn.to' || h === 'amzn.eu' || h === 'amzn.com') return true;
+  if (h.startsWith('amazon.')) return true;
+  if (h.endsWith('.amazon.com')) return true;
+  return false;
+}
+
+/**
+ * Short links, Amazon store/product/affiliate URLs: pin footer should be the user's brand/CTA, not the raw URL host.
+ * @returns {{ requiresManualBrandOrCta: boolean, brandingGateReason: string|null, brandingGateMessage: string|null }}
+ */
+function assessUrlBrandingGate(urlString) {
+  const none = {
+    requiresManualBrandOrCta: false,
+    brandingGateReason: null,
+    brandingGateMessage: null,
+  };
+  try {
+    const raw = String(urlString || '').trim();
+    if (!raw) return none;
+    const u = new URL(raw);
+    const host = normalizeUrlHostname(u.hostname);
+    const path = u.pathname || '';
+    const search = u.search || '';
+
+    if (isLikelyUrlShortenerHost(host)) {
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: 'short_link',
+        brandingGateMessage:
+          'This URL looks like a short or redirect link. Before generating pins, open Pin look & brand and enter your brand name or CTA (that text is what we use in the pin footer).',
+      };
+    }
+
+    if (isAmazonRelatedHost(host)) {
+      const hasAffiliate =
+        /[?&]tag=[^&]+/i.test(search) ||
+        /[?&]linkCode=/i.test(search) ||
+        /[?&](?:creative|creativeASIN)=/i.test(search) ||
+        /[?&]ref_=?(?:a|gp|as_li|cm_cr|pd|d)/i.test(search);
+      const productish =
+        /\/dp\//i.test(path) ||
+        /\/gp\/product/i.test(path) ||
+        /\/gp\/aw\/d\//i.test(path) ||
+        /\/d\/[a-z0-9]/i.test(path) ||
+        /\/stores\//i.test(path) ||
+        /\/shop\//i.test(path);
+
+      const reason = hasAffiliate || productish ? 'amazon_product_affiliate' : 'amazon_store';
+      const msg =
+        reason === 'amazon_product_affiliate'
+          ? 'This looks like an Amazon product or affiliate link. Pins should show your brand in the footer, not Amazon. Before generating, open Pin look & brand and add your brand name or CTA (e.g. your site name).'
+          : 'This looks like an Amazon page. Before generating pins, open Pin look & brand and add your brand name or CTA so the footer represents you, not the store.';
+
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: reason,
+        brandingGateMessage: msg,
+      };
+    }
+
+    return none;
+  } catch {
+    return none;
+  }
+}
+
 function extractMetaFromHtml(html, url) {
   let title = '';
   let description = '';
@@ -656,6 +724,7 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   const derivedKw = deriveKeywordFromArticleUrl(url);
   base.linkDisplay = derivedDisplay || base.linkDisplay || '';
   base.keyword = derivedKw;
+  Object.assign(base, assessUrlBrandingGate(url));
 
   // Very lightweight body text extraction from HTML
   let bodyText = '';
@@ -2174,6 +2243,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
       });
     }
     const meta = extractMetaFromHtml(html, url);
+    const brandingGate = assessUrlBrandingGate(url);
     if (enrich) {
       try {
         meta.contentProfile = await enrichContentProfile(meta, openai);
@@ -2181,7 +2251,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
         console.warn('urltopin scrape enrich error:', e.message || e);
       }
     }
-    return res.json(meta);
+    return res.json({ ...meta, ...brandingGate });
   } catch (err) {
     console.error('urltopin scrape error:', err);
     return res.status(500).json({ error: err.message });
@@ -2266,6 +2336,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     if (!url || effectiveStyles.length === 0) {
       return res.status(400).json({
         error: isStrategic ? 'Missing url or articleData for strategic mode' : 'Missing url or styles',
+      });
+    }
+
+    const brandingGate = assessUrlBrandingGate(url);
+    if (brandingGate.requiresManualBrandOrCta && !String(brand?.brandName || '').trim()) {
+      return res.status(400).json({
+        error: 'branding_required',
+        ...brandingGate,
       });
     }
 
