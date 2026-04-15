@@ -4583,6 +4583,90 @@ app.get('/api/pinterest/scheduled-pins/preflight', async (req, res) => {
   }
 });
 
+// Bulk-cancel pins stuck in the posting queue (due / failed / posting, or all non-posted waiting)
+app.post('/api/pinterest/scheduled-pins/bulk-cancel', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const scope = req.body?.scope === 'all_waiting' ? 'all_waiting' : 'due';
+  const nowIso = new Date().toISOString();
+
+  try {
+    let query = supabaseAdmin
+      .from('scheduled_pins')
+      .select('id, image_url')
+      .eq('user_id', user.id)
+      .is('deleted_at', null);
+
+    if (scope === 'all_waiting') {
+      query = query.in('status', ['scheduled', 'failed', 'posting']);
+    } else {
+      query = query.or(
+        `and(status.eq.scheduled,scheduled_for.lte.${nowIso}),status.eq.failed,status.eq.posting`
+      );
+    }
+
+    const { data: pins, error: fetchError } = await query;
+
+    if (fetchError) {
+      console.error('bulk-cancel fetch error:', fetchError);
+      return res.status(500).json({ error: 'Failed to list pins to cancel' });
+    }
+
+    if (!pins || pins.length === 0) {
+      return res.json({
+        success: true,
+        cancelled_count: 0,
+        scope,
+        message: 'No matching pins to cancel',
+      });
+    }
+
+    const ids = pins.map((p) => p.id);
+    const { error: updateError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .update({
+        status: 'cancelled',
+        next_retry_at: null,
+        updated_at: nowIso,
+      })
+      .in('id', ids)
+      .eq('user_id', user.id)
+      .is('deleted_at', null);
+
+    if (updateError) {
+      console.error('bulk-cancel update error:', updateError);
+      return res.status(500).json({ error: 'Failed to cancel pins' });
+    }
+
+    const seenUrls = new Set();
+    for (const pin of pins) {
+      if (!pin.image_url || seenUrls.has(pin.image_url)) continue;
+      seenUrls.add(pin.image_url);
+      await supabaseAdmin
+        .from('user_images')
+        .update({
+          is_scheduled: false,
+          scheduled_for: null,
+        })
+        .eq('user_id', user.id)
+        .eq('image_url', pin.image_url);
+    }
+
+    return res.json({
+      success: true,
+      cancelled_count: ids.length,
+      scope,
+    });
+  } catch (error) {
+    console.error('bulk-cancel error:', error);
+    return res.status(500).json({ error: 'Bulk cancel failed', details: error.message });
+  }
+});
+
 // Update a scheduled pin
 app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   const authHeader = req.headers.authorization;
