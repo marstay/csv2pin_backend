@@ -1867,8 +1867,11 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       )
     : '';
   const footerSourceOnly = overlayText?.footerSourceOnly === true;
+  const footerLineTrim = String(source || '').trim();
+  const brandTrim = String(brand?.brandName || '').trim();
+  // When the footer line already is the brand/CTA, do not also ask for the brand elsewhere (avoids duplicate footer text).
   const brandNameHint =
-    footerSourceOnly || !brand?.brandName
+    footerSourceOnly || !brandTrim || footerLineTrim === brandTrim
       ? ''
       : promptTier(
           ` Use the brand name ${brand.brandName} subtly in the design.`,
@@ -2612,6 +2615,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       logoUrl: brandLogoUrl || null,
     };
 
+    /** Bottom-of-pin line: user brand/CTA replaces raw URL when set (AI prompt + overlays stay consistent). */
+    const pinFooterSourceLine = String(brandName || '').trim().slice(0, 80) || domain;
+
     const pinPromises = stylePrompts.map(async (sp) => {
       const metaKey = sp.index != null && ((isStrategic || isStrategicSingle) || effectiveStyles.length > 1) ? `${sp.id}::${sp.index}` : sp.id;
       const meta = styleMetadataByStyleId.get(metaKey) || styleMetadataByStyleId.get(sp.id) || {};
@@ -2624,7 +2630,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const overlayTextForPrompt = {
         headline: onImageHeadline,
         subheadline: onImageSubheadline,
-        source: domain,
+        source: pinFooterSourceLine,
       };
 
       let imagePrompt = buildOverlayImagePrompt({
@@ -2645,7 +2651,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const overlayText = {
         headline: onImageHeadline,
         subheadline: onImageSubheadline,
-        source: domain,
+        source: pinFooterSourceLine,
       };
 
       let imageUrl = '';
