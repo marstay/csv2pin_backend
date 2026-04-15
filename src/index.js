@@ -685,6 +685,34 @@ async function processScheduledPin(pin) {
       return;
     }
 
+    if (!pin.board_id) {
+      await handlePinError(
+        pin.id,
+        'Permanent failure: No board_id set for this scheduled pin. User must select a Pinterest board before posting.',
+        pin.retry_count || 0,
+        { retryable: false }
+      );
+      return;
+    }
+
+    // Pre-flight validation: confirm this token can access the target board.
+    // This prevents wasting retries on 403 "not permitted" errors caused by mismatched board/account.
+    if ((pin.retry_count || 0) === 0) {
+      const boardAccess = await pinterestValidateBoardAccess(accessToken, pin.board_id);
+      if (!boardAccess.ok) {
+        const reason = boardAccess.status
+          ? `status ${boardAccess.status}`
+          : 'unknown status';
+        await handlePinError(
+          pin.id,
+          `Pinterest board access check failed (${reason}) for board_id=${pin.board_id}. ${boardAccess.message} Likely causes: board belongs to a different connected account, board was deleted, or the user must reconnect Pinterest and reselect a board.`,
+          pin.retry_count || 0,
+          { retryable: false, status: boardAccess.status }
+        );
+        return;
+      }
+    }
+
     // Create Pinterest pin using existing logic
     const requestBody = {
       board_id: pin.board_id,
@@ -776,10 +804,23 @@ async function processScheduledPin(pin) {
       
     } else {
       // Handle Pinterest API error
+      const status = pinterestRes.status;
       const errorMessage = pinData.message || pinData.error || 'Pinterest API error';
       console.error(`❌ Pinterest API error for pin ${pin.id}:`, errorMessage);
       
-      await handlePinError(pin.id, errorMessage, pin.retry_count || 0);
+      const isPermissionError = pinterestResponseIsPermissionFailure(status, pinData);
+      const isValidationError = status === 400 || status === 404;
+      const isRateLimit = status === 429;
+      const isServerError = status >= 500;
+
+      // Permission and validation errors are not fixed by retries/token refresh.
+      const retryable = !isPermissionError && !isValidationError && (isRateLimit || isServerError || true);
+
+      const finalMessage = isPermissionError
+        ? `Pinterest permission error (board/account access): ${errorMessage}. Likely causes: board_id not owned by this connected account, board removed, missing app scopes, or the user needs to reconnect Pinterest and reselect a board.`
+        : errorMessage;
+
+      await handlePinError(pin.id, finalMessage, pin.retry_count || 0, { retryable, status });
     }
 
   } catch (error) {
@@ -788,15 +829,31 @@ async function processScheduledPin(pin) {
   }
 }
 
-async function handlePinError(pinId, errorMessage, currentRetryCount = 0) {
+async function handlePinError(pinId, errorMessage, currentRetryCount = 0, options = {}) {
   const maxRetries = 3;
   const nextRetryCount = currentRetryCount + 1;
+  const retryable = options?.retryable !== false;
   
   // Check if this is a spam-related error
   const isSpamError = errorMessage.toLowerCase().includes('spam') || 
                       errorMessage.toLowerCase().includes('blocked') ||
                       errorMessage.toLowerCase().includes('redirect');
   
+  if (!retryable) {
+    // Permanent error: don't waste retries (e.g., permission/validation)
+    await supabaseAdmin
+      .from('scheduled_pins')
+      .update({ 
+        status: 'failed',
+        error_message: `Permanent failure: ${errorMessage}`,
+        next_retry_at: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', pinId);
+    console.log(`❌ Pin ${pinId} failed permanently (non-retryable error)`);
+    return;
+  }
+
   if (nextRetryCount <= maxRetries) {
     // Calculate backoff based on error type
     let backoffMinutes;
@@ -3701,9 +3758,47 @@ function pinterestAccountNeedsProactiveRefresh(account) {
 }
 
 function pinterestResponseIsAuthFailure(status, pinData) {
-  if (status === 401 || status === 403) return true;
+  // 401 + invalid_token/unauthorized should trigger token refresh; 403 is often authorization/permissions.
+  if (status === 401) return true;
   const msg = String(pinData?.message || pinData?.error || '').toLowerCase();
   return msg.includes('authentication') || msg.includes('unauthorized') || msg.includes('invalid_token');
+}
+
+function pinterestResponseIsPermissionFailure(status, pinData) {
+  if (status !== 403) return false;
+  const msg = String(pinData?.message || pinData?.error || '').toLowerCase();
+  return (
+    msg.includes('not permitted') ||
+    msg.includes('forbidden') ||
+    msg.includes('permission') ||
+    msg.includes('access that resource')
+  );
+}
+
+async function pinterestValidateBoardAccess(accessToken, boardId) {
+  try {
+    const res = await fetch(`https://api.pinterest.com/v5/boards/${encodeURIComponent(boardId)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      // ignore JSON parse issues; Pinterest sometimes returns empty body
+    }
+
+    if (res.ok) return { ok: true, status: res.status, message: null };
+
+    const msg = String(data?.message || data?.error || '').trim();
+    return { ok: false, status: res.status, message: msg ? `${msg}.` : '' };
+  } catch (e) {
+    return { ok: false, status: null, message: (e?.message || 'Network error.') };
+  }
 }
 
 /**
@@ -4358,6 +4453,133 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
         status: 'failure' 
       } 
     });
+  }
+});
+
+// Preflight check upcoming scheduled pins for common permanent failures (missing account/board, board access)
+app.get('/api/pinterest/scheduled-pins/preflight', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  const windowHours = Math.min(24 * 14, Math.max(1, parseInt(req.query.window_hours || '72', 10))); // 1h..14d
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '100', 10)));
+
+  try {
+    const now = new Date();
+    const until = new Date(now.getTime() + windowHours * 60 * 60 * 1000);
+
+    const { data: pins, error: fetchError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('id,user_id,pinterest_account_id,board_id,title,scheduled_for,status,deleted_at')
+      .eq('user_id', user.id)
+      .eq('status', 'scheduled')
+      .gte('scheduled_for', now.toISOString())
+      .lte('scheduled_for', until.toISOString())
+      .is('deleted_at', null)
+      .order('scheduled_for', { ascending: true })
+      .limit(limit);
+
+    if (fetchError) {
+      console.error('Preflight fetch scheduled pins error:', fetchError);
+      return res.status(500).json({ error: 'Failed to fetch scheduled pins for preflight' });
+    }
+
+    const issues = [];
+    const boardChecks = [];
+    const seenKey = new Set();
+
+    for (const pin of pins || []) {
+      if (!pin.pinterest_account_id) {
+        issues.push({
+          pin_id: pin.id,
+          type: 'missing_pinterest_account',
+          message: 'No Pinterest account linked to this scheduled pin.',
+          scheduled_for: pin.scheduled_for,
+        });
+        continue;
+      }
+      if (!pin.board_id) {
+        issues.push({
+          pin_id: pin.id,
+          type: 'missing_board_id',
+          message: 'No board selected for this scheduled pin.',
+          scheduled_for: pin.scheduled_for,
+        });
+        continue;
+      }
+
+      const key = `${pin.pinterest_account_id}:${pin.board_id}`;
+      if (!seenKey.has(key)) {
+        seenKey.add(key);
+        boardChecks.push({ pin_id: pin.id, account_id: pin.pinterest_account_id, board_id: pin.board_id });
+      }
+    }
+
+    // Validate board access for a capped number of unique (account, board) pairs to avoid API spam
+    const MAX_BOARD_CHECKS = 30;
+    const toCheck = boardChecks.slice(0, MAX_BOARD_CHECKS);
+
+    // Fetch account rows in batch
+    const uniqueAccountIds = [...new Set(toCheck.map(x => x.account_id))];
+    let accountsById = {};
+    if (uniqueAccountIds.length > 0) {
+      const { data: accRows, error: accErr } = await supabaseAdmin
+        .from('pinterest_accounts')
+        .select('id, access_token, refresh_token, token_expires_at')
+        .in('id', uniqueAccountIds);
+      if (accErr) {
+        console.error('Preflight fetch pinterest accounts error:', accErr);
+      } else {
+        for (const a of accRows || []) accountsById[a.id] = a;
+      }
+    }
+
+    for (const check of toCheck) {
+      const accRow = accountsById[check.account_id];
+      if (!accRow) {
+        issues.push({
+          pin_id: check.pin_id,
+          type: 'pinterest_account_not_found',
+          message: 'Pinterest account row not found (was it deleted/disconnected?).',
+        });
+        continue;
+      }
+
+      const { accessToken } = await ensureValidPinterestAccessToken(accRow);
+      if (!accessToken) {
+        issues.push({
+          pin_id: check.pin_id,
+          type: 'missing_access_token',
+          message: 'No usable Pinterest access token for this account (reconnect required).',
+        });
+        continue;
+      }
+
+      const boardAccess = await pinterestValidateBoardAccess(accessToken, check.board_id);
+      if (!boardAccess.ok) {
+        issues.push({
+          pin_id: check.pin_id,
+          type: 'board_not_accessible',
+          message: `Board not accessible for this connected account (status ${boardAccess.status || 'n/a'}). ${boardAccess.message || ''}`.trim(),
+          board_id: check.board_id,
+          pinterest_account_id: check.account_id,
+        });
+      }
+    }
+
+    return res.json({
+      window_hours: windowHours,
+      checked_pins: (pins || []).length,
+      unique_board_checks: toCheck.length,
+      capped_board_checks: boardChecks.length > MAX_BOARD_CHECKS,
+      issues,
+    });
+  } catch (error) {
+    console.error('Preflight scheduled pins error:', error);
+    return res.status(500).json({ error: 'Failed to preflight scheduled pins', details: error.message });
   }
 });
 
