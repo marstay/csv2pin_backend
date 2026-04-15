@@ -585,6 +585,189 @@ function assessUrlBrandingGate(urlString) {
   }
 }
 
+/** Product / affiliate pages where we try to attach Amazon CDN images to Nano Banana (not generic store hubs). */
+function isAmazonProductPageForNanoReference(urlString) {
+  try {
+    const raw = String(urlString || '').trim();
+    if (!raw) return false;
+    const u = new URL(raw);
+    if (!isAmazonRelatedHost(u.hostname)) return false;
+    const path = u.pathname || '';
+    const search = u.search || '';
+    const hasAffiliate =
+      /[?&]tag=[^&]+/i.test(search) ||
+      /[?&]linkCode=/i.test(search) ||
+      /[?&](?:creative|creativeASIN)=/i.test(search) ||
+      /[?&]ref_=?(?:a|gp|as_li|cm_cr|pd|d)/i.test(search);
+    const productish =
+      /\/dp\//i.test(path) ||
+      /\/gp\/product/i.test(path) ||
+      /\/gp\/aw\/d\//i.test(path) ||
+      /\/d\/[A-Za-z0-9]/i.test(path);
+    return productish || hasAffiliate;
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedAmazonCdnImageUrl(urlString) {
+  try {
+    const u = new URL(urlString);
+    if (!/^https:/i.test(u.protocol)) return false;
+    const h = u.hostname.toLowerCase();
+    if (h.includes('media-amazon.com')) return true;
+    if (h.includes('ssl-images-amazon.com')) return true;
+    if (h.endsWith('images-amazon.com')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeAmazonImageUrlString(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (s.startsWith('//')) s = `https:${s}`;
+  try {
+    const p = new URL(s);
+    if (!isAllowedAmazonCdnImageUrl(p.href)) return null;
+    return `${p.origin}${p.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+function collectLdJsonProductImages(node, set) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    node.forEach((x) => collectLdJsonProductImages(x, set));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  if (node['@graph']) {
+    collectLdJsonProductImages(node['@graph'], set);
+  }
+  const typesRaw = node['@type'];
+  const types = Array.isArray(typesRaw)
+    ? typesRaw.map((t) => String(t).toLowerCase())
+    : typesRaw
+      ? [String(typesRaw).toLowerCase()]
+      : [];
+  const isProduct = types.some((t) => t.includes('product'));
+  if (isProduct && node.image != null) {
+    const imgs = Array.isArray(node.image) ? node.image : [node.image];
+    for (const im of imgs) {
+      if (typeof im === 'string') {
+        const n = normalizeAmazonImageUrlString(im);
+        if (n) set.add(n);
+      } else if (im && typeof im === 'object' && im.url) {
+        const n = normalizeAmazonImageUrlString(im.url);
+        if (n) set.add(n);
+      }
+    }
+  }
+  for (const key of Object.keys(node)) {
+    if (key === '@context' || key === '@type' || key === '@id' || key === '@graph') continue;
+    collectLdJsonProductImages(node[key], set);
+  }
+}
+
+function rankAmazonImageUrlCandidates(urls) {
+  const score = (u) => {
+    let s = 0;
+    if (/SL1[5-9]\d{2}_|SL2\d{3}_/i.test(u)) s += 60;
+    else if (/SL1[0-4]\d{2}_/i.test(u)) s += 35;
+    if (/_AC_UL\d{2,3}_/i.test(u)) s -= 45;
+    return s;
+  };
+  return [...urls].sort((a, b) => score(b) - score(a)).slice(0, 12);
+}
+
+function extractAmazonProductImageUrlsFromHtml(html) {
+  const set = new Set();
+  if (!html || typeof html !== 'string') return [];
+
+  let m;
+  const ogRe = /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while ((m = ogRe.exec(html)) !== null) {
+    const n = normalizeAmazonImageUrlString(m[1]);
+    if (n) set.add(n);
+  }
+  const ogReAlt = /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["'][^>]*>/gi;
+  while ((m = ogReAlt.exec(html)) !== null) {
+    const n = normalizeAmazonImageUrlString(m[1]);
+    if (n) set.add(n);
+  }
+  const twRe = /<meta[^>]+name=["']twitter:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while ((m = twRe.exec(html)) !== null) {
+    const n = normalizeAmazonImageUrlString(m[1]);
+    if (n) set.add(n);
+  }
+
+  const scriptRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  while ((m = scriptRe.exec(html)) !== null) {
+    try {
+      const jsonText = m[1].trim();
+      if (!jsonText) continue;
+      collectLdJsonProductImages(JSON.parse(jsonText), set);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const mediaRe = /https:\/\/m\.media-amazon\.com\/images\/I\/[A-Za-z0-9._%-]+/gi;
+  while ((m = mediaRe.exec(html)) !== null) {
+    const n = normalizeAmazonImageUrlString(m[0]);
+    if (n) set.add(n);
+  }
+
+  return rankAmazonImageUrlCandidates([...set]);
+}
+
+const MAX_AMAZON_REF_IMAGE_BYTES = 4 * 1024 * 1024;
+const AMAZON_NANO_MAX_REFERENCE_IMAGES = 3;
+
+async function mirrorAmazonImageUrlsForNanoBanana(sourceUrls, userId) {
+  if (!supabaseAdmin || !userId || !Array.isArray(sourceUrls) || sourceUrls.length === 0) {
+    return [];
+  }
+  const out = [];
+  for (let i = 0; i < sourceUrls.length && out.length < AMAZON_NANO_MAX_REFERENCE_IMAGES; i++) {
+    const src = sourceUrls[i];
+    if (!src || !isAllowedAmazonCdnImageUrl(src)) continue;
+    try {
+      const res = await fetchWithTimeout(
+        src,
+        {
+          headers: {
+            ...URL_SCRAPE_HEADERS,
+            Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          },
+        },
+        20000
+      );
+      if (!res.ok) continue;
+      const ct = (res.headers.get('content-type') || '').split(';')[0].trim();
+      if (!ct.startsWith('image/')) continue;
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > MAX_AMAZON_REF_IMAGE_BYTES || ab.byteLength < 1500) continue;
+      const buf = Buffer.from(ab);
+      const ext = ct.includes('png') ? 'png' : ct.includes('webp') ? 'webp' : 'jpg';
+      const fileName = `amazon-ref-${userId}-${Date.now()}-${i}.${ext}`;
+      const { error: uploadError } = await supabaseAdmin.storage.from('ai-images').upload(fileName, buf, {
+        contentType: ct || 'image/jpeg',
+        upsert: true,
+      });
+      if (uploadError) continue;
+      const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+      if (publicUrlData?.publicUrl) out.push(publicUrlData.publicUrl);
+    } catch (e) {
+      console.warn('mirrorAmazonImageUrlsForNanoBanana:', e.message || e);
+    }
+  }
+  return out;
+}
+
 function extractMetaFromHtml(html, url) {
   let title = '';
   let description = '';
@@ -2618,6 +2801,30 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     /** Bottom-of-pin line: user brand/CTA replaces raw URL when set (AI prompt + overlays stay consistent). */
     const pinFooterSourceLine = String(brandName || '').trim().slice(0, 80) || domain;
 
+    let amazonNanoImageInputs = [];
+    if (
+      process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
+      !useTextBased &&
+      !useUserComposite &&
+      !useDummyImages &&
+      isAmazonProductPageForNanoReference(url)
+    ) {
+      try {
+        const azHtml = await fetchArticleHtml(url);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
+        if (candidates.length > 0) {
+          amazonNanoImageInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+          if (amazonNanoImageInputs.length > 0) {
+            console.log(
+              `urltopin: Nano Banana Amazon reference images: ${amazonNanoImageInputs.length} (${String(url).slice(0, 96)})`
+            );
+          }
+        }
+      } catch (e) {
+        console.warn('urltopin Amazon product images for Nano:', e.message || e);
+      }
+    }
+
     const pinPromises = stylePrompts.map(async (sp) => {
       const metaKey = sp.index != null && ((isStrategic || isStrategicSingle) || effectiveStyles.length > 1) ? `${sp.id}::${sp.index}` : sp.id;
       const meta = styleMetadataByStyleId.get(metaKey) || styleMetadataByStyleId.get(sp.id) || {};
@@ -2646,6 +2853,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
       if (useTextBased) {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
+      } else if (amazonNanoImageInputs.length > 0) {
+        imagePrompt +=
+          ' ' +
+          promptTier(
+            'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
+            'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+          );
       }
 
       const overlayText = {
@@ -2728,11 +2942,12 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       } else if (!useUserComposite) {
         try {
-          const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+          const nanoOpts = amazonNanoImageInputs.length ? { imageInput: amazonNanoImageInputs } : {};
+          const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts);
           imageUrl = nanoUrl || '';
           if (!imageUrl) {
             console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
-            const retryUrl = await generateImageWithNanoBanana(imagePrompt, sp.label);
+            const retryUrl = await generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts);
             imageUrl = retryUrl || '';
           }
 
@@ -2820,7 +3035,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }),
         ...(!userCompositeSourceUrl &&
           !useUserComposite &&
-          !useTextBased && { imageGenerationMode: 'ai' }),
+          !useTextBased && {
+            imageGenerationMode: 'ai',
+            ...(amazonNanoImageInputs.length > 0 && {
+              nanoBananaReferenceCount: amazonNanoImageInputs.length,
+              nanoBananaReferenceSource: 'amazon_product',
+            }),
+          }),
         ...((isStrategic || isStrategicSingle) && metaExtra.strategy && {
           strategy: metaExtra.strategy,
           goal: metaExtra.goal,
@@ -3128,15 +3349,43 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       });
     }
 
+    let regenAmazonNanoInputs = [];
+    if (
+      process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
+      isAmazonProductPageForNanoReference(url)
+    ) {
+      try {
+        const azHtml = await fetchArticleHtml(url);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
+        if (candidates.length > 0) {
+          regenAmazonNanoInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+        }
+      } catch (e) {
+        console.warn('urltopin regenerate Amazon refs:', e.message || e);
+      }
+    }
+
+    let imagePromptForNano = imagePrompt;
+    if (regenAmazonNanoInputs.length > 0) {
+      imagePromptForNano +=
+        ' ' +
+        promptTier(
+          'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+          'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+        );
+    }
+
+    const regenNanoOpts = regenAmazonNanoInputs.length ? { imageInput: regenAmazonNanoInputs } : {};
+
     let imageUrl = '';
     try {
-      imageUrl = await generateImageWithNanoBanana(imagePrompt, styleId);
+      imageUrl = await generateImageWithNanoBanana(imagePromptForNano, styleId, regenNanoOpts);
       if (!imageUrl) {
         try {
           const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: imagePrompt, title: topic }),
+            body: JSON.stringify({ prompt: imagePromptForNano, title: topic }),
           });
           if (imgRes.ok) {
             const imgJson = await imgRes.json();
@@ -3157,7 +3406,14 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       return res.status(500).json({ error: 'Failed to generate image with the provided text' });
     }
 
-    return res.json({ imageUrl, imagePrompt });
+    return res.json({
+      imageUrl,
+      imagePrompt: imagePromptForNano,
+      ...(regenAmazonNanoInputs.length > 0 && {
+        nanoBananaReferenceCount: regenAmazonNanoInputs.length,
+        nanoBananaReferenceSource: 'amazon_product',
+      }),
+    });
   } catch (err) {
     console.error('urltopin regenerate-image-with-text error:', err);
     return res.status(500).json({ error: err.message });
