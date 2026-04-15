@@ -526,6 +526,93 @@ function isAmazonRelatedHost(host) {
 }
 
 /**
+ * Amazon listing titles are long SEO strings; shorten for pin topic / UI (still descriptive).
+ */
+function shortenAmazonListingTitleForPins(rawTitle) {
+  let t = String(rawTitle || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return t;
+  t = t.replace(/^Amazon(\.[a-z.]+)?\s*:\s*/i, '');
+  t = t.replace(/\s*:\s*[A-Za-z0-9,&'’\- ]{3,100}\s*$/i, '').trim();
+  const SOFT_MAX = 74;
+  const firstComma = t.indexOf(',');
+  if (firstComma !== -1 && firstComma >= 18 && firstComma <= SOFT_MAX + 18) {
+    const head = t.slice(0, firstComma).trim();
+    if (head.length >= 18) return head;
+  }
+  if (t.length <= SOFT_MAX) return t;
+  const slice = t.slice(0, SOFT_MAX + 1);
+  const lastSpace = slice.lastIndexOf(' ');
+  const cut = lastSpace > 32 ? slice.slice(0, lastSpace).trim() : slice.slice(0, SOFT_MAX).trim();
+  return `${cut}…`;
+}
+
+/**
+ * Pinterest-friendly line via OpenAI; falls back to {@link shortenAmazonListingTitleForPins} on error or if disabled.
+ */
+async function shortenAmazonListingTitleWithAi(rawTitle, openaiClient) {
+  const fallback = shortenAmazonListingTitleForPins(rawTitle);
+  if (
+    process.env.URLTOPIN_AMAZON_TITLE_AI === '0' ||
+    !process.env.OPENAI_API_KEY ||
+    !openaiClient
+  ) {
+    return fallback;
+  }
+  const cleaned = String(rawTitle || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return fallback;
+  if (cleaned.length <= 52) {
+    return shortenAmazonListingTitleForPins(rawTitle);
+  }
+  try {
+    const model = process.env.URLTOPIN_AMAZON_TITLE_MODEL || 'gpt-4o-mini';
+    const completion = await openaiClient.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: 'user',
+          content:
+            'Rewrite this Amazon-style product listing title as ONE short line for a Pinterest pin.\n' +
+            'Rules: max 58 characters; name the product clearly; keep one concrete detail (size, piece count, color, or key feature); no ALL CAPS; no quotation marks; no "Amazon", "Buy now", or price; no ellipsis; output only the line, nothing else.\n\n' +
+            `Title:\n${cleaned.slice(0, 480)}`,
+        },
+      ],
+      max_tokens: 100,
+      temperature: 0.35,
+    });
+    let out = (completion.choices[0]?.message?.content || '')
+      .trim()
+      .replace(/^["'«»]+|["'«»]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!out) return fallback;
+    if (out.length > 65) {
+      out = out.slice(0, 65);
+      const sp = out.lastIndexOf(' ');
+      if (sp > 35) out = out.slice(0, sp);
+      out = out.trim();
+    }
+    if (out.length < 10) return fallback;
+    return out;
+  } catch (e) {
+    console.warn('shortenAmazonListingTitleWithAi:', e.message || e);
+    return fallback;
+  }
+}
+
+async function maybeShortenAmazonPageTitle(urlString, title, openaiClient) {
+  try {
+    if (!title || !urlString) return title;
+    const u = new URL(String(urlString).trim());
+    if (!isAmazonRelatedHost(u.hostname)) return title;
+    return await shortenAmazonListingTitleWithAi(title, openaiClient);
+  } catch {
+    return shortenAmazonListingTitleForPins(title);
+  }
+}
+
+/**
  * Short links, Amazon store/product/affiliate URLs: pin footer should be the user's brand/CTA, not the raw URL host.
  * @returns {{ requiresManualBrandOrCta: boolean, brandingGateReason: string|null, brandingGateMessage: string|null }}
  */
@@ -908,6 +995,9 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   base.linkDisplay = derivedDisplay || base.linkDisplay || '';
   base.keyword = derivedKw;
   Object.assign(base, assessUrlBrandingGate(url));
+  if (base.title) {
+    base.title = await maybeShortenAmazonPageTitle(url, base.title, openai);
+  }
 
   // Very lightweight body text extraction from HTML
   let bodyText = '';
@@ -2431,6 +2521,9 @@ app.post('/api/urltopin/scrape', async (req, res) => {
       });
     }
     const meta = extractMetaFromHtml(html, url);
+    if (meta.title) {
+      meta.title = await maybeShortenAmazonPageTitle(url, meta.title, openai);
+    }
     const brandingGate = assessUrlBrandingGate(url);
     if (enrich) {
       try {
@@ -3171,6 +3264,9 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     const derivedKw = deriveKeywordFromArticleUrl(url);
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
+    if (base.title) {
+      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai);
+    }
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
@@ -3287,6 +3383,9 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     const derivedKw = deriveKeywordFromArticleUrl(url);
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
+    if (base.title) {
+      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai);
+    }
     const year = new Date().getFullYear();
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
