@@ -5386,6 +5386,17 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
     if (typeof is_recurring === 'boolean') updates.is_recurring = is_recurring;
     if (recurrence_pattern) updates.recurrence_pattern = recurrence_pattern;
 
+    // Putting a failed pin back on the calendar: clear error/retry state so the worker can try again
+    if (
+      scheduled_for &&
+      updates.status === 'scheduled' &&
+      existingPin.status === 'failed'
+    ) {
+      updates.error_message = null;
+      updates.retry_count = 0;
+      updates.next_retry_at = null;
+    }
+
     const { data: updatedPin, error: updateError } = await supabaseAdmin
       .from('scheduled_pins')
       .update(updates)
