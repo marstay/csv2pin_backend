@@ -470,6 +470,17 @@ function isLikelyUrlShortenerHost(host) {
   return false;
 }
 
+/** Drop path segments that are Amazon/search tracking (e.g. ref=sr_1_2_sspa) so they never become keywords or prompts. */
+function pathSegmentsStripTracking(parts) {
+  if (!Array.isArray(parts)) return [];
+  return parts.filter((p) => {
+    if (!p) return false;
+    if (/^ref=/i.test(p)) return false;
+    if (/^ref[_-]/i.test(p)) return false;
+    return true;
+  });
+}
+
 /** Footer / “source” line: host + path (no scheme, no query), truncated — correct for short links. */
 function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
   try {
@@ -477,6 +488,16 @@ function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
     const host = normalizeUrlHostname(u.hostname);
     let path = u.pathname || '';
     if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    let parts = pathSegmentsStripTracking(path.split('/').filter(Boolean));
+    if (isAmazonRelatedHost(host)) {
+      const dpIdx = parts.findIndex((p) => p === 'dp');
+      if (dpIdx >= 0 && parts[dpIdx + 1]) {
+        parts = parts.slice(0, dpIdx + 2);
+      }
+      path = parts.length ? `/${parts.join('/')}` : '';
+    } else {
+      path = parts.length ? `/${parts.join('/')}` : '';
+    }
     if (!path || path === '/') return host.slice(0, maxLen);
     return `${host}${path}`.slice(0, maxLen);
   } catch {
@@ -486,6 +507,7 @@ function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
 
 /**
  * Keyword from URL path for prompts — skip shorteners and opaque slug segments (e.g. asdf123).
+ * Amazon: prefer product slug before /dp/ASIN; never use trailing ref=… segments.
  */
 function deriveKeywordFromArticleUrl(urlString) {
   try {
@@ -493,11 +515,28 @@ function deriveKeywordFromArticleUrl(urlString) {
     const host = normalizeUrlHostname(u.hostname);
     if (isLikelyUrlShortenerHost(host)) return '';
 
-    const parts = (u.pathname || '').split('/').filter(Boolean);
+    let parts = pathSegmentsStripTracking((u.pathname || '').split('/').filter(Boolean));
+    if (parts.length === 0) return '';
+
+    if (isAmazonRelatedHost(host)) {
+      const dpIdx = parts.findIndex((p) => p === 'dp');
+      if (dpIdx > 0) {
+        const slug = parts[dpIdx - 1];
+        if (slug && !/^dp$/i.test(slug)) {
+          let keyword = slug
+            .replace(/[-_]/g, ' ')
+            .replace(/\.[a-zA-Z0-9]+$/, '')
+            .trim();
+          if (keyword.length >= 3) return keyword;
+        }
+      }
+      const last = parts[parts.length - 1] || '';
+      if (/^B[0-9A-Z]{9}$/i.test(last) || /^[0-9A-Z]{10}$/i.test(last)) return '';
+    }
+
     const last = parts[parts.length - 1] || '';
     if (!last) return '';
 
-    // Opaque ID-like final segment (no word separators): not a readable topic
     if (
       parts.length >= 1 &&
       /^[a-z0-9]{5,14}$/i.test(last) &&
@@ -511,6 +550,7 @@ function deriveKeywordFromArticleUrl(urlString) {
       .replace(/\.[a-zA-Z0-9]+$/, '')
       .trim();
     if (keyword.length < 3) return '';
+    if (/^ref\s*=/i.test(keyword) || /\bsspa\b/i.test(keyword)) return '';
     return keyword;
   } catch {
     return '';
@@ -523,6 +563,24 @@ function isAmazonRelatedHost(host) {
   if (h.startsWith('amazon.')) return true;
   if (h.endsWith('.amazon.com')) return true;
   return false;
+}
+
+/** Stops models from painting Amazon tracking path/query tokens (e.g. ref=sr_1_2_sspa) into the bitmap. */
+function appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, urlString) {
+  try {
+    if (!imagePrompt || !urlString) return imagePrompt;
+    const u = new URL(String(urlString).trim());
+    if (!isAmazonRelatedHost(u.hostname)) return imagePrompt;
+    return (
+      `${imagePrompt} ` +
+      promptTier(
+        'Do not render Amazon URL tracking or path fragments as text anywhere on the pin: no "ref=", "sr_", "sspa", query-style codes, or small boxes mimicking URL parameters. Only the specified headline, subheadline, and footer line may appear as readable text.',
+        'Never paint ref=/sspa/URL tracking text—only headline, sub, footer.',
+      )
+    );
+  } catch {
+    return imagePrompt;
+  }
 }
 
 /**
@@ -2987,13 +3045,16 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
       if (useTextBased) {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
-      } else if (amazonNanoImageInputs.length > 0) {
-        imagePrompt +=
-          ' ' +
-          promptTier(
-            'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
-            'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-          );
+      } else {
+        imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, url);
+        if (amazonNanoImageInputs.length > 0) {
+          imagePrompt +=
+            ' ' +
+            promptTier(
+              'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
+              'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+            );
+        }
       }
 
       const overlayText = {
@@ -3454,7 +3515,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       regenAmazonNanoInputs.length > 0
     );
 
-    const imagePrompt = buildOverlayImagePrompt({
+    let imagePrompt = buildOverlayImagePrompt({
       styleId: nanoStyleId,
       topic,
       domain,
@@ -3463,6 +3524,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       overlayText: overlayForRender,
       brand,
     });
+    imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, url);
 
     const trimmedUserImg = userImageUrl && String(userImageUrl).trim();
     if (trimmedUserImg && isAllowedUserImageUrl(trimmedUserImg, process.env.SUPABASE_URL)) {
