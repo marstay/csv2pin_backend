@@ -1124,21 +1124,48 @@ async function processScheduledPins() {
   console.log('🔄 Processing scheduled pins...');
   
   try {
-    // Get pins that are due to be posted
-    const { data: pinsToPost, error: fetchError } = await supabaseAdmin
+    const nowIso = new Date().toISOString();
+    const fetchLimit = 30; // fetch enough from each bucket to merge; final batch is capped below
+
+    // Due "scheduled" pins (normal queue).
+    const scheduledQuery = supabaseAdmin
       .from('scheduled_pins')
       .select('*')
-      .in('status', ['scheduled', 'failed'])
-      .lte('scheduled_for', new Date().toISOString())
-      .or('next_retry_at.is.null,next_retry_at.lte.' + new Date().toISOString())
+      .eq('status', 'scheduled')
+      .lte('scheduled_for', nowIso)
       .is('deleted_at', null)
       .order('scheduled_for', { ascending: true })
-      .limit(10); // Process 10 pins at a time
+      .limit(fetchLimit);
 
-    if (fetchError) {
-      console.error('❌ Error fetching scheduled pins:', fetchError);
+    // Due "failed" pins that still have a retry time — NOT permanent failures
+    // (those have next_retry_at = null and must not match, or they clog every run).
+    const failedRetryQuery = supabaseAdmin
+      .from('scheduled_pins')
+      .select('*')
+      .eq('status', 'failed')
+      .lte('scheduled_for', nowIso)
+      .not('next_retry_at', 'is', null)
+      .lte('next_retry_at', nowIso)
+      .is('deleted_at', null)
+      .order('scheduled_for', { ascending: true })
+      .limit(fetchLimit);
+
+    const [{ data: scheduledDue, error: errScheduled }, { data: failedRetryDue, error: errFailed }] =
+      await Promise.all([scheduledQuery, failedRetryQuery]);
+
+    if (errScheduled) {
+      console.error('❌ Error fetching due scheduled pins:', errScheduled);
       return;
     }
+    if (errFailed) {
+      console.error('❌ Error fetching failed pins due for retry:', errFailed);
+      return;
+    }
+
+    const merged = [...(scheduledDue || []), ...(failedRetryDue || [])].sort(
+      (a, b) => new Date(a.scheduled_for) - new Date(b.scheduled_for)
+    );
+    const pinsToPost = merged.slice(0, 10); // Process 10 pins at a time
 
     if (!pinsToPost || pinsToPost.length === 0) {
       console.log('✅ No scheduled pins to process');
