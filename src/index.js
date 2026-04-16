@@ -460,6 +460,15 @@ function normalizeUrlHostname(host) {
     .toLowerCase();
 }
 
+function isYouTubeHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (h === 'youtu.be') return true;
+  if (h === 'youtube.com') return true;
+  if (h.endsWith('.youtube.com')) return true; // m.youtube.com, music.youtube.com, etc.
+  return false;
+}
+
 function isLikelyUrlShortenerHost(host) {
   const h = normalizeUrlHostname(host);
   if (!h) return false;
@@ -489,6 +498,23 @@ function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
     let path = u.pathname || '';
     if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
     let parts = pathSegmentsStripTracking(path.split('/').filter(Boolean));
+    if (isYouTubeHost(host)) {
+      let id = '';
+      if (host === 'youtu.be') {
+        id = parts[0] || '';
+      } else if (parts[0] === 'shorts' && parts[1]) {
+        id = parts[1];
+      } else if (parts[0] === 'embed' && parts[1]) {
+        id = parts[1];
+      } else {
+        id = (u.searchParams.get('v') || '').trim();
+      }
+      id = id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32);
+      if (id) return `youtu.be/${id}`.slice(0, maxLen);
+      // Fallback: show host + first path segment only (no query)
+      const fb = parts.length ? `youtube.com/${parts[0]}` : 'youtube.com';
+      return fb.slice(0, maxLen);
+    }
     if (isAmazonRelatedHost(host)) {
       const dpIdx = parts.findIndex((p) => p === 'dp');
       if (dpIdx >= 0 && parts[dpIdx + 1]) {
@@ -687,6 +713,15 @@ function assessUrlBrandingGate(urlString) {
     const host = normalizeUrlHostname(u.hostname);
     const path = u.pathname || '';
     const search = u.search || '';
+
+    if (isYouTubeHost(host)) {
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: 'youtube',
+        brandingGateMessage:
+          'This looks like a YouTube link. Pins should show your brand or CTA in the footer, not YouTube. Before generating, open Pin look & brand and add your brand name or CTA (e.g. your site name).',
+      };
+    }
 
     if (isLikelyUrlShortenerHost(host)) {
       return {
