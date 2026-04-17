@@ -490,7 +490,7 @@ function pathSegmentsStripTracking(parts) {
   });
 }
 
-/** Footer / “source” line: host + path (no scheme, no query), truncated — correct for short links. */
+/** Footer / “source” line used in prompts/overlays. */
 function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
   try {
     const u = new URL(String(urlString || '').trim());
@@ -515,17 +515,20 @@ function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
       const fb = parts.length ? `youtube.com/${parts[0]}` : 'youtube.com';
       return fb.slice(0, maxLen);
     }
-    if (isAmazonRelatedHost(host)) {
-      const dpIdx = parts.findIndex((p) => p === 'dp');
-      if (dpIdx >= 0 && parts[dpIdx + 1]) {
-        parts = parts.slice(0, dpIdx + 2);
-      }
+    // Short links: keep host + path so it's not just "bit.ly".
+    if (isLikelyUrlShortenerHost(host)) {
       path = parts.length ? `/${parts.join('/')}` : '';
-    } else {
-      path = parts.length ? `/${parts.join('/')}` : '';
+      if (!path || path === '/') return host.slice(0, maxLen);
+      return `${host}${path}`.slice(0, maxLen);
     }
-    if (!path || path === '/') return host.slice(0, maxLen);
-    return `${host}${path}`.slice(0, maxLen);
+
+    // Amazon: keep host only (footer is expected to be user's brand/CTA anyway; avoid long paths).
+    if (isAmazonRelatedHost(host)) {
+      return host.slice(0, maxLen);
+    }
+
+    // Normal sites: host only (prevents long article slugs becoming the footer line).
+    return host.slice(0, maxLen);
   } catch {
     return '';
   }
