@@ -887,6 +887,99 @@ function collectLdJsonProductImages(node, set) {
   }
 }
 
+/** Ordered Product images from JSON-LD (gallery order preserved per block). */
+function collectLdJsonProductImagesOrdered(node, out, seen) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    node.forEach((x) => collectLdJsonProductImagesOrdered(x, out, seen));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  if (node['@graph']) {
+    collectLdJsonProductImagesOrdered(node['@graph'], out, seen);
+  }
+  const typesRaw = node['@type'];
+  const types = Array.isArray(typesRaw)
+    ? typesRaw.map((t) => String(t).toLowerCase())
+    : typesRaw
+      ? [String(typesRaw).toLowerCase()]
+      : [];
+  const isProduct = types.some((t) => t.includes('product'));
+  if (isProduct && node.image != null) {
+    const imgs = Array.isArray(node.image) ? node.image : [node.image];
+    for (const im of imgs) {
+      let raw = null;
+      if (typeof im === 'string') raw = im;
+      else if (im && typeof im === 'object' && im.url) raw = im.url;
+      const n = raw ? normalizeAmazonImageUrlString(raw) : null;
+      if (n && !seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+  }
+  for (const key of Object.keys(node)) {
+    if (key === '@context' || key === '@type' || key === '@id' || key === '@graph') continue;
+    collectLdJsonProductImagesOrdered(node[key], out, seen);
+  }
+}
+
+function extractAmazonAsinFromUrl(urlString) {
+  try {
+    const raw = String(urlString || '').trim();
+    if (!raw) return null;
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    const path = u.pathname || '';
+    let m = path.match(/\/(?:dp|gp\/product|gp\/aw\/d|d)\/([A-Z0-9]{10})/i);
+    if (m) return m[1].toUpperCase();
+    m = String(u.search || '').match(/[?&]asin=([A-Z0-9]{10})/i);
+    if (m) return m[1].toUpperCase();
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function pushUniqueAmazonImageUrl(ordered, seen, raw) {
+  const n = normalizeAmazonImageUrlString(raw);
+  if (!n || seen.has(n)) return;
+  seen.add(n);
+  ordered.push(n);
+}
+
+/**
+ * Primary PDP gallery: Amazon embeds hi-res URLs inside a colorImages / ImageBlock JSON blob.
+ * Restrict extraction to a window after "colorImages" so we don't harvest unrelated media-amazon
+ * thumbnails from the rest of the page.
+ */
+function extractAmazonColorImagesGalleryUrls(html) {
+  const ordered = [];
+  const seen = new Set();
+  if (!html || typeof html !== 'string') return ordered;
+  const needle = 'colorImages';
+  let start = 0;
+  const hiResRe = /"hiRes"\s*:\s*"([^"]+)"/gi;
+  const largeRe = /"large"\s*:\s*"([^"]+)"/gi;
+  const maxRegion = 140000;
+  const maxTotal = 24;
+  while (ordered.length < maxTotal) {
+    const idx = html.indexOf(needle, start);
+    if (idx < 0) break;
+    const region = html.slice(idx, idx + maxRegion);
+    let m;
+    hiResRe.lastIndex = 0;
+    while ((m = hiResRe.exec(region)) !== null && ordered.length < maxTotal) {
+      pushUniqueAmazonImageUrl(ordered, seen, m[1]);
+    }
+    largeRe.lastIndex = 0;
+    while ((m = largeRe.exec(region)) !== null && ordered.length < maxTotal) {
+      pushUniqueAmazonImageUrl(ordered, seen, m[1]);
+    }
+    start = idx + needle.length;
+  }
+  return ordered;
+}
+
 function rankAmazonImageUrlCandidates(urls) {
   const score = (u) => {
     let s = 0;
@@ -898,25 +991,24 @@ function rankAmazonImageUrlCandidates(urls) {
   return [...urls].sort((a, b) => score(b) - score(a)).slice(0, 12);
 }
 
-function extractAmazonProductImageUrlsFromHtml(html) {
-  const set = new Set();
+function extractAmazonProductImageUrlsFromHtml(html, pageUrl = '') {
   if (!html || typeof html !== 'string') return [];
 
+  const ordered = [];
+  const seen = new Set();
   let m;
+
   const ogRe = /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
   while ((m = ogRe.exec(html)) !== null) {
-    const n = normalizeAmazonImageUrlString(m[1]);
-    if (n) set.add(n);
+    pushUniqueAmazonImageUrl(ordered, seen, m[1]);
   }
   const ogReAlt = /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["'][^>]*>/gi;
   while ((m = ogReAlt.exec(html)) !== null) {
-    const n = normalizeAmazonImageUrlString(m[1]);
-    if (n) set.add(n);
+    pushUniqueAmazonImageUrl(ordered, seen, m[1]);
   }
   const twRe = /<meta[^>]+name=["']twitter:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
   while ((m = twRe.exec(html)) !== null) {
-    const n = normalizeAmazonImageUrlString(m[1]);
-    if (n) set.add(n);
+    pushUniqueAmazonImageUrl(ordered, seen, m[1]);
   }
 
   const scriptRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
@@ -924,19 +1016,25 @@ function extractAmazonProductImageUrlsFromHtml(html) {
     try {
       const jsonText = m[1].trim();
       if (!jsonText) continue;
-      collectLdJsonProductImages(JSON.parse(jsonText), set);
+      collectLdJsonProductImagesOrdered(JSON.parse(jsonText), ordered, seen);
     } catch {
       /* ignore */
     }
   }
 
-  const mediaRe = /https:\/\/m\.media-amazon\.com\/images\/I\/[A-Za-z0-9._%-]+/gi;
-  while ((m = mediaRe.exec(html)) !== null) {
-    const n = normalizeAmazonImageUrlString(m[0]);
-    if (n) set.add(n);
+  for (const u of extractAmazonColorImagesGalleryUrls(html)) {
+    pushUniqueAmazonImageUrl(ordered, seen, u);
   }
 
-  return rankAmazonImageUrlCandidates([...set]);
+  const asin = extractAmazonAsinFromUrl(pageUrl);
+  if (asin && ordered.length > 0) {
+    const tagged = ordered.filter((u) => u.includes(`_${asin}_`) || u.includes(`.${asin}.`));
+    if (tagged.length > 0) {
+      return rankAmazonImageUrlCandidates(tagged);
+    }
+  }
+
+  return rankAmazonImageUrlCandidates(ordered);
 }
 
 const MAX_AMAZON_REF_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -2830,7 +2928,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     ) {
       try {
         const azHtml = await fetchArticleHtml(url);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, url);
         if (candidates.length > 0) {
           amazonNanoImageInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
           if (amazonNanoImageInputs.length > 0) {
@@ -3563,7 +3661,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     ) {
       try {
         const azHtml = await fetchArticleHtml(url);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, url);
         if (candidates.length > 0) {
           regenAmazonNanoInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
         }
