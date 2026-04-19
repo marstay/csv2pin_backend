@@ -4224,7 +4224,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       return res.status(500).json({ error: 'Dodo Payments API key not configured' });
     }
 
-    const { planType, discountCode, couponCode, referralKey } = req.body || {};
+    const { planType, discountCode, couponCode, referralKey, affonsoReferral } = req.body || {};
     if (!planType) {
       return res.status(400).json({ error: 'Missing planType' });
     }
@@ -4232,6 +4232,10 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     const referralSlug = String(referralKey || '')
       .trim()
       .toLowerCase();
+
+    const affonso_referral = String(affonsoReferral || '')
+      .trim()
+      .slice(0, 256);
 
     // Dodo checkout expects the human-readable discount *code* (e.g. LAUNCH20), not the dashboard id (dsc_...).
     // Priority: typed coupon → partner ?ref= slug map → global env default.
@@ -4272,6 +4276,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
         supabase_user_id: req.user.id,
         app_plan_type: planType,
         ...(referralSlug ? { referral_key: referralSlug } : {}),
+        ...(affonso_referral ? { affonso_referral } : {}),
       },
     // Redirect back to app after success/failure
     return_url: `${frontendBase.replace(/\/$/, '')}/payment-success?plan=${encodeURIComponent(planType)}`,
