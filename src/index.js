@@ -472,6 +472,7 @@ const URL_SHORTENER_HOSTNAMES = new Set([
   'eepurl.com',
   'fb.watch',
   'l.instagram.com',
+  'pin.it',
 ]);
 
 function normalizeUrlHostname(host) {
