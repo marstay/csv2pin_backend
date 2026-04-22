@@ -59,17 +59,17 @@ function resolvePartnerDiscountCode(referralKey) {
 
 const PLAN_PIN_LIMITS = {
   free: 10,
-  creator: 100,
-  pro: 400,
-  agency: 1000,
+  creator: 150,
+  pro: 450,
+  agency: 1200,
 };
 
 /** Monthly caps for “your photo + text overlay” pins (no image model). Separate from AI pin quota. */
 const PLAN_USER_PHOTO_PIN_LIMITS = {
   free: 40,
-  creator: 400,
-  pro: 1600,
-  agency: 4000,
+  creator: 600,
+  pro: 1800,
+  agency: 4800,
 };
 
 const PLAN_METADATA_LIMITS = {
@@ -115,10 +115,14 @@ const pinUsageLocks = new Map();
 
 function planAiPinsLimit(sub) {
   const planType = sub?.plan_type || 'free';
+  // Always use canonical limits for standard tiers so plan changes apply without DB backfills.
+  if (Object.prototype.hasOwnProperty.call(PLAN_PIN_LIMITS, planType)) {
+    return PLAN_PIN_LIMITS[planType];
+  }
   if (typeof sub?.pins_limit_per_month === 'number' && sub.pins_limit_per_month > 0) {
     return sub.pins_limit_per_month;
   }
-  return PLAN_PIN_LIMITS[planType] || PLAN_PIN_LIMITS.free;
+  return PLAN_PIN_LIMITS.free;
 }
 
 function resolveUserPhotoPinLimitForPlan(sub) {
