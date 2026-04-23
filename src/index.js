@@ -725,11 +725,24 @@ async function shortenAmazonListingTitleWithAi(rawTitle, openaiClient) {
   }
 }
 
-async function maybeShortenAmazonPageTitle(urlString, title, openaiClient) {
+async function maybeShortenAmazonPageTitle(urlString, title, openaiClient, canonicalUrl = '') {
   try {
     if (!title || !urlString) return title;
+    // IMPORTANT: users often paste short links (geni.us, amzn.to, etc.) that 302 to Amazon.
+    // In those cases, urlString is not an Amazon host, but the extracted <title>/og:title is.
+    const looksLikeAmazonTitle = /(?:^|\s)(?:Amazon)\.[a-z.]+/i.test(String(title));
     const u = new URL(String(urlString).trim());
-    if (!isAmazonRelatedHost(u.hostname)) return title;
+    let canonicalHostIsAmazon = false;
+    try {
+      if (canonicalUrl) {
+        const cu = new URL(String(canonicalUrl).trim());
+        canonicalHostIsAmazon = isAmazonRelatedHost(cu.hostname);
+      }
+    } catch {
+      canonicalHostIsAmazon = false;
+    }
+
+    if (!looksLikeAmazonTitle && !canonicalHostIsAmazon && !isAmazonRelatedHost(u.hostname)) return title;
     return await shortenAmazonListingTitleWithAi(title, openaiClient);
   } catch {
     return shortenAmazonListingTitleForPins(title);
@@ -1124,6 +1137,7 @@ async function mirrorAmazonImageUrlsForNanoBanana(sourceUrls, userId) {
 function extractMetaFromHtml(html, url) {
   let title = '';
   let description = '';
+  let canonicalUrl = '';
   try {
     const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
     if (titleMatch && titleMatch[1]) {
@@ -1132,6 +1146,10 @@ function extractMetaFromHtml(html, url) {
     const ogTitleMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']*)["'][^>]*>/i);
     if (ogTitleMatch && ogTitleMatch[1]) {
       title = ogTitleMatch[1].trim();
+    }
+    const canonicalMatch = html.match(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["'][^>]*>/i);
+    if (canonicalMatch && canonicalMatch[1]) {
+      canonicalUrl = canonicalMatch[1].trim();
     }
     const descMatch = html.match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']*)["'][^>]*>/i);
     if (descMatch && descMatch[1]) {
@@ -1159,7 +1177,7 @@ function extractMetaFromHtml(html, url) {
     linkDisplay = '';
   }
 
-  return { title, description, domain, keyword, linkDisplay };
+  return { title, description, canonicalUrl, domain, keyword, linkDisplay };
 }
 
 /** Browser-like headers — bare Node fetch gets 403 from Medium and similar CDNs */
@@ -1262,7 +1280,7 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   base.keyword = derivedKw;
   Object.assign(base, assessUrlBrandingGate(url));
   if (base.title) {
-    base.title = await maybeShortenAmazonPageTitle(url, base.title, openai);
+    base.title = await maybeShortenAmazonPageTitle(url, base.title, openai, base.canonicalUrl);
   }
 
   // Very lightweight body text extraction from HTML
@@ -2815,7 +2833,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     }
     const meta = extractMetaFromHtml(html, url);
     if (meta.title) {
-      meta.title = await maybeShortenAmazonPageTitle(url, meta.title, openai);
+      meta.title = await maybeShortenAmazonPageTitle(url, meta.title, openai, meta.canonicalUrl);
     }
     const brandingGate = assessUrlBrandingGate(url);
     if (enrich) {
@@ -3567,7 +3585,7 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
     if (base.title) {
-      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai);
+      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai, base.canonicalUrl);
     }
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
@@ -3686,7 +3704,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
     if (base.title) {
-      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai);
+      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai, base.canonicalUrl);
     }
     const year = new Date().getFullYear();
     const domain =
