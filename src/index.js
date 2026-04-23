@@ -509,6 +509,62 @@ function isYouTubeHost(host) {
   return false;
 }
 
+/**
+ * Affiliate / network tracking hosts — not a merchant brand; pin footer must be user’s CTA.
+ * Keep in sync with frontend/src/utils/urlBrandingGate.js
+ */
+const AFFILIATE_TRACKING_HOST_EXACT = new Set([
+  // ClickBank
+  'hop.clickbank.net',
+  // CJ / Conversant classic tracking domains
+  'anrdoezrs.net',
+  'tkqlhce.com',
+  'jdoqocy.com',
+  'dpbolvw.net',
+  'syocnh.net',
+  'emjcd.com',
+  // Rakuten Advertising / LinkShare
+  'click.linksynergy.com',
+  'linksynergy.com',
+  // Awin
+  'awin1.com',
+  'aw.click',
+  // ShareASale
+  'shareasale.com',
+  // JVZoo / WarriorPlus style marketplaces (affiliate checkout URLs)
+  'jvzoo.com',
+  'warriorplus.com',
+  // Impact
+  'sjv.io',
+  'ojrq.net',
+  // PartnerStack
+  'prf.hn',
+  // Pepperjam / partner tracking
+  'pjtra.com',
+  // Skimlinks
+  'go.skimresources.com',
+  'redirect.skimresources.com',
+  // FlexOffers
+  'track.flexlinks.com',
+  'track.flexlinkspro.com',
+  // Refersion
+  'rfer.us',
+]);
+
+function isAffiliateTrackingRedirectHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (AFFILIATE_TRACKING_HOST_EXACT.has(h)) return true;
+  if (h.endsWith('.hop.clickbank.net')) return true;
+  if (h.endsWith('.sjv.io')) return true;
+  if (h.endsWith('.ojrq.net')) return true;
+  if (h.endsWith('.linksynergy.com')) return true;
+  if (h.endsWith('.awin1.com')) return true;
+  if (h.endsWith('.aw.click')) return true;
+  if (h.endsWith('.pxf.io')) return true; // e.g. ct.pxf.io, go.pxf.io
+  return false;
+}
+
 function isLikelyUrlShortenerHost(host) {
   const h = normalizeUrlHostname(host);
   if (!h) return false;
@@ -555,8 +611,8 @@ function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
       const fb = parts.length ? `youtube.com/${parts[0]}` : 'youtube.com';
       return fb.slice(0, maxLen);
     }
-    // Short links: keep host + path so it's not just "bit.ly".
-    if (isLikelyUrlShortenerHost(host)) {
+    // Short / tracking links: keep host + path so it's not just "bit.ly" or a bare hop subdomain.
+    if (isLikelyUrlShortenerHost(host) || isAffiliateTrackingRedirectHost(host)) {
       path = parts.length ? `/${parts.join('/')}` : '';
       if (!path || path === '/') return host.slice(0, maxLen);
       return `${host}${path}`.slice(0, maxLen);
@@ -582,7 +638,7 @@ function deriveKeywordFromArticleUrl(urlString) {
   try {
     const u = new URL(String(urlString || '').trim());
     const host = normalizeUrlHostname(u.hostname);
-    if (isLikelyUrlShortenerHost(host)) return '';
+    if (isLikelyUrlShortenerHost(host) || isAffiliateTrackingRedirectHost(host)) return '';
 
     let parts = pathSegmentsStripTracking((u.pathname || '').split('/').filter(Boolean));
     if (parts.length === 0) return '';
@@ -787,6 +843,15 @@ function assessUrlBrandingGate(urlString) {
         brandingGateReason: 'youtube',
         brandingGateMessage:
           'This looks like a YouTube link. Pins should show your brand or CTA in the footer, not YouTube. Before generating, open Pin look & brand and add your brand name or CTA (e.g. your site name).',
+      };
+    }
+
+    if (isAffiliateTrackingRedirectHost(host)) {
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: 'affiliate_tracking',
+        brandingGateMessage:
+          'This looks like an affiliate or network tracking link (not your own site). Pins should show your brand or CTA in the footer, not the tracking URL. Before generating, open Pin look & brand and add your brand name or CTA.',
       };
     }
 
