@@ -130,6 +130,20 @@ function resolveUserPhotoPinLimitForPlan(sub) {
   return PLAN_USER_PHOTO_PIN_LIMITS[planType] || PLAN_USER_PHOTO_PIN_LIMITS.free;
 }
 
+function pickAmazonContextUrl(inputUrl, canonicalUrl) {
+  const rawInput = String(inputUrl || '').trim();
+  const rawCanon = String(canonicalUrl || '').trim();
+  try {
+    if (rawCanon) {
+      const cu = new URL(rawCanon);
+      if (isAmazonRelatedHost(cu.hostname)) return rawCanon;
+    }
+  } catch {
+    // ignore
+  }
+  return rawInput;
+}
+
 /**
  * @param {string} userId
  * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas, positive consume, negative refund
@@ -2977,21 +2991,22 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const topic = base.title || 'Does Brown Sugar Expire?';
 
     let amazonNanoImageInputs = [];
+    const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       !useTextBased &&
       !useUserComposite &&
       process.env.USE_DUMMY_IMAGES !== 'true' &&
-      isAmazonProductPageForNanoReference(url)
+      isAmazonProductPageForNanoReference(amazonCtxUrl)
     ) {
       try {
-        const azHtml = await fetchArticleHtml(url);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, url);
+        const azHtml = await fetchArticleHtml(amazonCtxUrl);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
         if (candidates.length > 0) {
           amazonNanoImageInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
           if (amazonNanoImageInputs.length > 0) {
             console.log(
-              `urltopin: Nano Banana Amazon reference images: ${amazonNanoImageInputs.length} (${String(url).slice(0, 96)})`
+              `urltopin: Nano Banana Amazon reference images: ${amazonNanoImageInputs.length} (${String(amazonCtxUrl).slice(0, 96)})`
             );
           }
         }
@@ -3264,7 +3279,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       if (useTextBased) {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
       } else {
-        imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, url);
+        imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
         if (amazonNanoImageInputs.length > 0) {
           imagePrompt +=
             ' ' +
@@ -3713,13 +3728,14 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     const topic = base.title || 'Does Brown Sugar Expire?';
 
     let regenAmazonNanoInputs = [];
+    const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
-      isAmazonProductPageForNanoReference(url)
+      isAmazonProductPageForNanoReference(amazonCtxUrl)
     ) {
       try {
-        const azHtml = await fetchArticleHtml(url);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, url);
+        const azHtml = await fetchArticleHtml(amazonCtxUrl);
+        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
         if (candidates.length > 0) {
           regenAmazonNanoInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
         }
@@ -3742,7 +3758,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       overlayText: overlayForRender,
       brand,
     });
-    imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, url);
+    imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
 
     const trimmedUserImg = userImageUrl && String(userImageUrl).trim();
     if (trimmedUserImg && isAllowedUserImageUrl(trimmedUserImg, process.env.SUPABASE_URL)) {
