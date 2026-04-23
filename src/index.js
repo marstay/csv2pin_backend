@@ -646,9 +646,20 @@ function shortenAmazonListingTitleForPins(rawTitle) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!t) return t;
-  t = t.replace(/^Amazon(\.[a-z.]+)?\s*:\s*/i, '');
-  t = t.replace(/\s*:\s*[A-Za-z0-9,&'’\- ]{3,100}\s*$/i, '').trim();
-  const SOFT_MAX = 74;
+  // Common Amazon patterns:
+  // - "Amazon.co.uk: Foo Bar"
+  // - "Foo Bar : Amazon.co.uk: Home & Kitchen"
+  // - "Foo Bar | Amazon.co.uk"
+  t = t.replace(/^Amazon(\.[a-z.]+)?\s*:\s*/i, '').trim();
+  t = t.replace(/\s*(?:\||:|–|-)\s*Amazon\.[a-z.]+(?:\s*:\s*[^|]{0,120})?\s*$/i, '').trim();
+  // Remove trailing category breadcrumbs like ": Home & Kitchen" (often chained).
+  for (let i = 0; i < 3; i++) {
+    const next = t.replace(/\s*:\s*[A-Za-z0-9,&'’\- ]{3,100}\s*$/i, '').trim();
+    if (next === t) break;
+    t = next;
+  }
+  // Keep this tight because Amazon titles often get rendered as small text on the pin.
+  const SOFT_MAX = 58;
   const firstComma = t.indexOf(',');
   if (firstComma !== -1 && firstComma >= 18 && firstComma <= SOFT_MAX + 18) {
     const head = t.slice(0, firstComma).trim();
