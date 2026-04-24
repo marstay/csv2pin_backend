@@ -513,6 +513,8 @@ function isYouTubeHost(host) {
 function isEtsyHost(host) {
   const h = normalizeUrlHostname(host);
   if (!h) return false;
+  // etsy.me short links (user-pasted URL before/without redirect metadata)
+  if (h === 'etsy.me') return true;
   return h === 'etsy.com' || h.endsWith('.etsy.com');
 }
 
@@ -723,6 +725,75 @@ function appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, urlString) {
 }
 
 /**
+ * Pinterest-friendly max width for scraped listing titles (topic + fallbacks).
+ * @param {string} t
+ * @param {number} [softMax]
+ */
+function truncateListingTitleForPins(t, softMax = 58) {
+  const s = String(t || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!s) return s;
+  const firstComma = s.indexOf(',');
+  if (firstComma !== -1 && firstComma >= 18 && firstComma <= softMax + 18) {
+    const head = s.slice(0, firstComma).trim();
+    if (head.length >= 18) return head;
+  }
+  if (s.length <= softMax) return s;
+  const slice = s.slice(0, softMax + 1);
+  const lastSpace = slice.lastIndexOf(' ');
+  const cut = lastSpace > 32 ? slice.slice(0, lastSpace).trim() : slice.slice(0, softMax).trim();
+  return `${cut}…`;
+}
+
+function isShopifyMyshopifyHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h.endsWith('.myshopify.com') || h === 'myshopify.com';
+}
+
+/**
+ * Etsy, Shopify-style URLs, or obvious stacked SEO product titles — shorten so topic / image fallbacks stay readable.
+ */
+function shouldApplyGenericShopTitleSafety(pageHostname, pagePath, canonicalHostname, title) {
+  const h = normalizeUrlHostname(pageHostname);
+  const ch = normalizeUrlHostname(canonicalHostname || '');
+  const path = String(pagePath || '');
+  const t = String(title || '');
+  if (isEtsyHost(h) || isEtsyHost(ch)) return true;
+  if (isShopifyMyshopifyHost(h) || isShopifyMyshopifyHost(ch)) return true;
+  if (/\/products\//.test(path)) return true;
+  const pipes = (t.match(/\|/g) || []).length;
+  if (t.length >= 92 && pipes >= 2) return true;
+  if (t.length >= 118) return true;
+  return false;
+}
+
+/**
+ * Non-Amazon ecommerce / long SEO listing titles: strip marketplace suffixes, prefer first pipe segment, then truncate.
+ */
+function shortenGenericShopListingTitleForPins(rawTitle) {
+  let t = String(rawTitle || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return t;
+  t = t.replace(/\s*[\|–—]\s*Etsy[^|]*$/i, '').trim();
+  t = t.replace(/\s+on\s+Etsy\s*$/i, '').trim();
+  const pipeParts = t
+    .split('|')
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (pipeParts.length >= 3 && t.length >= 70) {
+    const first = pipeParts[0];
+    if (first.length >= 12) t = first;
+  } else if (pipeParts.length === 2 && t.length >= 85) {
+    const first = pipeParts[0];
+    if (first.length >= 18) t = first;
+  }
+  return truncateListingTitleForPins(t, 58);
+}
+
+/**
  * Amazon listing titles are long SEO strings; shorten for pin topic / UI (still descriptive).
  */
 function shortenAmazonListingTitleForPins(rawTitle) {
@@ -742,18 +813,7 @@ function shortenAmazonListingTitleForPins(rawTitle) {
     if (next === t) break;
     t = next;
   }
-  // Keep this tight because Amazon titles often get rendered as small text on the pin.
-  const SOFT_MAX = 58;
-  const firstComma = t.indexOf(',');
-  if (firstComma !== -1 && firstComma >= 18 && firstComma <= SOFT_MAX + 18) {
-    const head = t.slice(0, firstComma).trim();
-    if (head.length >= 18) return head;
-  }
-  if (t.length <= SOFT_MAX) return t;
-  const slice = t.slice(0, SOFT_MAX + 1);
-  const lastSpace = slice.lastIndexOf(' ');
-  const cut = lastSpace > 32 ? slice.slice(0, lastSpace).trim() : slice.slice(0, SOFT_MAX).trim();
-  return `${cut}…`;
+  return truncateListingTitleForPins(t, 58);
 }
 
 /**
@@ -809,27 +869,91 @@ async function shortenAmazonListingTitleWithAi(rawTitle, openaiClient) {
   }
 }
 
-async function maybeShortenAmazonPageTitle(urlString, title, openaiClient, canonicalUrl = '') {
+/**
+ * Etsy / Shopify / stacked SEO titles — optional AI rewrite (see URLTOPIN_SHOP_TITLE_AI).
+ */
+async function shortenGenericShopListingTitleWithAi(rawTitle, openaiClient) {
+  const fallback = shortenGenericShopListingTitleForPins(rawTitle);
+  if (
+    process.env.URLTOPIN_SHOP_TITLE_AI === '0' ||
+    !process.env.OPENAI_API_KEY ||
+    !openaiClient
+  ) {
+    return fallback;
+  }
+  const cleaned = String(rawTitle || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return fallback;
+  if (cleaned.length <= 52) {
+    return shortenGenericShopListingTitleForPins(rawTitle);
+  }
+  try {
+    const model = process.env.URLTOPIN_SHOP_TITLE_MODEL || process.env.URLTOPIN_AMAZON_TITLE_MODEL || 'gpt-4o-mini';
+    const completion = await openaiClient.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: 'user',
+          content:
+            'Rewrite this ecommerce product or shop listing title as ONE short line for a Pinterest pin.\n' +
+            'Rules: max 58 characters; name the product clearly; keep one concrete detail (size, material, color, or key use); no ALL CAPS; no quotation marks; no marketplace name (Etsy, Shopify, Amazon); no "Buy" or price; no ellipsis; output only the line, nothing else.\n\n' +
+            `Title:\n${cleaned.slice(0, 480)}`,
+        },
+      ],
+      max_tokens: 100,
+      temperature: 0.35,
+    });
+    let out = (completion.choices[0]?.message?.content || '')
+      .trim()
+      .replace(/^["'«»]+|["'«»]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!out) return fallback;
+    if (out.length > 65) {
+      out = out.slice(0, 65);
+      const sp = out.lastIndexOf(' ');
+      if (sp > 35) out = out.slice(0, sp);
+      out = out.trim();
+    }
+    if (out.length < 10) return fallback;
+    return out;
+  } catch (e) {
+    console.warn('shortenGenericShopListingTitleWithAi:', e.message || e);
+    return fallback;
+  }
+}
+
+/**
+ * Shorten long marketplace / product listing titles for `topic` (Amazon, Etsy, Shopify, /products/ URLs, stacked SEO).
+ */
+async function maybeShortenPageTitleForUrlToPin(urlString, title, openaiClient, canonicalUrl = '') {
   try {
     if (!title || !urlString) return title;
-    // IMPORTANT: users often paste short links (geni.us, amzn.to, etc.) that 302 to Amazon.
-    // In those cases, urlString is not an Amazon host, but the extracted <title>/og:title is.
     const looksLikeAmazonTitle = /(?:^|\s)(?:Amazon)\.[a-z.]+/i.test(String(title));
     const u = new URL(String(urlString).trim());
     let canonicalHostIsAmazon = false;
+    let canonicalHostname = '';
     try {
       if (canonicalUrl) {
         const cu = new URL(String(canonicalUrl).trim());
+        canonicalHostname = cu.hostname;
         canonicalHostIsAmazon = isAmazonRelatedHost(cu.hostname);
       }
     } catch {
       canonicalHostIsAmazon = false;
     }
 
-    if (!looksLikeAmazonTitle && !canonicalHostIsAmazon && !isAmazonRelatedHost(u.hostname)) return title;
-    return await shortenAmazonListingTitleWithAi(title, openaiClient);
+    const isAmazon =
+      looksLikeAmazonTitle || canonicalHostIsAmazon || isAmazonRelatedHost(u.hostname);
+    if (isAmazon) {
+      return await shortenAmazonListingTitleWithAi(title, openaiClient);
+    }
+
+    if (shouldApplyGenericShopTitleSafety(u.hostname, u.pathname || '', canonicalHostname, title)) {
+      return await shortenGenericShopListingTitleWithAi(title, openaiClient);
+    }
+    return title;
   } catch {
-    return shortenAmazonListingTitleForPins(title);
+    return shortenGenericShopListingTitleForPins(title);
   }
 }
 
@@ -1249,6 +1373,240 @@ async function mirrorAmazonImageUrlsForNanoBanana(sourceUrls, userId) {
   return out;
 }
 
+const PAGE_REF_MIN_SCORE = 30;
+const PAGE_REF_MAX_CANDIDATES = 14;
+
+function resolveUrlAgainstPage(pageUrlString, href) {
+  if (!href || typeof href !== 'string') return null;
+  let s = href.trim();
+  if (!s || s.startsWith('data:') || s.startsWith('blob:')) return null;
+  if (s.startsWith('//')) s = `https:${s}`;
+  try {
+    if (/^https?:\/\//i.test(s)) return new URL(s).href;
+    const base = String(pageUrlString || '').trim();
+    if (!base) return null;
+    const b = /^https?:\/\//i.test(base) ? base : `https://${base}`;
+    return new URL(s, b).href;
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedGenericReferenceImageUrl(href) {
+  try {
+    const u = new URL(String(href || '').trim());
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    const path = (u.pathname || '').toLowerCase();
+    if (/\.(svg)(\?|$)/i.test(path)) return false;
+    const bad =
+      /(icon|logo|favicon|sprite|pixel|tracking|spacer|badge|button|emoji|avatar|gravatar)/i.test(path);
+    if (bad) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function scoreGenericImageCandidate(urlStr, meta) {
+  let s = meta.baseScore || 0;
+  try {
+    const u = new URL(urlStr);
+    const path = (u.pathname || '').toLowerCase();
+    if (/(thumb|thumbnail|small|mini|tiny|\b50x50\b|\b100x100\b)/i.test(path)) s -= 35;
+    const w = meta.width || 0;
+    const h = meta.height || 0;
+    if (w > 0 && h > 0) {
+      const px = w * h;
+      if (px >= 800 * 800) s += 55;
+      else if (px >= 500 * 500) s += 40;
+      else if (px >= 320 * 320) s += 22;
+      else if (px < 120 * 120) s -= 40;
+    }
+  } catch {
+    /* ignore */
+  }
+  return s;
+}
+
+function pushGenericCandidate(bucket, href, pageUrl, meta) {
+  const abs = resolveUrlAgainstPage(pageUrl, href);
+  if (!abs || !isAllowedGenericReferenceImageUrl(abs)) return;
+  const score = scoreGenericImageCandidate(abs, meta);
+  bucket.push({ url: abs, score });
+}
+
+function parseSrcsetLargestUrl(srcsetRaw, pageUrl) {
+  if (!srcsetRaw || typeof srcsetRaw !== 'string') return null;
+  const parts = srcsetRaw.split(',').map((p) => p.trim()).filter(Boolean);
+  let bestUrl = null;
+  let bestW = -1;
+  for (const p of parts) {
+    const segs = p.split(/\s+/);
+    const rawU = segs[0];
+    let w = 0;
+    for (let i = 1; i < segs.length; i++) {
+      const m = segs[i].match(/^(\d+)w$/i);
+      if (m) w = Math.max(w, parseInt(m[1], 10));
+    }
+    const abs = resolveUrlAgainstPage(pageUrl, rawU);
+    if (!abs) continue;
+    if (w > bestW) {
+      bestW = w;
+      bestUrl = abs;
+    } else if (bestW <= 0 && !bestUrl) {
+      bestUrl = abs;
+    }
+  }
+  return bestUrl;
+}
+
+function collectLdJsonContentImages(node, pageUrl, bucket) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    node.forEach((x) => collectLdJsonContentImages(x, pageUrl, bucket));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  if (node['@graph']) {
+    collectLdJsonContentImages(node['@graph'], pageUrl, bucket);
+  }
+  const typesRaw = node['@type'];
+  const types = Array.isArray(typesRaw)
+    ? typesRaw.map((t) => String(t).toLowerCase())
+    : typesRaw
+      ? [String(typesRaw).toLowerCase()]
+      : [];
+  const wantsImage = types.some((t) =>
+    /(article|blogposting|newsarticle|recipe|product|webpage)/i.test(t)
+  );
+  if (wantsImage && node.image != null) {
+    const imgs = Array.isArray(node.image) ? node.image : [node.image];
+    for (const im of imgs) {
+      if (typeof im === 'string') {
+        pushGenericCandidate(bucket, im, pageUrl, { baseScore: 38 });
+      } else if (im && typeof im === 'object') {
+        if (im.url) pushGenericCandidate(bucket, im.url, pageUrl, { baseScore: 38 });
+        if (Array.isArray(im['@list'])) collectLdJsonContentImages(im['@list'], pageUrl, bucket);
+      }
+    }
+  }
+  for (const key of Object.keys(node)) {
+    if (key === '@context' || key === '@type' || key === '@id' || key === '@graph') continue;
+    collectLdJsonContentImages(node[key], pageUrl, bucket);
+  }
+}
+
+/**
+ * Best-effort harvest of hero/content images from arbitrary pages (blogs, shops, etc.).
+ * Returns absolute URLs sorted by score (higher first).
+ */
+function extractGenericPageImageUrlsFromHtml(html, pageUrl = '') {
+  if (!html || typeof html !== 'string' || !pageUrl) return [];
+  const bucket = [];
+  let m;
+
+  const ogRe = /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while ((m = ogRe.exec(html)) !== null) {
+    pushGenericCandidate(bucket, m[1], pageUrl, { baseScore: 42 });
+  }
+  const ogReAlt = /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["'][^>]*>/gi;
+  while ((m = ogReAlt.exec(html)) !== null) {
+    pushGenericCandidate(bucket, m[1], pageUrl, { baseScore: 42 });
+  }
+  const twRe = /<meta[^>]+name=["']twitter:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while ((m = twRe.exec(html)) !== null) {
+    pushGenericCandidate(bucket, m[1], pageUrl, { baseScore: 40 });
+  }
+
+  const scriptRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  while ((m = scriptRe.exec(html)) !== null) {
+    try {
+      const jsonText = m[1].trim();
+      if (!jsonText) continue;
+      collectLdJsonContentImages(JSON.parse(jsonText), pageUrl, bucket);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const imgRe = /<img\b[^>]*>/gi;
+  while ((m = imgRe.exec(html)) !== null) {
+    const tag = m[0];
+    const srcM = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(tag);
+    const srcsetM = /\bsrcset\s*=\s*["']([^"']+)["']/i.exec(tag);
+    const wM = /\bwidth\s*=\s*["']?(\d+)/i.exec(tag);
+    const hM = /\bheight\s*=\s*["']?(\d+)/i.exec(tag);
+    const width = wM ? parseInt(wM[1], 10) : 0;
+    const height = hM ? parseInt(hM[1], 10) : 0;
+    const fromSet = srcsetM ? parseSrcsetLargestUrl(srcsetM[1], pageUrl) : null;
+    if (fromSet) {
+      pushGenericCandidate(bucket, fromSet, pageUrl, { baseScore: 12, width, height });
+    } else if (srcM) {
+      pushGenericCandidate(bucket, srcM[1], pageUrl, { baseScore: 8, width, height });
+    }
+  }
+
+  const byUrl = new Map();
+  for (const c of bucket) {
+    const prev = byUrl.get(c.url);
+    if (!prev || c.score > prev) byUrl.set(c.url, c.score);
+  }
+  return [...byUrl.entries()]
+    .map(([url, score]) => ({ url, score }))
+    .filter((x) => x.score >= PAGE_REF_MIN_SCORE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, PAGE_REF_MAX_CANDIDATES)
+    .map((x) => x.url);
+}
+
+async function mirrorGenericPageImageUrlsForNanoBanana(sourceUrls, userId) {
+  if (!supabaseAdmin || !userId || !Array.isArray(sourceUrls) || sourceUrls.length === 0) {
+    return [];
+  }
+  const out = [];
+  for (let i = 0; i < sourceUrls.length && out.length < AMAZON_NANO_MAX_REFERENCE_IMAGES; i++) {
+    const src = sourceUrls[i];
+    if (!src || !isAllowedGenericReferenceImageUrl(src)) continue;
+    try {
+      let referer = '';
+      try {
+        referer = `${new URL(src).origin}/`;
+      } catch {
+        referer = '';
+      }
+      const res = await fetchWithTimeout(
+        src,
+        {
+          headers: {
+            ...URL_SCRAPE_HEADERS,
+            Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            ...(referer ? { Referer: referer } : {}),
+          },
+        },
+        20000
+      );
+      if (!res.ok) continue;
+      const ct = (res.headers.get('content-type') || '').split(';')[0].trim();
+      if (!ct.startsWith('image/')) continue;
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > MAX_AMAZON_REF_IMAGE_BYTES || ab.byteLength < 1500) continue;
+      const buf = Buffer.from(ab);
+      const ext = ct.includes('png') ? 'png' : ct.includes('webp') ? 'webp' : 'jpg';
+      const fileName = `page-ref-${userId}-${Date.now()}-${i}.${ext}`;
+      const { error: uploadError } = await supabaseAdmin.storage.from('ai-images').upload(fileName, buf, {
+        contentType: ct || 'image/jpeg',
+        upsert: true,
+      });
+      if (uploadError) continue;
+      const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+      if (publicUrlData?.publicUrl) out.push(publicUrlData.publicUrl);
+    } catch (e) {
+      console.warn('mirrorGenericPageImageUrlsForNanoBanana:', e.message || e);
+    }
+  }
+  return out;
+}
+
 function extractMetaFromHtml(html, url) {
   let title = '';
   let description = '';
@@ -1395,7 +1753,7 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   base.keyword = derivedKw;
   Object.assign(base, assessUrlBrandingGate(url));
   if (base.title) {
-    base.title = await maybeShortenAmazonPageTitle(url, base.title, openai, base.canonicalUrl);
+    base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
   }
 
   // Very lightweight body text extraction from HTML
@@ -2948,7 +3306,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     }
     const meta = extractMetaFromHtml(html, url);
     if (meta.title) {
-      meta.title = await maybeShortenAmazonPageTitle(url, meta.title, openai, meta.canonicalUrl);
+      meta.title = await maybeShortenPageTitleForUrlToPin(url, meta.title, openai, meta.canonicalUrl);
     }
     const brandingGate = assessUrlBrandingGate(url);
     if (enrich) {
@@ -3000,7 +3358,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       strategicSingle,
       imageSource = 'ai',
       userImageUrls: rawUserImageUrls,
+      usePageReferenceImages: rawUsePageReferenceImages,
     } = req.body || {};
+    const usePageReferenceImages = rawUsePageReferenceImages === true;
     let userImageUrls = rawUserImageUrls;
     if (typeof userImageUrls === 'string' && userImageUrls.trim()) {
       userImageUrls = [userImageUrls.trim()];
@@ -3091,8 +3451,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
-    let amazonNanoImageInputs = [];
+    let nanoBananaReferenceInputs = [];
+    let nanoBananaReferenceSource = null;
     const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
+    const refHtmlUrl = amazonCtxUrl || url;
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       !useTextBased &&
@@ -3104,19 +3466,44 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         const azHtml = await fetchArticleHtml(amazonCtxUrl);
         const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
         if (candidates.length > 0) {
-          amazonNanoImageInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
-          if (amazonNanoImageInputs.length > 0) {
+          nanoBananaReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+          if (nanoBananaReferenceInputs.length > 0) {
+            nanoBananaReferenceSource = 'amazon_product';
             console.log(
-              `urltopin: Nano Banana Amazon reference images: ${amazonNanoImageInputs.length} (${String(amazonCtxUrl).slice(0, 96)})`
+              `urltopin: Nano Banana Amazon reference images: ${nanoBananaReferenceInputs.length} (${String(amazonCtxUrl).slice(0, 96)})`
             );
           }
         }
       } catch (e) {
         console.warn('urltopin Amazon product images for Nano:', e.message || e);
       }
+    } else if (
+      usePageReferenceImages &&
+      process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0' &&
+      !useTextBased &&
+      !useUserComposite &&
+      process.env.USE_DUMMY_IMAGES !== 'true'
+    ) {
+      try {
+        const pageHtml = await fetchArticleHtml(refHtmlUrl);
+        if (pageHtml && pageHtml.length > 200) {
+          const candidates = extractGenericPageImageUrlsFromHtml(pageHtml, refHtmlUrl);
+          if (candidates.length > 0) {
+            nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(candidates, req.user.id);
+            if (nanoBananaReferenceInputs.length > 0) {
+              nanoBananaReferenceSource = 'page';
+              console.log(
+                `urltopin: Nano Banana page reference images: ${nanoBananaReferenceInputs.length} (${String(refHtmlUrl).slice(0, 96)})`
+              );
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('urltopin page reference images for Nano:', e.message || e);
+      }
     }
 
-    if (amazonNanoImageInputs.length > 0) {
+    if (nanoBananaReferenceInputs.length > 0) {
       const remapped = remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, req._strategicPlan || null);
       effectiveStyles = remapped.styles;
       if (remapped.plan) req._strategicPlan = remapped.plan;
@@ -3381,13 +3768,22 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
       } else {
         imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
-        if (amazonNanoImageInputs.length > 0) {
-          imagePrompt +=
-            ' ' +
-            promptTier(
-              'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
-              'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-            );
+        if (nanoBananaReferenceInputs.length > 0) {
+          if (nanoBananaReferenceSource === 'amazon_product') {
+            imagePrompt +=
+              ' ' +
+              promptTier(
+                'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
+                'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+              );
+          } else {
+            imagePrompt +=
+              ' ' +
+              promptTier(
+                'Attached reference image(s) come from the source page (hero or content photos). Use them as the primary visual subject when helpful: preserve recognizable subjects, colors, and composition; do not paste URL text or watermarks as new text. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+                'Reference: prefer attached page photos as the hero when they are strong; keep headline/sub/footer as specified.',
+              );
+          }
         }
       }
 
@@ -3471,7 +3867,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       } else if (!useUserComposite) {
         try {
-          const nanoOpts = amazonNanoImageInputs.length ? { imageInput: amazonNanoImageInputs } : {};
+          const nanoOpts = nanoBananaReferenceInputs.length ? { imageInput: nanoBananaReferenceInputs } : {};
           const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts);
           imageUrl = nanoUrl || '';
           if (!imageUrl) {
@@ -3566,10 +3962,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           !useUserComposite &&
           !useTextBased && {
             imageGenerationMode: 'ai',
-            ...(amazonNanoImageInputs.length > 0 && {
-              nanoBananaReferenceCount: amazonNanoImageInputs.length,
-              nanoBananaReferenceSource: 'amazon_product',
-            }),
+            ...(nanoBananaReferenceInputs.length > 0 &&
+              nanoBananaReferenceSource && {
+                nanoBananaReferenceCount: nanoBananaReferenceInputs.length,
+                nanoBananaReferenceSource,
+              }),
           }),
         ...((isStrategic || isStrategicSingle) && metaExtra.strategy && {
           strategy: metaExtra.strategy,
@@ -3701,7 +4098,7 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
     if (base.title) {
-      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai, base.canonicalUrl);
+      base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
     }
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
@@ -3755,7 +4152,9 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       variationSeed: rawVariationSeed,
       imageGenerationMode,
       textBased: rawTextBased,
+      usePageReferenceImages: rawUsePageReferenceImages,
     } = req.body || {};
+    const usePageReferenceImages = rawUsePageReferenceImages === true;
     if (!url || !styleId || !overlayText) {
       return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
     }
@@ -3820,7 +4219,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
     if (base.title) {
-      base.title = await maybeShortenAmazonPageTitle(url, base.title, openai, base.canonicalUrl);
+      base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
     }
     const year = new Date().getFullYear();
     const domain =
@@ -3828,8 +4227,10 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     const keyword = base.keyword || '';
     const topic = base.title || 'Does Brown Sugar Expire?';
 
-    let regenAmazonNanoInputs = [];
+    let regenNanoReferenceInputs = [];
+    let regenNanoReferenceSource = null;
     const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
+    const refHtmlUrl = amazonCtxUrl || url;
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       isAmazonProductPageForNanoReference(amazonCtxUrl)
@@ -3838,16 +4239,33 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
         const azHtml = await fetchArticleHtml(amazonCtxUrl);
         const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
         if (candidates.length > 0) {
-          regenAmazonNanoInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+          regenNanoReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+          if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'amazon_product';
         }
       } catch (e) {
         console.warn('urltopin regenerate Amazon refs:', e.message || e);
+      }
+    } else if (
+      usePageReferenceImages &&
+      process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0'
+    ) {
+      try {
+        const pageHtml = await fetchArticleHtml(refHtmlUrl);
+        if (pageHtml && pageHtml.length > 200) {
+          const candidates = extractGenericPageImageUrlsFromHtml(pageHtml, refHtmlUrl);
+          if (candidates.length > 0) {
+            regenNanoReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(candidates, req.user.id);
+            if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'page';
+          }
+        }
+      } catch (e) {
+        console.warn('urltopin regenerate page refs:', e.message || e);
       }
     }
 
     const nanoStyleId = replaceInfographicStyleIdForAmazonNanoRefs(
       styleId,
-      regenAmazonNanoInputs.length > 0
+      regenNanoReferenceInputs.length > 0
     );
 
     let imagePrompt = buildOverlayImagePrompt({
@@ -3908,16 +4326,25 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     }
 
     let imagePromptForNano = imagePrompt;
-    if (regenAmazonNanoInputs.length > 0) {
-      imagePromptForNano +=
-        ' ' +
-        promptTier(
-          'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-          'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-        );
+    if (regenNanoReferenceInputs.length > 0) {
+      if (regenNanoReferenceSource === 'amazon_product') {
+        imagePromptForNano +=
+          ' ' +
+          promptTier(
+            'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+            'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+          );
+      } else {
+        imagePromptForNano +=
+          ' ' +
+          promptTier(
+            'Attached reference image(s) come from the source page (hero or content photos). Use them as the primary visual subject when helpful: preserve recognizable subjects, colors, and composition; do not paste URL text or watermarks as new text. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+            'Reference: prefer attached page photos as the hero when they are strong; keep headline/sub/footer as specified.',
+          );
+      }
     }
 
-    const regenNanoOpts = regenAmazonNanoInputs.length ? { imageInput: regenAmazonNanoInputs } : {};
+    const regenNanoOpts = regenNanoReferenceInputs.length ? { imageInput: regenNanoReferenceInputs } : {};
 
     let imageUrl = '';
     try {
@@ -3952,10 +4379,11 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       imageUrl,
       imagePrompt: imagePromptForNano,
       ...(nanoStyleId !== styleId && { layoutIdUsed: nanoStyleId }),
-      ...(regenAmazonNanoInputs.length > 0 && {
-        nanoBananaReferenceCount: regenAmazonNanoInputs.length,
-        nanoBananaReferenceSource: 'amazon_product',
-      }),
+      ...(regenNanoReferenceInputs.length > 0 &&
+        regenNanoReferenceSource && {
+          nanoBananaReferenceCount: regenNanoReferenceInputs.length,
+          nanoBananaReferenceSource: regenNanoReferenceSource,
+        }),
     });
   } catch (err) {
     console.error('urltopin regenerate-image-with-text error:', err);
