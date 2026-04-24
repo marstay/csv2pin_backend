@@ -445,6 +445,7 @@ const URL_SHORTENER_HOSTNAMES = new Set([
   'a.co',
   'amzn.to',
   'amzn.eu',
+  'etsy.me',
   'bit.ly',
   'bitly.com',
   'bitly.ws',
@@ -507,6 +508,18 @@ function isYouTubeHost(host) {
   if (h === 'youtube.com') return true;
   if (h.endsWith('.youtube.com')) return true; // m.youtube.com, music.youtube.com, etc.
   return false;
+}
+
+function isEtsyHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h === 'etsy.com' || h.endsWith('.etsy.com');
+}
+
+function isPrintifyHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h === 'printify.com' || h.endsWith('.printify.com') || h === 'printify.me' || h.endsWith('.printify.me');
 }
 
 /**
@@ -639,6 +652,7 @@ function deriveKeywordFromArticleUrl(urlString) {
     const u = new URL(String(urlString || '').trim());
     const host = normalizeUrlHostname(u.hostname);
     if (isLikelyUrlShortenerHost(host) || isAffiliateTrackingRedirectHost(host)) return '';
+    if (isEtsyHost(host) || isPrintifyHost(host)) return '';
 
     let parts = pathSegmentsStripTracking((u.pathname || '').split('/').filter(Boolean));
     if (parts.length === 0) return '';
@@ -852,6 +866,28 @@ function assessUrlBrandingGate(urlString) {
         brandingGateReason: 'affiliate_tracking',
         brandingGateMessage:
           'This looks like an affiliate or network tracking link (not your own site). Pins should show your brand or CTA in the footer, not the tracking URL. Before generating, open Pin look & brand and add your brand name or CTA.',
+      };
+    }
+
+    if (isEtsyHost(host)) {
+      // Etsy shop/product pages should not show Etsy as the footer; require creator brand/CTA.
+      const isShop = /^\/shop\/[^/]+/i.test(path);
+      const isListing = /^\/listing\/\d+/i.test(path);
+      const reason = isShop || isListing ? 'marketplace' : 'marketplace';
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: reason,
+        brandingGateMessage:
+          'This looks like an Etsy shop/product link. Pins should show your brand or CTA in the footer, not Etsy. Before generating, open Pin look & brand and add your brand name or CTA.',
+      };
+    }
+
+    if (isPrintifyHost(host)) {
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: 'print_on_demand',
+        brandingGateMessage:
+          'This looks like a Printify link (print-on-demand storefront). Pins should show your brand or CTA in the footer, not Printify. Before generating, open Pin look & brand and add your brand name or CTA.',
       };
     }
 
