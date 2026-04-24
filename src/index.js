@@ -5412,7 +5412,9 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
       `)
       .eq('user_id', user.id)
       .is('deleted_at', null)
-      .order('scheduled_for', { ascending: true, nullsFirst: true })
+      // Put generated pins (scheduled_for=null) after real scheduled pins,
+      // otherwise calendar view can fetch only null rows and appear empty.
+      .order('scheduled_for', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: false });
 
     if (status) {
