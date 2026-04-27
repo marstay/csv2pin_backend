@@ -448,6 +448,8 @@ const URL_SHORTENER_HOSTNAMES = new Set([
   'a.co',
   'amzn.to',
   'amzn.eu',
+  'netlify.app',
+  'netlify.com',
   'etsy.me',
   'bit.ly',
   'bitly.com',
@@ -587,6 +589,8 @@ function isLikelyUrlShortenerHost(host) {
   const h = normalizeUrlHostname(host);
   if (!h) return false;
   if (URL_SHORTENER_HOSTNAMES.has(h)) return true;
+  // Netlify deploy previews & custom subdomains behave like shorteners for identity/keywords.
+  if (h.endsWith('.netlify.app') || h.endsWith('.netlify.com')) return true;
   // Very short branded hosts on TLDs often used for redirects (e.g. a.co, x.co)
   if (/^[a-z0-9]{1,4}\.co$/i.test(h)) return true;
   if (/^[a-z0-9]{1,4}\.(me|io|ly)$/i.test(h)) return true;
@@ -703,7 +707,9 @@ function deriveKeywordFromArticleUrl(urlString) {
 
 function isAmazonRelatedHost(host) {
   const h = normalizeUrlHostname(host);
-  if (h === 'a.co' || h === 'amzn.to' || h === 'amzn.eu' || h === 'amzn.com') return true;
+  // Amazon short domains + regional amzn TLDs (amzn.asia, amzn.in, etc.)
+  if (h === 'a.co' || h.startsWith('amzn.')) return true;
+  if (h === 'amzn.to' || h.endsWith('.amzn.to')) return true;
   if (h.startsWith('amazon.')) return true;
   if (h.endsWith('.amazon.com')) return true;
   return false;
