@@ -3299,6 +3299,186 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
+// --- Public tools (SEO) ---
+
+const toolRateLimit = new Map();
+function getClientIp(req) {
+  const xf = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xf || req.socket?.remoteAddress || 'unknown';
+}
+
+function rateLimitTool(req, key, { windowMs = 60_000, max = 20 } = {}) {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const k = `${key}::${ip}`;
+  const prev = toolRateLimit.get(k) || { start: now, count: 0 };
+  const next = now - prev.start > windowMs ? { start: now, count: 0 } : prev;
+  next.count++;
+  toolRateLimit.set(k, next);
+  return next.count <= max;
+}
+
+function dedupeKeepOrder(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr || []) {
+    const s = String(x || '').trim();
+    if (!s) continue;
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
+
+function buildPinterestKeywordIdeas(seed, niche = '') {
+  const s = String(seed || '').trim().replace(/\s+/g, ' ');
+  const n = String(niche || '').trim().toLowerCase();
+  const base = s;
+  const year = new Date().getFullYear();
+  const modifiers = [
+    'ideas',
+    'tips',
+    'checklist',
+    'template',
+    'guide',
+    'for beginners',
+    'step by step',
+    'mistakes',
+    'vs',
+    'best',
+    'best {year}',
+    'how to',
+    'easy',
+    'quick',
+    'cheap',
+    'budget',
+  ];
+  const ecommerce = ['etsy', 'shopify', 'amazon', 'gift', 'under $50', 'small business'];
+  const food = ['meal prep', 'healthy', 'high protein', 'air fryer', 'dinner', 'snack'];
+  const travel = ['itinerary', 'budget', 'packing list', 'weekend', 'family', 'solo'];
+  const diy = ['diy', 'tutorial', 'before and after', 'ideas', 'beginner'];
+  const affiliate = ['review', 'best', 'comparison', 'under $100', 'worth it'];
+
+  const nicheMods =
+    n === 'food'
+      ? food
+      : n === 'travel'
+        ? travel
+        : n === 'diy'
+          ? diy
+          : n === 'affiliate'
+            ? affiliate
+            : n === 'ecommerce'
+              ? ecommerce
+              : [];
+
+  const replaceYear = (m) => m.replace(/\{year\}/g, String(year));
+  const primary = [];
+  for (const m of modifiers) {
+    primary.push(`${base} ${replaceYear(m)}`);
+  }
+  for (const m of nicheMods) {
+    primary.push(`${base} ${replaceYear(m)}`);
+  }
+
+  const questions = [
+    `how to ${base}`,
+    `why ${base} isn't working`,
+    `how many ${base}`,
+    `best time to post ${base}`,
+    `${base} strategy`,
+    `${base} checklist`,
+  ];
+
+  const longTail = [
+    `${base} for small accounts`,
+    `${base} without followers`,
+    `${base} seo`,
+    `${base} keywords`,
+    `${base} content plan`,
+  ];
+
+  return {
+    seed: base,
+    primary: dedupeKeepOrder(primary).slice(0, 40),
+    questions: dedupeKeepOrder(questions).slice(0, 20),
+    longTail: dedupeKeepOrder(longTail).slice(0, 25),
+  };
+}
+
+async function maybeAiExpandPinterestKeywords(seed, niche, openaiClient) {
+  if (process.env.PINTEREST_KEYWORD_TOOL_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) return null;
+  const s = String(seed || '').trim();
+  if (!s) return null;
+  try {
+    const year = new Date().getFullYear();
+    const completion = await openaiClient.chat.completions.create({
+      model: process.env.PINTEREST_KEYWORD_TOOL_MODEL || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Generate Pinterest keyword ideas for the seed phrase.\n` +
+            `Seed: ${s}\n` +
+            `${niche ? `Niche: ${String(niche)}\n` : ''}` +
+            `Year: ${year}\n\n` +
+            `Return JSON only with keys: primary, questions, longTail.\n` +
+            `Rules:\n` +
+            `- primary: 25-40 phrases, 2-6 words each, include intent modifiers (best, how to, ideas, checklist, template, for beginners).\n` +
+            `- questions: 10-15 phrases.\n` +
+            `- longTail: 15-25 phrases.\n` +
+            `- No hashtags.\n` +
+            `- No quotes.\n` +
+            `- No duplicates.\n`,
+        },
+      ],
+      max_tokens: 700,
+      temperature: 0.6,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const primary = dedupeKeepOrder(parsed.primary || []);
+    const questions = dedupeKeepOrder(parsed.questions || []);
+    const longTail = dedupeKeepOrder(parsed.longTail || []);
+    if (!primary.length) return null;
+    return {
+      primary: primary.slice(0, 50),
+      questions: questions.slice(0, 25),
+      longTail: longTail.slice(0, 35),
+    };
+  } catch (e) {
+    console.warn('maybeAiExpandPinterestKeywords:', e.message || e);
+    return null;
+  }
+}
+
+app.post('/api/tools/pinterest-keywords', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'pinterest-keywords', { windowMs: 60_000, max: 30 })) {
+      return res.status(429).json({ error: 'Too many requests. Please try again in a minute.' });
+    }
+    const { seed, niche } = req.body || {};
+    const s = String(seed || '').trim();
+    if (s.length < 2) return res.status(400).json({ error: 'Enter a keyword (at least 2 characters).' });
+    const base = buildPinterestKeywordIdeas(s, niche || '');
+    const ai = await maybeAiExpandPinterestKeywords(s, niche || '', openai);
+    const merged = {
+      seed: base.seed,
+      primary: dedupeKeepOrder([...(ai?.primary || []), ...base.primary]).slice(0, 60),
+      questions: dedupeKeepOrder([...(ai?.questions || []), ...base.questions]).slice(0, 30),
+      longTail: dedupeKeepOrder([...(ai?.longTail || []), ...base.longTail]).slice(0, 45),
+    };
+    return res.json({ ...merged, source: ai ? 'ai+heuristic' : 'heuristic' });
+  } catch (e) {
+    console.error('pinterest-keywords tool error:', e);
+    return res.status(500).json({ error: 'Failed to generate keyword ideas.' });
+  }
+});
+
 // --- URL → Pin helper endpoints ---
 
 app.post('/api/urltopin/scrape', async (req, res) => {
