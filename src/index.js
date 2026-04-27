@@ -59,6 +59,7 @@ function resolvePartnerDiscountCode(referralKey) {
 
 const PLAN_PIN_LIMITS = {
   free: 10,
+  starter: 60,
   creator: 150,
   pro: 450,
   agency: 1200,
@@ -67,6 +68,7 @@ const PLAN_PIN_LIMITS = {
 /** Monthly caps for “your photo + text overlay” pins (no image model). Separate from AI pin quota. */
 const PLAN_USER_PHOTO_PIN_LIMITS = {
   free: 40,
+  starter: 240,
   creator: 600,
   pro: 1800,
   agency: 4800,
@@ -74,6 +76,7 @@ const PLAN_USER_PHOTO_PIN_LIMITS = {
 
 const PLAN_METADATA_LIMITS = {
   free: 500,
+  starter: 2000,
   creator: 5000,
   pro: 20000,
   agency: 100000,
@@ -4849,6 +4852,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     // Map internal plan types to Dodo product IDs via environment variables
     const productMap = {
       free: process.env.DODO_PRODUCT_FREE_ID,
+      starter: process.env.DODO_PRODUCT_STARTER_ID,
       creator: process.env.DODO_PRODUCT_CREATOR_ID,
       pro: process.env.DODO_PRODUCT_PRO_ID,
       agency: process.env.DODO_PRODUCT_AGENCY_ID,
@@ -5385,7 +5389,7 @@ app.post('/api/pinterest/oauth', async (req, res) => {
         .select('id')
         .eq('user_id', user.id);
       const count = Array.isArray(existing) ? existing.length : 0;
-      const planLimits = { free: 1, creator: 3, pro: Infinity, agency: Infinity };
+      const planLimits = { free: 1, starter: 1, creator: 3, pro: Infinity, agency: Infinity };
       const limit = planLimits[planType] ?? 1;
       if (count >= limit) {
         return res.status(403).json({ error: `Plan limit reached. Your plan (${planType}) allows ${limit === Infinity ? 'unlimited' : limit} account(s).` });
