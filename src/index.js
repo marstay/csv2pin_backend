@@ -112,6 +112,36 @@ async function getActiveSubscriptionForUser(userId) {
   }
 }
 
+async function resolvePlanTypeForUser(userId) {
+  const sub = await getActiveSubscriptionForUser(userId);
+  if (sub?.plan_type) return sub.plan_type;
+  try {
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('plan_type')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) return 'free';
+    return profile?.plan_type || 'free';
+  } catch {
+    return 'free';
+  }
+}
+
+async function enforcePaidSchedulingOrThrow(res, userId) {
+  const planType = await resolvePlanTypeForUser(userId);
+  if (planType === 'free') {
+    res.status(402).json({
+      error: 'Upgrade required to schedule pins. You can still export/download pins on the Free plan.',
+      code: 'upgrade_required',
+      feature: 'scheduling',
+      planType,
+    });
+    return false;
+  }
+  return true;
+}
+
 // Serialize pin consumption per user so concurrent requests (e.g. 2+ styles in URL→Pin)
 // don't all read the same counters and only write one increment.
 const pinUsageLocks = new Map();
@@ -6161,6 +6191,8 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
 
+  if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
+
   const { image_url, title, description, board_id, link, account_id } = req.body;
   if (!image_url || !title || !description || !board_id) {
     return res.status(400).json({ error: 'Missing required fields.' });
@@ -6231,6 +6263,8 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   const token = authHeader.split(' ')[1];
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
 
   const { 
     image_url, title, description, board_id, link, account_id,
@@ -6696,6 +6730,11 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   } = req.body;
 
   try {
+    // If a free user attempts to schedule/unschedule via update, block scheduling-related updates.
+    if (scheduled_for || status === 'scheduled') {
+      if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
+    }
+
     // First check if pin exists and belongs to user (only active pins)
     const { data: existingPin, error: fetchError } = await supabaseAdmin
       .from('scheduled_pins')
@@ -6781,6 +6820,8 @@ app.post('/api/pinterest/scheduled-pins/:id/post-now', async (req, res) => {
   const token = authHeader.split(' ')[1];
   const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
   if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
 
   const { id } = req.params;
 
