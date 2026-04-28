@@ -3456,6 +3456,312 @@ async function maybeAiExpandPinterestKeywords(seed, niche, openaiClient) {
   }
 }
 
+function normalizeNicheLabel(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s&/+-]/gu, '');
+}
+
+function toHashtag(phrase) {
+  const p = String(phrase || '').trim();
+  if (!p) return '';
+  // Pinterest hashtags are typically no spaces. Keep letters/numbers only.
+  const compact = p
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/g)
+    .join('');
+  if (!compact) return '';
+  return `#${compact}`;
+}
+
+function buildPinterestHashtagIdeas(topic, niche = '') {
+  const t = String(topic || '').trim().replace(/\s+/g, ' ');
+  const n = normalizeNicheLabel(niche).toLowerCase();
+  const year = new Date().getFullYear();
+
+  const base = [
+    t,
+    `${t} ideas`,
+    `${t} tips`,
+    `${t} checklist`,
+    `${t} for beginners`,
+    `how to ${t}`,
+    `${t} {year}`,
+    `best ${t}`,
+    `${t} tutorial`,
+    `${t} guide`,
+    `${t} hacks`,
+  ].map((x) => String(x).replace(/\{year\}/g, String(year)));
+
+  const nicheBoost = n
+    ? [
+        `${n} tips`,
+        `${n} ideas`,
+        `${t} ${n}`,
+        `${t} for ${n}`,
+        `${n} inspiration`,
+      ]
+    : [];
+
+  const suggested = dedupeKeepOrder([...base, ...nicheBoost].map(toHashtag)).filter(Boolean);
+
+  // "Avoid" list is intentionally generic: overly broad, spammy, or irrelevant tags
+  const avoid = dedupeKeepOrder(
+    [
+      '#love',
+      '#instagood',
+      '#photooftheday',
+      '#beautiful',
+      '#happy',
+      '#cute',
+      '#tbt',
+      '#likeforlike',
+      '#followme',
+      '#viral',
+      '#trending',
+      '#fyp',
+    ].map((x) => String(x).toLowerCase())
+  );
+
+  return {
+    topic: t,
+    suggested: suggested.slice(0, 30),
+    avoid,
+  };
+}
+
+function buildPinterestBioIdeas(niche, offer = '') {
+  const n = normalizeNicheLabel(niche);
+  const o = normalizeNicheLabel(offer);
+  const keywords = dedupeKeepOrder(
+    [
+      n,
+      o,
+      `${n} tips`,
+      `${n} ideas`,
+      `${n} guide`,
+      `${n} for beginners`,
+      o ? `${o} tips` : '',
+    ].filter(Boolean)
+  ).slice(0, 12);
+
+  const offerBit = o ? ` • ${o}` : '';
+  const ctaLine = o ? `Grab the ${o} ↓` : 'Get new pin ideas ↓';
+
+  const bios = dedupeKeepOrder([
+    `${n} tips & ideas${offerBit}. ${ctaLine}`,
+    `Helping you grow with ${n}.${offerBit} New pins weekly. ${ctaLine}`,
+    `${n} made simple${offerBit}. Save this for later + follow for more.`,
+    `${n} content + Pinterest SEO${offerBit}. ${ctaLine}`,
+    `Practical ${n} for busy creators${offerBit}. ${ctaLine}`,
+  ]).slice(0, 5);
+
+  return { niche: n, offer: o, bios, ctaLine, keywords };
+}
+
+function buildPinterestBoardIdeas(niche, audience = '', offer = '') {
+  const n = normalizeNicheLabel(niche);
+  const a = normalizeNicheLabel(audience);
+  const o = normalizeNicheLabel(offer);
+
+  const baseBoards = [
+    `${n} Tips`,
+    `${n} Ideas`,
+    `${n} for Beginners`,
+    `Best ${n}`,
+    `${n} Checklist`,
+    `${n} Templates`,
+    `${n} Mistakes to Avoid`,
+    `${n} Before & After`,
+    `${n} Resources`,
+    `${n} Inspiration`,
+  ];
+
+  const audienceBoards = a
+    ? [
+        `${n} for ${a}`,
+        `${a} ${n} Ideas`,
+        `${n} for Busy ${a}`,
+      ]
+    : [];
+
+  const offerBoards = o
+    ? [
+        `${o}`,
+        `${o} Ideas`,
+        `${o} Checklist`,
+      ]
+    : [];
+
+  const names = dedupeKeepOrder([...baseBoards, ...audienceBoards, ...offerBoards]).slice(0, 16);
+
+  const boards = names.map((name) => {
+    const kw = dedupeKeepOrder([
+      n,
+      name.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim(),
+      a ? `${n} for ${a}` : '',
+      o ? o : '',
+      `${n} ideas`,
+      `${n} tips`,
+    ]).slice(0, 10);
+    const descBits = [
+      `Save ${n.toLowerCase()} ideas you can actually use.`,
+      a ? `Made for ${a.toLowerCase()}.` : '',
+      o ? `Includes ${o.toLowerCase()} and step-by-step pins.` : '',
+    ].filter(Boolean);
+    return {
+      name,
+      description: descBits.join(' '),
+      keywords: kw,
+    };
+  });
+
+  return { niche: n, audience: a, offer: o, boards };
+}
+
+async function maybeAiPinterestBio(niche, offer, openaiClient) {
+  if (process.env.PINTEREST_BIO_TOOL_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) return null;
+  const n = normalizeNicheLabel(niche);
+  if (!n) return null;
+  try {
+    const completion = await openaiClient.chat.completions.create({
+      model: process.env.PINTEREST_BIO_TOOL_MODEL || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Write 5 Pinterest bios for a creator.\n` +
+            `Niche: ${n}\n` +
+            `${offer ? `Offer: ${normalizeNicheLabel(offer)}\n` : ''}` +
+            `Return JSON only with keys: bios, ctaLine, keywords.\n` +
+            `Rules:\n` +
+            `- bios: exactly 5, each <= 140 characters.\n` +
+            `- No emojis.\n` +
+            `- ctaLine: short (<= 35 chars).\n` +
+            `- keywords: 8-12 short phrases, no hashtags.\n`,
+        },
+      ],
+      max_tokens: 420,
+      temperature: 0.7,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const bios = dedupeKeepOrder(parsed.bios || []).slice(0, 5);
+    if (bios.length < 3) return null;
+    return {
+      bios: bios.slice(0, 5),
+      ctaLine: String(parsed.ctaLine || '').trim(),
+      keywords: dedupeKeepOrder(parsed.keywords || []).slice(0, 15),
+    };
+  } catch (e) {
+    console.warn('maybeAiPinterestBio:', e.message || e);
+    return null;
+  }
+}
+
+async function maybeAiPinterestBoards(niche, audience, offer, openaiClient) {
+  if (process.env.PINTEREST_BOARD_TOOL_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) return null;
+  const n = normalizeNicheLabel(niche);
+  if (!n) return null;
+  try {
+    const completion = await openaiClient.chat.completions.create({
+      model: process.env.PINTEREST_BOARD_TOOL_MODEL || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Generate Pinterest board ideas.\n` +
+            `Niche: ${n}\n` +
+            `${audience ? `Audience: ${normalizeNicheLabel(audience)}\n` : ''}` +
+            `${offer ? `Offer: ${normalizeNicheLabel(offer)}\n` : ''}` +
+            `Return JSON only with key: boards (array).\n` +
+            `Each board must be an object: { name, description, keywords }.\n` +
+            `Rules:\n` +
+            `- boards: 10-14 items.\n` +
+            `- name: 2-6 words.\n` +
+            `- description: 1-2 short sentences.\n` +
+            `- keywords: 6-10 short phrases, no hashtags.\n` +
+            `- No duplicates.\n`,
+        },
+      ],
+      max_tokens: 800,
+      temperature: 0.7,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const boards = Array.isArray(parsed.boards) ? parsed.boards : [];
+    const cleaned = [];
+    const seen = new Set();
+    for (const b of boards) {
+      const name = String(b?.name || '').trim();
+      if (!name) continue;
+      const k = name.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      cleaned.push({
+        name,
+        description: String(b?.description || '').trim(),
+        keywords: dedupeKeepOrder(b?.keywords || []).slice(0, 12),
+      });
+    }
+    if (cleaned.length < 6) return null;
+    return { boards: cleaned.slice(0, 16) };
+  } catch (e) {
+    console.warn('maybeAiPinterestBoards:', e.message || e);
+    return null;
+  }
+}
+
+async function maybeAiPinterestHashtags(topic, niche, openaiClient) {
+  if (process.env.PINTEREST_HASHTAG_TOOL_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) return null;
+  const t = String(topic || '').trim();
+  if (t.length < 2) return null;
+  try {
+    const completion = await openaiClient.chat.completions.create({
+      model: process.env.PINTEREST_HASHTAG_TOOL_MODEL || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Generate Pinterest hashtags for the topic.\n` +
+            `Topic: ${t}\n` +
+            `${niche ? `Niche: ${normalizeNicheLabel(niche)}\n` : ''}` +
+            `Return JSON only with keys: suggested, avoid.\n` +
+            `Rules:\n` +
+            `- suggested: 20-30 hashtags, all starting with #, no spaces.\n` +
+            `- avoid: 8-16 hashtags that are too generic/spammy.\n` +
+            `- No duplicates.\n`,
+        },
+      ],
+      max_tokens: 500,
+      temperature: 0.6,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const suggested = dedupeKeepOrder(parsed.suggested || [])
+      .map((x) => String(x).trim())
+      .filter((x) => x.startsWith('#'));
+    if (suggested.length < 10) return null;
+    const avoid = dedupeKeepOrder(parsed.avoid || [])
+      .map((x) => String(x).trim().toLowerCase())
+      .filter((x) => x.startsWith('#'));
+    return { suggested: suggested.slice(0, 40), avoid: avoid.slice(0, 20) };
+  } catch (e) {
+    console.warn('maybeAiPinterestHashtags:', e.message || e);
+    return null;
+  }
+}
+
 app.post('/api/tools/pinterest-keywords', async (req, res) => {
   try {
     if (!rateLimitTool(req, 'pinterest-keywords', { windowMs: 60_000, max: 30 })) {
@@ -3476,6 +3782,87 @@ app.post('/api/tools/pinterest-keywords', async (req, res) => {
   } catch (e) {
     console.error('pinterest-keywords tool error:', e);
     return res.status(500).json({ error: 'Failed to generate keyword ideas.' });
+  }
+});
+
+app.post('/api/tools/pinterest-board-generator', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'pinterest-board-generator', { windowMs: 60_000, max: 25 })) {
+      return res.status(429).json({ error: 'Too many requests. Please try again in a minute.' });
+    }
+    const { niche, audience, offer } = req.body || {};
+    const n = normalizeNicheLabel(niche);
+    if (n.length < 2) return res.status(400).json({ error: 'Enter a niche (at least 2 characters).' });
+    const base = buildPinterestBoardIdeas(n, audience || '', offer || '');
+    const ai = await maybeAiPinterestBoards(n, audience || '', offer || '', openai);
+    const mergedBoards = dedupeKeepOrder([...(ai?.boards || []).map((b) => b?.name), ...base.boards.map((b) => b.name)])
+      .map((name) => {
+        const fromAi = (ai?.boards || []).find((b) => String(b?.name || '').trim().toLowerCase() === String(name).toLowerCase());
+        const fromBase = base.boards.find((b) => String(b?.name || '').trim().toLowerCase() === String(name).toLowerCase());
+        return fromAi || fromBase || { name, description: '', keywords: [] };
+      })
+      .slice(0, 16);
+    return res.json({
+      niche: base.niche,
+      audience: base.audience,
+      offer: base.offer,
+      boards: mergedBoards,
+      source: ai ? 'ai+heuristic' : 'heuristic',
+    });
+  } catch (e) {
+    console.error('pinterest-board-generator tool error:', e);
+    return res.status(500).json({ error: 'Failed to generate board ideas.' });
+  }
+});
+
+app.post('/api/tools/pinterest-bio-generator', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'pinterest-bio-generator', { windowMs: 60_000, max: 30 })) {
+      return res.status(429).json({ error: 'Too many requests. Please try again in a minute.' });
+    }
+    const { niche, offer } = req.body || {};
+    const n = normalizeNicheLabel(niche);
+    if (n.length < 2) return res.status(400).json({ error: 'Enter a niche (at least 2 characters).' });
+    const base = buildPinterestBioIdeas(n, offer || '');
+    const ai = await maybeAiPinterestBio(n, offer || '', openai);
+    const bios = dedupeKeepOrder([...(ai?.bios || []), ...base.bios]).slice(0, 5);
+    const keywords = dedupeKeepOrder([...(ai?.keywords || []), ...base.keywords]).slice(0, 16);
+    const ctaLine = String(ai?.ctaLine || base.ctaLine || '').trim();
+    return res.json({
+      niche: base.niche,
+      offer: base.offer,
+      bios,
+      ctaLine,
+      keywords,
+      source: ai ? 'ai+heuristic' : 'heuristic',
+    });
+  } catch (e) {
+    console.error('pinterest-bio-generator tool error:', e);
+    return res.status(500).json({ error: 'Failed to generate bio ideas.' });
+  }
+});
+
+app.post('/api/tools/pinterest-hashtag-generator', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'pinterest-hashtag-generator', { windowMs: 60_000, max: 35 })) {
+      return res.status(429).json({ error: 'Too many requests. Please try again in a minute.' });
+    }
+    const { topic, niche } = req.body || {};
+    const t = String(topic || '').trim();
+    if (t.length < 2) return res.status(400).json({ error: 'Enter a topic (at least 2 characters).' });
+    const base = buildPinterestHashtagIdeas(t, niche || '');
+    const ai = await maybeAiPinterestHashtags(t, niche || '', openai);
+    const suggested = dedupeKeepOrder([...(ai?.suggested || []), ...base.suggested]).slice(0, 40);
+    const avoid = dedupeKeepOrder([...(ai?.avoid || []), ...base.avoid]).slice(0, 25);
+    return res.json({
+      topic: base.topic,
+      suggested,
+      avoid,
+      source: ai ? 'ai+heuristic' : 'heuristic',
+    });
+  } catch (e) {
+    console.error('pinterest-hashtag-generator tool error:', e);
+    return res.status(500).json({ error: 'Failed to generate hashtags.' });
   }
 });
 
