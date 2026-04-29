@@ -95,7 +95,9 @@ async function getActiveSubscriptionForUser(userId) {
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_subscriptions')
-      .select('plan_type, pins_limit_per_month')
+      .select(
+        'id, plan_type, pins_limit_per_month, status, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
+      )
       .eq('user_id', userId)
       .eq('status', 'active')
       .order('created_at', { ascending: false })
@@ -107,7 +109,25 @@ async function getActiveSubscriptionForUser(userId) {
     }
 
     if (!data || data.length === 0) return null;
-    return data[0];
+    const sub = data[0];
+    // If the paid period ended, treat as not active (and cleanup profile).
+    try {
+      if (sub?.current_period_end && new Date(sub.current_period_end).getTime() <= Date.now()) {
+        await supabaseAdmin
+          .from('billing_subscriptions')
+          .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+          .eq('id', sub.id)
+          .eq('user_id', userId);
+        await supabaseAdmin
+          .from('profiles')
+          .update({ plan_type: 'free', is_pro: false, updated_at: new Date().toISOString() })
+          .eq('id', userId);
+        return null;
+      }
+    } catch {
+      // ignore cleanup failures; fall through
+    }
+    return sub;
   } catch (err) {
     console.warn('getActiveSubscriptionForUser error:', err.message || err);
     return null;
@@ -139,17 +159,44 @@ function consumePendingDodoActivation(userId, requestedPlanType) {
   return { ok: true, pending: row };
 }
 
-async function applyPlanActivationForUser(userId, planType, source = 'unknown') {
+async function applyPlanActivationForUser(
+  userId,
+  planType,
+  source = 'unknown',
+  opts = null
+) {
   if (!planType || !PLAN_PIN_LIMITS[planType]) {
     return { ok: false, error: 'Invalid planType' };
   }
 
   const now = new Date();
-  const periodStart = now.toISOString();
-  const nextMonth = new Date(now);
-  nextMonth.setMonth(nextMonth.getMonth() + 1);
-  const periodEnd = nextMonth.toISOString();
+  const periodStart = String(opts?.periodStart || now.toISOString());
+  const periodEnd = String(opts?.periodEnd || (() => {
+    const nextMonth = new Date(now);
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    return nextMonth.toISOString();
+  })());
   const pinsLimit = PLAN_PIN_LIMITS[planType];
+  const dodoSubscriptionId = opts?.dodoSubscriptionId ? String(opts.dodoSubscriptionId) : null;
+
+  // Baseline current usage so upgrades/renewals don't "steal" allowance from earlier periods.
+  const yearMonth = currentYearMonthDate();
+  let baselineAi = 0;
+  let baselineUserPhoto = 0;
+  try {
+    const { data: usageRows } = await supabaseAdmin
+      .from('pin_usage')
+      .select('pins_used, user_photo_pins_used')
+      .eq('user_id', userId)
+      .eq('year_month', yearMonth)
+      .limit(1);
+    const row = usageRows && usageRows.length ? usageRows[0] : null;
+    baselineAi = Math.max(0, Number(row?.pins_used ?? 0) || 0);
+    baselineUserPhoto = Math.max(0, Number(row?.user_photo_pins_used ?? 0) || 0);
+  } catch {
+    baselineAi = 0;
+    baselineUserPhoto = 0;
+  }
 
   await supabaseAdmin
     .from('billing_subscriptions')
@@ -166,6 +213,11 @@ async function applyPlanActivationForUser(userId, planType, source = 'unknown') 
       status: 'active',
       current_period_start: periodStart,
       current_period_end: periodEnd,
+      cancel_at_period_end: false,
+      cancelled_at: null,
+      dodo_subscription_id: dodoSubscriptionId,
+      usage_baseline_pins_used: baselineAi,
+      usage_baseline_user_photo_pins_used: baselineUserPhoto,
     });
 
   if (insertError) {
@@ -263,6 +315,8 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
     const planType = sub?.plan_type || 'free';
     const planPinsLimit = planAiPinsLimit(sub);
     const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(sub);
+    const baselineAi = Math.max(0, Number(sub?.usage_baseline_pins_used ?? 0) || 0);
+    const baselineUserPhoto = Math.max(0, Number(sub?.usage_baseline_user_photo_pins_used ?? 0) || 0);
 
     try {
       const { data: usageRows, error: usageError } = await supabaseAdmin
@@ -280,8 +334,10 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
       const currentAi = row?.pins_used ?? 0;
       const currentUserPhoto = row?.user_photo_pins_used ?? 0;
 
-      const tentativeAi = currentAi + aiDelta;
-      const tentativeUserPhoto = currentUserPhoto + userPhotoDelta;
+      const effectiveCurrentAi = Math.max(0, currentAi - baselineAi);
+      const effectiveCurrentUserPhoto = Math.max(0, currentUserPhoto - baselineUserPhoto);
+      const tentativeAi = effectiveCurrentAi + aiDelta;
+      const tentativeUserPhoto = effectiveCurrentUserPhoto + userPhotoDelta;
 
       if (tentativeAi < 0 || tentativeUserPhoto < 0) {
         console.warn('applyPinQuotaDelta: negative usage prevented', {
@@ -309,9 +365,9 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
           planType,
           planPinsLimit,
           planUserPhotoPinsLimit,
-          currentUsed: currentAi,
+          currentUsed: effectiveCurrentAi,
           wouldUseAi: aiDelta,
-          currentUserPhotoPinsUsed: currentUserPhoto,
+          currentUserPhotoPinsUsed: effectiveCurrentUserPhoto,
         };
       }
 
@@ -322,14 +378,15 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
           planType,
           planPinsLimit,
           planUserPhotoPinsLimit,
-          currentUsed: currentAi,
-          currentUserPhotoPinsUsed: currentUserPhoto,
+          currentUsed: effectiveCurrentAi,
+          currentUserPhotoPinsUsed: effectiveCurrentUserPhoto,
           wouldUseUserPhoto: userPhotoDelta,
         };
       }
 
-      const newAi = tentativeAi;
-      const newUserPhoto = tentativeUserPhoto;
+      // Store absolute counters, but enforce limits against the "effective" (baseline-adjusted) usage.
+      const newAi = currentAi + aiDelta;
+      const newUserPhoto = currentUserPhoto + userPhotoDelta;
 
       const { error: upsertError } = await supabaseAdmin.from('pin_usage').upsert(
         {
@@ -350,10 +407,10 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
         planType,
         planPinsLimit,
         planUserPhotoPinsLimit,
-        previousUsed: currentAi,
-        newUsed: newAi,
-        previousUserPhotoPinsUsed: currentUserPhoto,
-        newUserPhotoPinsUsed: newUserPhoto,
+        previousUsed: effectiveCurrentAi,
+        newUsed: Math.max(0, newAi - baselineAi),
+        previousUserPhotoPinsUsed: effectiveCurrentUserPhoto,
+        newUserPhotoPinsUsed: Math.max(0, newUserPhoto - baselineUserPhoto),
       };
     } catch (err) {
       console.warn('applyPinQuotaDelta error (falling back to allow):', err.message || err);
@@ -447,6 +504,8 @@ async function getCurrentUsageSnapshot(userId) {
   const planType = subscription?.plan_type || 'free';
   const planPinsLimit = planAiPinsLimit(subscription);
   const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(subscription);
+  const baselineAi = Math.max(0, Number(subscription?.usage_baseline_pins_used ?? 0) || 0);
+  const baselineUserPhoto = Math.max(0, Number(subscription?.usage_baseline_user_photo_pins_used ?? 0) || 0);
 
   // Profile info (for email, created_at, etc.)
   const { data: profile } = await supabaseAdmin
@@ -498,12 +557,26 @@ async function getCurrentUsageSnapshot(userId) {
     console.warn('metadata_usage fetch unexpected error:', e.message || e);
   }
   const planMetaLimit = PLAN_METADATA_LIMITS[planType] || PLAN_METADATA_LIMITS.free;
+  const effectivePinsUsed = Math.max(0, pinsUsed - baselineAi);
+  const effectiveUserPhotoPinsUsed = Math.max(0, userPhotoPinsUsed - baselineUserPhoto);
 
   return {
     user: {
       id: profile?.id || userId,
       email: profile?.email || null,
     },
+    subscription: subscription
+      ? {
+          id: subscription.id || null,
+          status: subscription.status || null,
+          plan_type: subscription.plan_type || null,
+          current_period_start: subscription.current_period_start || null,
+          current_period_end: subscription.current_period_end || null,
+          cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
+          cancelled_at: subscription.cancelled_at || null,
+          dodo_subscription_id: subscription.dodo_subscription_id || null,
+        }
+      : null,
     plan: {
       type: planType,
       pins_limit_per_month: planPinsLimit,
@@ -512,10 +585,10 @@ async function getCurrentUsageSnapshot(userId) {
     },
     usage: {
       year_month: yearMonth,
-      pins_used: pinsUsed,
-      pins_remaining: Math.max(0, planPinsLimit - pinsUsed),
-      user_photo_pins_used: userPhotoPinsUsed,
-      user_photo_pins_remaining: Math.max(0, planUserPhotoPinsLimit - userPhotoPinsUsed),
+      pins_used: effectivePinsUsed,
+      pins_remaining: Math.max(0, planPinsLimit - effectivePinsUsed),
+      user_photo_pins_used: effectiveUserPhotoPinsUsed,
+      user_photo_pins_remaining: Math.max(0, planUserPhotoPinsLimit - effectiveUserPhotoPinsUsed),
       metadata_calls: metadataCalls,
       metadata_soft_limit: planMetaLimit,
     },
@@ -5690,7 +5763,7 @@ app.post('/api/account/cancel', requireUser, async (req, res) => {
     const now = new Date().toISOString();
     const { data: activeSub, error } = await supabaseAdmin
       .from('billing_subscriptions')
-      .select('id, plan_type, status')
+      .select('id, plan_type, status, current_period_end, dodo_subscription_id')
       .eq('user_id', req.user.id)
       .eq('status', 'active')
       .order('created_at', { ascending: false })
@@ -5706,27 +5779,50 @@ app.post('/api/account/cancel', requireUser, async (req, res) => {
       return res.status(400).json({ error: 'No active subscription to cancel.' });
     }
 
-    await supabaseAdmin
-      .from('billing_subscriptions')
-      .update({ status: 'cancelled', updated_at: now })
-      .eq('id', activeSub.id)
-      .eq('user_id', req.user.id);
+    // Prefer cancelling in Dodo (cancel at next billing date) so the user keeps benefits until period end.
+    if (DODO_API_KEY && activeSub.dodo_subscription_id) {
+      try {
+        const dodoResp = await fetch(
+          `${DODO_BASE_URL}/subscriptions/${encodeURIComponent(activeSub.dodo_subscription_id)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${DODO_API_KEY}`,
+            },
+            body: JSON.stringify({ cancel_at_next_billing_date: true }),
+          }
+        );
+        const dodoJson = await dodoResp.json().catch(() => ({}));
+        if (!dodoResp.ok) {
+          console.warn('account/cancel: Dodo cancel failed', {
+            status: dodoResp.status,
+            details: dodoJson,
+            subId: activeSub.dodo_subscription_id,
+          });
+        }
+      } catch (e) {
+        console.warn('account/cancel: Dodo cancel error', e.message || e);
+      }
+    }
 
     await supabaseAdmin
-      .from('profiles')
-      .update({ plan_type: 'free', is_pro: false, updated_at: now })
-      .eq('id', req.user.id);
+      .from('billing_subscriptions')
+      .update({ cancel_at_period_end: true, cancelled_at: now, updated_at: now })
+      .eq('id', activeSub.id)
+      .eq('user_id', req.user.id);
 
     console.log('ℹ️ account/cancel: marked subscription cancelled in app only', {
       userId: req.user.id,
       planType: activeSub.plan_type,
-      note: 'Remember to cancel in Dodo dashboard or rely on webhook cancellations.',
+      note: 'Cancellation is scheduled at period end (benefits stay active until expiry).',
     });
 
     return res.json({
       ok: true,
       message:
-        'Your subscription was marked as cancelled inside URL2Pin. If billing is managed via Dodo, ensure the subscription is also cancelled there.',
+        'Your subscription will cancel at the end of the current billing period. You keep your current plan benefits until it expires.',
+      currentPeriodEnd: activeSub.current_period_end || null,
     });
   } catch (err) {
     console.error('account/cancel error:', err);
@@ -5746,6 +5842,21 @@ app.post('/api/dodo/webhook', async (req, res) => {
     const metadata = dataObj?.metadata || event?.metadata || {};
     const userId = String(metadata?.supabase_user_id || '').trim();
     const planType = String(metadata?.app_plan_type || metadata?.plan_type || '').trim();
+    const dodoSubId =
+      String(dataObj?.subscription_id || dataObj?.id || dataObj?.subscription?.id || '').trim() || null;
+    const periodStartRaw =
+      dataObj?.current_period_start ||
+      dataObj?.current_period_started_at ||
+      dataObj?.period_start ||
+      dataObj?.starts_at ||
+      null;
+    const periodEndRaw =
+      dataObj?.current_period_end ||
+      dataObj?.current_period_ends_at ||
+      dataObj?.period_end ||
+      dataObj?.ends_at ||
+      dataObj?.next_billing_date ||
+      null;
 
     if (!eventType) return res.status(400).json({ error: 'Missing event type' });
     if (!userId) {
@@ -5768,6 +5879,10 @@ app.post('/api/dodo/webhook', async (req, res) => {
       'subscription.expired',
       'subscription.ended',
     ];
+    const cancelAtPeriodEndSignals = [
+      'subscription.updated',
+      'subscription.update',
+    ];
 
     if (activateSignals.some((sig) => eventType.includes(sig))) {
       if (!planType || !PLAN_PIN_LIMITS[planType]) {
@@ -5778,12 +5893,36 @@ app.post('/api/dodo/webhook', async (req, res) => {
         });
         return res.json({ ok: true, ignored: true, reason: 'missing_plan_metadata' });
       }
-      const activated = await applyPlanActivationForUser(userId, planType, `dodo_webhook:${eventType}`);
+      const activated = await applyPlanActivationForUser(userId, planType, `dodo_webhook:${eventType}`, {
+        periodStart: periodStartRaw || null,
+        periodEnd: periodEndRaw || null,
+        dodoSubscriptionId: dodoSubId,
+      });
       if (!activated.ok) {
         console.error('dodo webhook activation failed', { eventType, userId, planType, error: activated.error });
         return res.status(500).json({ error: 'Failed to activate plan from webhook' });
       }
       return res.json({ ok: true, action: 'activated', userId, planType });
+    }
+
+    // Some providers send "subscription.updated" when a customer schedules cancellation at period end.
+    // In this case, keep the plan active until current_period_end, but mark cancel_at_period_end for UI.
+    if (
+      cancelAtPeriodEndSignals.some((sig) => eventType.includes(sig)) &&
+      (dataObj?.cancel_at_next_billing_date === true || dataObj?.cancel_at_period_end === true)
+    ) {
+      await supabaseAdmin
+        .from('billing_subscriptions')
+        .update({
+          cancel_at_period_end: true,
+          cancelled_at: new Date().toISOString(),
+          ...(dodoSubId ? { dodo_subscription_id: dodoSubId } : {}),
+          ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId)
+        .eq('status', 'active');
+      return res.json({ ok: true, action: 'cancel_scheduled', userId });
     }
 
     if (cancelSignals.some((sig) => eventType.includes(sig))) {
