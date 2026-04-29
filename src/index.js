@@ -4004,13 +4004,15 @@ app.post('/api/urltopin/scrape', async (req, res) => {
 
 app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
   try {
-    const { url, articleData } = req.body || {};
+    const { url, articleData, count: rawCount, pinsPerUrl: rawPinsPerUrl } = req.body || {};
     if (!url) {
       return res.status(400).json({ error: 'Missing url' });
     }
+    const requestedCount = Number.parseInt(rawPinsPerUrl ?? rawCount ?? 10, 10);
+    const count = [3, 5, 10].includes(requestedCount) ? requestedCount : 10;
     const { base } = await fetchArticleBaseAndSummary(url, articleData || null);
     const contentProfile = await enrichContentProfile(base, openai);
-    const plan = planStrategies(contentProfile, 10);
+    const plan = planStrategies(contentProfile, count);
     const strategyCounts = {};
     plan.forEach((p) => { strategyCounts[p.strategy] = (strategyCounts[p.strategy] || 0) + 1; });
     const topStrategies = Object.entries(strategyCounts)
