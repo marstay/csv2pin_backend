@@ -692,6 +692,8 @@ function isLikelyUrlShortenerHost(host) {
   const h = normalizeUrlHostname(host);
   if (!h) return false;
   if (URL_SHORTENER_HOSTNAMES.has(h)) return true;
+  // Pinterest pin URLs behave like redirects (not the user's site identity).
+  if (h === 'pinterest.com' || h.endsWith('.pinterest.com') || /^pinterest\.[a-z.]{2,}$/i.test(h)) return true;
   // Netlify deploy previews & custom subdomains behave like shorteners for identity/keywords.
   if (h.endsWith('.netlify.app') || h.endsWith('.netlify.com')) return true;
   // Very short branded hosts on TLDs often used for redirects (e.g. a.co, x.co)
