@@ -82,6 +82,8 @@ const PLAN_METADATA_LIMITS = {
   agency: 100000,
 };
 
+const pendingDodoActivations = new Map();
+
 function currentYearMonthDate() {
   const now = new Date();
   // Use UTC month start to avoid timezone edge cases with Postgres date
@@ -110,6 +112,77 @@ async function getActiveSubscriptionForUser(userId) {
     console.warn('getActiveSubscriptionForUser error:', err.message || err);
     return null;
   }
+}
+
+function markPendingDodoActivation(userId, planType, sessionId = null) {
+  if (!userId || !planType) return;
+  pendingDodoActivations.set(String(userId), {
+    planType: String(planType),
+    sessionId: sessionId ? String(sessionId) : null,
+    createdAt: Date.now(),
+  });
+}
+
+function consumePendingDodoActivation(userId, requestedPlanType) {
+  const key = String(userId || '');
+  const row = pendingDodoActivations.get(key);
+  if (!row) return { ok: false, reason: 'missing_pending_checkout' };
+  const maxAgeMs = 2 * 60 * 60 * 1000;
+  if (Date.now() - row.createdAt > maxAgeMs) {
+    pendingDodoActivations.delete(key);
+    return { ok: false, reason: 'pending_checkout_expired' };
+  }
+  if (String(row.planType) !== String(requestedPlanType)) {
+    return { ok: false, reason: 'plan_mismatch_with_pending_checkout', pendingPlanType: row.planType };
+  }
+  pendingDodoActivations.delete(key);
+  return { ok: true, pending: row };
+}
+
+async function applyPlanActivationForUser(userId, planType, source = 'unknown') {
+  if (!planType || !PLAN_PIN_LIMITS[planType]) {
+    return { ok: false, error: 'Invalid planType' };
+  }
+
+  const now = new Date();
+  const periodStart = now.toISOString();
+  const nextMonth = new Date(now);
+  nextMonth.setMonth(nextMonth.getMonth() + 1);
+  const periodEnd = nextMonth.toISOString();
+  const pinsLimit = PLAN_PIN_LIMITS[planType];
+
+  await supabaseAdmin
+    .from('billing_subscriptions')
+    .update({ status: 'cancelled', updated_at: now.toISOString() })
+    .eq('user_id', userId)
+    .eq('status', 'active');
+
+  const { error: insertError } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .insert({
+      user_id: userId,
+      plan_type: planType,
+      pins_limit_per_month: pinsLimit,
+      status: 'active',
+      current_period_start: periodStart,
+      current_period_end: periodEnd,
+    });
+
+  if (insertError) {
+    return { ok: false, error: insertError.message || String(insertError) };
+  }
+
+  await supabaseAdmin
+    .from('profiles')
+    .update({
+      plan_type: planType,
+      is_pro: planType !== 'free',
+      updated_at: now.toISOString(),
+    })
+    .eq('id', userId);
+
+  console.log('✅ plan activated', { userId, planType, source });
+  return { ok: true, planType, pinsLimit };
 }
 
 async function resolvePlanTypeForUser(userId) {
@@ -5520,6 +5593,14 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     const checkoutUrl = json.checkout_url || json.url || null;
     const sessionId = json.session_id || json.id || null;
 
+    markPendingDodoActivation(req.user.id, planType, sessionId || null);
+    console.log('🧾 Dodo checkout created', {
+      userId: req.user.id,
+      planType,
+      sessionId: sessionId || null,
+      hasCheckoutUrl: Boolean(checkoutUrl),
+    });
+
     if (!checkoutUrl && !sessionId) {
       console.warn('Dodo checkout response missing checkout_url and session_id:', json);
     }
@@ -5547,56 +5628,125 @@ app.get('/api/account/usage', requireUser, async (req, res) => {
   }
 });
 
+app.get('/api/account/plan', requireUser, async (req, res) => {
+  try {
+    const planType = await resolvePlanTypeForUser(req.user.id);
+    return res.json({ planType });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load plan' });
+  }
+});
+
 // Simple endpoint to mark a plan as active for the current user
 app.post('/api/account/activate-plan', requireUser, async (req, res) => {
   try {
-    const { planType } = req.body || {};
+    const { planType, checkoutSessionId } = req.body || {};
     if (!planType || !PLAN_PIN_LIMITS[planType]) {
       return res.status(400).json({ error: 'Invalid planType' });
     }
 
-    const now = new Date();
-    const periodStart = now.toISOString();
-    const nextMonth = new Date(now);
-    nextMonth.setMonth(nextMonth.getMonth() + 1);
-    const periodEnd = nextMonth.toISOString();
-
-    const pinsLimit = PLAN_PIN_LIMITS[planType];
-
-    // Mark any existing active subscriptions for this user as cancelled
-    await supabaseAdmin
-      .from('billing_subscriptions')
-      .update({ status: 'cancelled', updated_at: now.toISOString() })
-      .eq('user_id', req.user.id)
-      .eq('status', 'active');
-
-    // Insert new active subscription row
-    const { error: insertError } = await supabaseAdmin
-      .from('billing_subscriptions')
-      .insert({
-        user_id: req.user.id,
-        plan_type: planType,
-        pins_limit_per_month: pinsLimit,
-        status: 'active',
-        current_period_start: periodStart,
-        current_period_end: periodEnd,
+    const pending = consumePendingDodoActivation(req.user.id, planType);
+    if (!pending.ok) {
+      console.warn('activate-plan blocked (no verified pending checkout)', {
+        userId: req.user.id,
+        planType,
+        reason: pending.reason,
+        pendingPlanType: pending.pendingPlanType || null,
       });
-
-    if (insertError) {
-      console.error('activate-plan insert error:', insertError);
-      return res.status(500).json({
-        error: 'Failed to activate plan',
-        details: insertError.message || String(insertError),
+      return res.status(409).json({
+        error: 'No verified pending checkout for this plan. Please complete checkout again.',
+        code: 'missing_verified_checkout',
+        reason: pending.reason,
       });
     }
 
-    return res.json({ ok: true, planType, pinsLimit });
+    const result = await applyPlanActivationForUser(req.user.id, planType, 'payment_success_fallback');
+    if (!result.ok) {
+      return res.status(500).json({ error: 'Failed to activate plan', details: result.error });
+    }
+
+    console.log('✅ activate-plan fallback succeeded', {
+      userId: req.user.id,
+      planType,
+      checkoutSessionId: checkoutSessionId || null,
+      via: 'payment-success',
+    });
+    return res.json({ ok: true, planType: result.planType, pinsLimit: result.pinsLimit });
   } catch (err) {
     console.error('activate-plan error:', err);
     return res.status(500).json({
       error: 'Failed to activate plan',
       details: err.message || String(err),
     });
+  }
+});
+
+// Dodo webhook: primary source of subscription truth.
+app.post('/api/dodo/webhook', async (req, res) => {
+  try {
+    const event = req.body || {};
+    const eventType = String(event.type || event.event_type || event.name || '').toLowerCase();
+    const dataObj = event?.data?.object || event?.data || event?.payload || {};
+    const metadata = dataObj?.metadata || event?.metadata || {};
+    const userId = String(metadata?.supabase_user_id || '').trim();
+    const planType = String(metadata?.app_plan_type || metadata?.plan_type || '').trim();
+
+    if (!eventType) return res.status(400).json({ error: 'Missing event type' });
+    if (!userId) {
+      console.warn('dodo webhook ignored: missing supabase_user_id metadata', { eventType });
+      return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
+    }
+
+    const activateSignals = [
+      'checkout.completed',
+      'checkout.succeeded',
+      'payment.succeeded',
+      'subscription.created',
+      'subscription.activated',
+      'subscription.active',
+      'subscription.renewed',
+    ];
+    const cancelSignals = [
+      'subscription.canceled',
+      'subscription.cancelled',
+      'subscription.expired',
+      'subscription.ended',
+    ];
+
+    if (activateSignals.some((sig) => eventType.includes(sig))) {
+      if (!planType || !PLAN_PIN_LIMITS[planType]) {
+        console.warn('dodo webhook activation ignored: missing/invalid plan metadata', {
+          eventType,
+          userId,
+          planType,
+        });
+        return res.json({ ok: true, ignored: true, reason: 'missing_plan_metadata' });
+      }
+      const activated = await applyPlanActivationForUser(userId, planType, `dodo_webhook:${eventType}`);
+      if (!activated.ok) {
+        console.error('dodo webhook activation failed', { eventType, userId, planType, error: activated.error });
+        return res.status(500).json({ error: 'Failed to activate plan from webhook' });
+      }
+      return res.json({ ok: true, action: 'activated', userId, planType });
+    }
+
+    if (cancelSignals.some((sig) => eventType.includes(sig))) {
+      await supabaseAdmin
+        .from('billing_subscriptions')
+        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('user_id', userId)
+        .eq('status', 'active');
+      await supabaseAdmin
+        .from('profiles')
+        .update({ plan_type: 'free', is_pro: false, updated_at: new Date().toISOString() })
+        .eq('id', userId);
+      return res.json({ ok: true, action: 'cancelled', userId });
+    }
+
+    return res.json({ ok: true, ignored: true, reason: 'unhandled_event', eventType });
+  } catch (err) {
+    console.error('dodo webhook error:', err);
+    return res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 
