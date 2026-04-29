@@ -5681,6 +5681,58 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
   }
 });
 
+app.post('/api/account/cancel', requireUser, async (req, res) => {
+  try {
+    const now = new Date().toISOString();
+    const { data: activeSub, error } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, plan_type, status')
+      .eq('user_id', req.user.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error('account/cancel fetch error:', error);
+      return res.status(500).json({ error: 'Failed to load active subscription' });
+    }
+
+    if (!activeSub) {
+      return res.status(400).json({ error: 'No active subscription to cancel.' });
+    }
+
+    await supabaseAdmin
+      .from('billing_subscriptions')
+      .update({ status: 'cancelled', updated_at: now })
+      .eq('id', activeSub.id)
+      .eq('user_id', req.user.id);
+
+    await supabaseAdmin
+      .from('profiles')
+      .update({ plan_type: 'free', is_pro: false, updated_at: now })
+      .eq('id', req.user.id);
+
+    console.log('ℹ️ account/cancel: marked subscription cancelled in app only', {
+      userId: req.user.id,
+      planType: activeSub.plan_type,
+      note: 'Remember to cancel in Dodo dashboard or rely on webhook cancellations.',
+    });
+
+    return res.json({
+      ok: true,
+      message:
+        'Your subscription was marked as cancelled inside URL2Pin. If billing is managed via Dodo, ensure the subscription is also cancelled there.',
+    });
+  } catch (err) {
+    console.error('account/cancel error:', err);
+    return res.status(500).json({
+      error: 'Failed to cancel subscription',
+      details: err.message || String(err),
+    });
+  }
+});
+
 // Dodo webhook: primary source of subscription truth.
 app.post('/api/dodo/webhook', async (req, res) => {
   try {
