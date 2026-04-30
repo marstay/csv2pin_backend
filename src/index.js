@@ -3,6 +3,7 @@ import cors from 'cors';
 import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
+import net from 'node:net';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import JSZip from 'jszip';
@@ -1427,6 +1428,20 @@ function extractAmazonAsinFromUrl(urlString) {
   }
 }
 
+/** Numeric listing id from `https://www.etsy.com/listing/123/slug` (any Etsy host). */
+function extractEtsyListingIdFromUrl(urlString) {
+  try {
+    const raw = String(urlString || '').trim();
+    if (!raw) return '';
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!isEtsyHost(u.hostname)) return '';
+    const m = (u.pathname || '').match(/\/listing\/(\d{6,})(?:\/|$)/i);
+    return m ? m[1] : '';
+  } catch {
+    return '';
+  }
+}
+
 function pushUniqueAmazonImageUrl(ordered, seen, raw) {
   const n = normalizeAmazonImageUrlString(raw);
   if (!n || seen.has(n)) return;
@@ -1717,6 +1732,165 @@ async function fetchEtsyOembed(listingUrl) {
   } catch (e) {
     console.warn('fetchEtsyOembed:', e.message || e);
     return null;
+  }
+}
+
+function decodeHtmlEntitiesBasic(s) {
+  return String(s || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#0*39;/g, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#(\d+);/g, (_, n) => {
+      const c = Number.parseInt(n, 10);
+      return Number.isFinite(c) && c >= 32 && c !== 127 ? String.fromCharCode(c) : _;
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+      const c = Number.parseInt(h, 16);
+      return Number.isFinite(c) && c >= 32 && c !== 127 ? String.fromCharCode(c) : _;
+    });
+}
+
+function collectEtsyRapidApiImageUrls(data) {
+  if (!data || typeof data !== 'object') return [];
+  const out = [];
+  const seen = new Set();
+  const push = (s) => {
+    const u = String(s || '').trim();
+    if (!u || seen.has(u)) return;
+    if (!isAllowedGenericReferenceImageUrl(u)) return;
+    seen.add(u);
+    out.push(u);
+  };
+  if (typeof data.mainImage === 'string') push(data.mainImage);
+  if (Array.isArray(data.images)) {
+    for (const im of data.images) {
+      if (typeof im === 'string') push(im);
+    }
+  }
+  return out.slice(0, 14);
+}
+
+// Same TTL pattern as Amazon RapidAPI (strategic fan-out / parallel styles).
+const ETSY_RAPIDAPI_CACHE_TTL_MS = 2 * 60 * 1000;
+const etsyRapidApiCache = new Map();
+const etsyRapidApiInFlight = new Map();
+
+/**
+ * Etsy listing product payload from RapidAPI (`etsy-api2` style: `{ data: { title, description, images, ... } }`).
+ * Uses `RAPIDAPI_KEY` and optional `RAPIDAPI_ETSY_HOST` (default: etsy-api2.p.rapidapi.com).
+ */
+async function fetchEtsyProductDataViaRapidApi(listingId) {
+  let cacheKey = '';
+  try {
+    const key = String(process.env.RAPIDAPI_KEY || '').trim();
+    const host =
+      String(process.env.RAPIDAPI_ETSY_HOST || '').trim() || 'etsy-api2.p.rapidapi.com';
+    const id = String(listingId || '').trim();
+    if (!key || !id || !/^\d+$/.test(id)) return null;
+
+    cacheKey = `${host}::etsy::${id}`;
+    const now = Date.now();
+    const cached = etsyRapidApiCache.get(cacheKey);
+    if (cached && cached.data && now - cached.ts < ETSY_RAPIDAPI_CACHE_TTL_MS) {
+      return cached.data;
+    }
+    const inflight = etsyRapidApiInFlight.get(cacheKey);
+    if (inflight) {
+      return await inflight;
+    }
+
+    const url = `https://${host}/product/description?listingId=${encodeURIComponent(id)}`;
+
+    const p = (async () => {
+      const resp = await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            'x-rapidapi-key': key,
+            'x-rapidapi-host': host,
+            Accept: 'application/json',
+          },
+        },
+        20000
+      );
+      if (!resp.ok) return null;
+      const json = await resp.json().catch(() => null);
+      const data = json && typeof json === 'object' ? json.data : null;
+      if (!data || typeof data !== 'object') return null;
+      etsyRapidApiCache.set(cacheKey, { ts: Date.now(), data });
+      return data;
+    })();
+    etsyRapidApiInFlight.set(cacheKey, p);
+    return await p;
+  } catch (e) {
+    console.warn('fetchEtsyProductDataViaRapidApi:', e.message || e);
+    return null;
+  } finally {
+    if (cacheKey) {
+      try {
+        etsyRapidApiInFlight.delete(cacheKey);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
+ * Enrich `base` for Etsy listing URLs: RapidAPI when `RAPIDAPI_KEY` + listing id, else oEmbed for title/thumb gaps.
+ * Sets `etsy_rapidapi_image_urls` for Nano Banana mirroring when RapidAPI returns images.
+ */
+async function enrichEtsyListingBaseFromApis(base, pageUrlString) {
+  try {
+    const raw = String(pageUrlString || '').trim();
+    if (!raw) return;
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!isEtsyHost(u.hostname)) return;
+
+    const listingId = extractEtsyListingIdFromUrl(raw);
+    let rapid = null;
+    if (listingId && String(process.env.RAPIDAPI_KEY || '').trim()) {
+      rapid = await fetchEtsyProductDataViaRapidApi(listingId);
+    }
+
+    if (rapid && typeof rapid === 'object') {
+      const t = typeof rapid.title === 'string' ? decodeHtmlEntitiesBasic(rapid.title.trim()) : '';
+      if (t) {
+        const cur = String(base.title || '').trim();
+        if (cur.length < 3) {
+          base.title = t.slice(0, 180);
+        } else if (cur.length < 14) {
+          base.title = t.slice(0, 180);
+        }
+      }
+      const d = typeof rapid.description === 'string' ? decodeHtmlEntitiesBasic(rapid.description.trim()) : '';
+      if (d) {
+        const curD = String(base.description || '').trim();
+        if (curD.length < 40) {
+          base.description = d.slice(0, 450);
+        }
+      }
+      const imgs = collectEtsyRapidApiImageUrls(rapid);
+      if (imgs.length) {
+        base.etsy_rapidapi_image_urls = imgs;
+        base.etsy_oembed_thumbnail = imgs[0];
+      }
+      base.etsy_rapidapi_listing_id = listingId;
+    }
+
+    if (!base.title || String(base.title).trim().length < 3) {
+      const oe = await fetchEtsyOembed(u.href);
+      if (oe) {
+        if (!base.title && oe.title) base.title = oe.title.slice(0, 180);
+        if (oe.thumbnail_url && !base.etsy_oembed_thumbnail) base.etsy_oembed_thumbnail = oe.thumbnail_url;
+      }
+    }
+  } catch (e) {
+    console.warn('enrichEtsyListingBaseFromApis:', e.message || e);
   }
 }
 
@@ -2052,6 +2226,223 @@ const URL_SCRAPE_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
+function isPinterestOutboundHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (h === 'pin.it') return true;
+  if (h === 'pinterest.com' || h.endsWith('.pinterest.com') || /^pinterest\.[a-z.]{2,}$/i.test(h)) return true;
+  return false;
+}
+
+function isPrivateOrReservedIp(ip) {
+  if (!ip) return false;
+  const v = net.isIP(ip);
+  if (v === 4) {
+    const [a, b] = ip.split('.').map((x) => Number.parseInt(x, 10));
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return true;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a === 192 && b === 0 && Number.parseInt(ip.split('.')[2] || '0', 10) === 2) return true; // 192.0.2.0/24 doc
+    return false;
+  }
+  if (v === 6) {
+    const s = ip.toLowerCase();
+    if (s === '::1') return true;
+    if (s.startsWith('fe80:')) return true; // link-local
+    if (s.startsWith('fc') || s.startsWith('fd')) return true; // ULA
+    if (s.startsWith('::ffff:')) {
+      const m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+      if (m) return isPrivateOrReservedIp(m[1]);
+    }
+    return false;
+  }
+  return false;
+}
+
+function assertSafePublicHttpUrl(u) {
+  if (!(u instanceof URL)) throw new Error('invalid_url');
+  if (u.username || u.password) throw new Error('url_credentials_not_allowed');
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('url_protocol_not_allowed');
+  const host = normalizeUrlHostname(u.hostname);
+  if (!host) throw new Error('url_host_missing');
+  if (host === 'localhost' || host.endsWith('.localhost')) throw new Error('url_host_blocked');
+  if (host.endsWith('.local') || host.endsWith('.internal')) throw new Error('url_host_blocked');
+  if (host === 'metadata.google.internal' || host.endsWith('.metadata.google.internal')) throw new Error('url_host_blocked');
+  const ipVer = net.isIP(host);
+  if (ipVer && isPrivateOrReservedIp(host)) throw new Error('url_ip_blocked');
+  return true;
+}
+
+function shouldResolveOutboundUrlForUrlToPin(hostname) {
+  const h = normalizeUrlHostname(hostname);
+  if (!h) return false;
+  if (isPinterestOutboundHost(h)) return false;
+  if (isLikelyUrlShortenerHost(h)) return true;
+  if (isAffiliateTrackingRedirectHost(h)) return true;
+  return false;
+}
+
+function extractMetaRefreshTargetFromHtml(html) {
+  const s = String(html || '');
+  if (!s) return '';
+  const m = s.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/i);
+  if (!m) return '';
+  const tag = m[0];
+  const c = tag.match(/content=["']([^"']+)["']/i);
+  if (!c) return '';
+  const content = c[1];
+  const urlPart = content.split(/;/i).map((p) => p.trim()).find((p) => /^url=/i.test(p));
+  if (!urlPart) return '';
+  return urlPart.replace(/^url=/i, '').trim();
+}
+
+/**
+ * Expand short / affiliate redirect URLs to a final http(s) destination (bounded hops).
+ * Used so Amazon ASIN extraction, Etsy oEmbed, and branding gates see the real merchant URL.
+ */
+async function resolveOutboundUrlForUrlToPin(rawUrlString) {
+  const raw = String(rawUrlString || '').trim();
+  if (!raw) return raw;
+  let current;
+  try {
+    current = new URL(raw);
+  } catch {
+    return raw;
+  }
+  if (!shouldResolveOutboundUrlForUrlToPin(current.hostname)) return raw;
+
+  const maxHops = 6;
+  const timeoutMs = 9000;
+  const headers = {
+    ...URL_SCRAPE_HEADERS,
+    Accept: '*/*',
+  };
+
+  try {
+    assertSafePublicHttpUrl(current);
+  } catch {
+    return raw;
+  }
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    let headResp = null;
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        headResp = await fetch(current.href, {
+          method: 'HEAD',
+          redirect: 'manual',
+          headers,
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      headResp = null;
+    }
+
+    if (headResp) {
+      const loc = headResp.headers.get('location') || headResp.headers.get('Location');
+      if (headResp.status >= 300 && headResp.status < 400 && loc) {
+        let next;
+        try {
+          next = new URL(loc, current.href);
+        } catch {
+          return raw;
+        }
+        try {
+          assertSafePublicHttpUrl(next);
+        } catch {
+          return raw;
+        }
+        current = next;
+        continue;
+      }
+    }
+
+    if (!shouldResolveOutboundUrlForUrlToPin(current.hostname)) {
+      break;
+    }
+
+    // Some networks block HEAD; others return 200 HTML interstitials that need a small GET body (meta refresh).
+    if (hop < maxHops - 1) {
+      const ctrl2 = new AbortController();
+      const t2 = setTimeout(() => ctrl2.abort(), timeoutMs);
+      let resp2;
+      try {
+        resp2 = await fetch(current.href, {
+          method: 'GET',
+          redirect: 'manual',
+          headers,
+          signal: ctrl2.signal,
+        });
+      } catch {
+        clearTimeout(t2);
+        break;
+      } finally {
+        clearTimeout(t2);
+      }
+      if (resp2.status >= 300 && resp2.status < 400) {
+        const loc2 = resp2.headers.get('location') || resp2.headers.get('Location');
+        if (loc2) {
+          let next2;
+          try {
+            next2 = new URL(loc2, current.href);
+          } catch {
+            break;
+          }
+          try {
+            assertSafePublicHttpUrl(next2);
+          } catch {
+            break;
+          }
+          current = next2;
+          continue;
+        }
+      }
+      if (resp2.ok) {
+        try {
+          const buf = await resp2.arrayBuffer();
+          const slice = Buffer.from(buf).slice(0, 65536).toString('utf8');
+          const target = extractMetaRefreshTargetFromHtml(slice);
+          if (target) {
+            let next3;
+            try {
+              next3 = new URL(target, current.href);
+            } catch {
+              break;
+            }
+            try {
+              assertSafePublicHttpUrl(next3);
+            } catch {
+              break;
+            }
+            current = next3;
+            continue;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    break;
+  }
+
+  try {
+    return current.href;
+  } catch {
+    return raw;
+  }
+}
+
 /**
  * Load public article HTML: fetch with browser headers first.
  * - Amazon: single fetch only — if blocked/consent or non-OK, return '' so URL→Pin can use RapidAPI (no Puppeteer).
@@ -2134,6 +2525,18 @@ async function fetchArticleHtmlViaPuppeteer(pageUrl) {
  */
 async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   const fast = !!opts?.fast;
+  const preResolved = String(opts?.preResolvedUrl || '').trim();
+  let workingUrl = String(url || '').trim();
+  if (preResolved) {
+    workingUrl = preResolved;
+  } else {
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(workingUrl);
+      if (expanded && expanded !== workingUrl) workingUrl = expanded;
+    } catch (e) {
+      console.warn('fetchArticleBaseAndSummary resolveOutboundUrl error:', e.message || e);
+    }
+  }
   const hasClientMeta =
     clientArticleData &&
     typeof clientArticleData === 'object' &&
@@ -2145,30 +2548,27 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   let html = '';
   if (!fast || !hasClientMeta) {
     try {
-      html = await fetchArticleHtml(url);
+      html = await fetchArticleHtml(workingUrl);
     } catch (e) {
       console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
     }
   }
 
-  const metaFromHtml = extractMetaFromHtml(html || '', url);
+  const metaFromHtml = extractMetaFromHtml(html || '', workingUrl);
   const base = {
     ...metaFromHtml,
     ...(clientArticleData || {}),
   };
   // Canonical article URL always wins for display + keyword (fixes short links & opaque path slugs).
-  const derivedDisplay = buildLinkDisplayLabelFromUrl(url, 80);
-  const derivedKw = deriveKeywordFromArticleUrl(url);
+  const derivedDisplay = buildLinkDisplayLabelFromUrl(workingUrl, 80);
+  const derivedKw = deriveKeywordFromArticleUrl(workingUrl);
   base.linkDisplay = derivedDisplay || base.linkDisplay || '';
   base.keyword = derivedKw;
-  Object.assign(base, assessUrlBrandingGate(url));
-  if (base.title) {
-    base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
-  }
+  Object.assign(base, assessUrlBrandingGate(workingUrl));
   // Amazon fallback: if scraping yields a generic / blocked title, flag it so callers can abort
   // BEFORE spending credits (Nano Banana) and BEFORE deducting quota.
   try {
-    const u = new URL(String(url || '').trim());
+    const u = new URL(String(workingUrl || '').trim());
     if (isAmazonRelatedHost(u.hostname) && looksLikeGenericAmazonTitle(base.title)) {
       base.amazon_blocked = true;
       // Keep title empty so downstream copywriters don't anchor on "Amazon product".
@@ -2178,18 +2578,11 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     /* ignore */
   }
 
-  // Etsy fallback: if we failed to scrape (common), use Etsy oEmbed to get a real title + thumbnail.
-  try {
-    const u = new URL(String(url || '').trim());
-    if (isEtsyHost(u.hostname) && (!base.title || base.title.length < 3)) {
-      const oe = await fetchEtsyOembed(u.href);
-      if (oe) {
-        if (!base.title && oe.title) base.title = oe.title.slice(0, 180);
-        if (oe.thumbnail_url) base.etsy_oembed_thumbnail = oe.thumbnail_url;
-      }
-    }
-  } catch {
-    /* ignore */
+  // Etsy: RapidAPI listing payload when configured; else oEmbed for missing title/thumbnail.
+  await enrichEtsyListingBaseFromApis(base, workingUrl);
+
+  if (base.title) {
+    base.title = await maybeShortenPageTitleForUrlToPin(workingUrl, base.title, openai, base.canonicalUrl);
   }
 
   // Very lightweight body text extraction from HTML
@@ -4372,18 +4765,27 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     const { url, enrich } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
-    const html = await fetchArticleHtml(url);
+    const rawUrl = String(url || '').trim();
+    let effectiveUrl = rawUrl;
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+      if (expanded) effectiveUrl = expanded;
+    } catch (e) {
+      console.warn('urltopin scrape resolveOutboundUrl error:', e.message || e);
+    }
+
+    const html = await fetchArticleHtml(effectiveUrl);
     if (!html || html.length < 200) {
       return res.status(502).json({
         error:
           'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
       });
     }
-    const meta = extractMetaFromHtml(html, url);
+    const meta = extractMetaFromHtml(html, effectiveUrl);
     if (meta.title) {
-      meta.title = await maybeShortenPageTitleForUrlToPin(url, meta.title, openai, meta.canonicalUrl);
+      meta.title = await maybeShortenPageTitleForUrlToPin(effectiveUrl, meta.title, openai, meta.canonicalUrl);
     }
-    const brandingGate = assessUrlBrandingGate(url);
+    const brandingGate = assessUrlBrandingGate(effectiveUrl);
     if (enrich) {
       try {
         meta.contentProfile = await enrichContentProfile(meta, openai);
@@ -4457,6 +4859,17 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const isStrategic = mode === 'strategic';
     const isStrategicSingle = mode === 'strategic_single';
 
+    const rawUrl = String(url || '').trim();
+    let effectiveUrl = rawUrl;
+    if (rawUrl) {
+      try {
+        const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+        if (expanded) effectiveUrl = expanded;
+      } catch (e) {
+        console.warn('urltopin generate resolveOutboundUrl error:', e.message || e);
+      }
+    }
+
     let effectiveStyles = Array.isArray(styles) ? styles : [];
     if (isStrategicSingle && strategicSingle) {
       const { strategy, layoutId } = strategicSingle;
@@ -4467,7 +4880,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         req._strategicSingle = true;
       }
     } else if (isStrategic) {
-      const fetched = await fetchArticleBaseAndSummary(url, articleData);
+      const fetched = await fetchArticleBaseAndSummary(rawUrl, articleData, { preResolvedUrl: effectiveUrl });
       const { base } = fetched;
       const contentProfile = await enrichContentProfile(base, openai);
       const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
@@ -4477,13 +4890,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       req._fetchedArticle = fetched;
     }
 
-    if (!url || effectiveStyles.length === 0) {
+    if (!rawUrl || effectiveStyles.length === 0) {
       return res.status(400).json({
         error: isStrategic ? 'Missing url or articleData for strategic mode' : 'Missing url or styles',
       });
     }
 
-    const brandingGate = assessUrlBrandingGate(url);
+    const brandingGate = assessUrlBrandingGate(effectiveUrl);
     if (brandingGate.requiresManualBrandOrCta && !String(brand?.brandName || '').trim()) {
       return res.status(400).json({
         error: 'branding_required',
@@ -4493,12 +4906,16 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     const fastForFanOut = isStrategicSingle && !!articleData;
     const fetchedBase =
-      req._fetchedArticle || (await fetchArticleBaseAndSummary(url, articleData, fastForFanOut ? { fast: true } : null));
+      req._fetchedArticle ||
+      (await fetchArticleBaseAndSummary(rawUrl, articleData, {
+        ...(fastForFanOut ? { fast: true } : {}),
+        preResolvedUrl: effectiveUrl,
+      }));
     const base = fetchedBase.base;
     let articleSummary = fetchedBase.articleSummary;
 
     // Amazon: if scraping is blocked, try paid product-data API BEFORE spending quota / Nano Banana.
-    const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
+    const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base.canonicalUrl);
     let amazonRapid = null;
     if (base?.amazon_blocked && isAmazonProductPageForNanoReference(amazonCtxUrl)) {
       const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
@@ -4573,18 +4990,34 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     let nanoBananaReferenceInputs = [];
     let nanoBananaReferenceSource = null;
-    const refHtmlUrl = amazonCtxUrl || url;
+    const refHtmlUrl = amazonCtxUrl || effectiveUrl;
     if (!useTextBased && !useUserComposite) {
-      // Etsy: if oEmbed gave us a thumbnail, use it as a reference image even when HTML scraping fails.
-      const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
-      if (etsyThumb) {
+      // Etsy: prefer RapidAPI listing images for Nano Banana; fallback to oEmbed thumbnail.
+      const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
+      if (rapidEtsyUrls.length > 0) {
         try {
-          nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], req.user.id);
+          nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(
+            rapidEtsyUrls.slice(0, 3),
+            req.user.id
+          );
           if (nanoBananaReferenceInputs.length > 0) {
-            nanoBananaReferenceSource = 'page';
+            nanoBananaReferenceSource = 'etsy_product';
           }
         } catch (e) {
-          console.warn('urltopin Etsy oEmbed thumbnail mirror error:', e.message || e);
+          console.warn('urltopin Etsy RapidAPI images mirror error:', e.message || e);
+        }
+      }
+      if (nanoBananaReferenceInputs.length === 0) {
+        const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
+        if (etsyThumb) {
+          try {
+            nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], req.user.id);
+            if (nanoBananaReferenceInputs.length > 0) {
+              nanoBananaReferenceSource = 'page';
+            }
+          } catch (e) {
+            console.warn('urltopin Etsy oEmbed thumbnail mirror error:', e.message || e);
+          }
         }
       }
     }
@@ -4818,8 +5251,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const metaKeyForManual = (sp) => (effectiveStyles.length > 1 && sp.index != null ? `${sp.id}::${sp.index}` : sp.id);
       for (let i = 0; i < stylePrompts.length; i++) {
         const sp = stylePrompts[i];
-        const titlePrompt = `${topic}\n\nURL: ${url}\n\nStyle: ${sp.label}`;
-        const descPrompt = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
+        const titlePrompt = `${topic}\n\nURL: ${effectiveUrl}\n\nStyle: ${sp.label}`;
+        const descPrompt = `${topic}\n\nURL: ${effectiveUrl}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${sp.label}`;
         let pinTitle = topic;
         let pinDescription = base.description || '';
         let hashtags = [];
@@ -4931,6 +5364,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
               promptTier(
                 'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
                 'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+              );
+          } else if (nanoBananaReferenceSource === 'etsy_product') {
+            imagePrompt +=
+              ' ' +
+              promptTier(
+                'Attached reference image(s) are from the Etsy listing (product photos). Use them as the primary hero subject: preserve jewelry/product shape, materials, colors, and overall look. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+                'Reference: use attached Etsy listing photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
               );
           } else {
             imagePrompt +=
@@ -5261,13 +5701,21 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     if (!url || !styleId || !type || (type !== 'title' && type !== 'description')) {
       return res.status(400).json({ error: 'Missing or invalid url, styleId, or type (must be "title" or "description")' });
     }
-    const base = { ...extractMetaFromHtml('', url), ...(articleData || {}) };
-    const derivedDisplay = buildLinkDisplayLabelFromUrl(url, 80);
-    const derivedKw = deriveKeywordFromArticleUrl(url);
+    const rawUrl = String(url || '').trim();
+    let effectiveUrl = rawUrl;
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+      if (expanded) effectiveUrl = expanded;
+    } catch (e) {
+      console.warn('urltopin regenerate-metadata resolveOutboundUrl error:', e.message || e);
+    }
+    const base = { ...extractMetaFromHtml('', effectiveUrl), ...(articleData || {}) };
+    const derivedDisplay = buildLinkDisplayLabelFromUrl(effectiveUrl, 80);
+    const derivedKw = deriveKeywordFromArticleUrl(effectiveUrl);
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
     if (base.title) {
-      base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
+      base.title = await maybeShortenPageTitleForUrlToPin(effectiveUrl, base.title, openai, base.canonicalUrl);
     }
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
@@ -5278,7 +5726,7 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
       console.warn('recordMetadataUsage(urltopin/regenerate-metadata) error:', err?.message || err)
     );
 
-    const contentBase = `${topic}\n\nURL: ${url}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${styleId}`;
+    const contentBase = `${topic}\n\nURL: ${effectiveUrl}\n\nDomain: ${domain}\n\nKeyword: ${keyword}\n\nStyle: ${styleId}`;
     const currentValue = type === 'title' ? (currentTitle || '') : (currentDescription || '');
     const varietyHint = currentValue.trim()
       ? `\n\nThe current ${type} is: "${currentValue.slice(0, 200)}${currentValue.length > 200 ? '…' : ''}". Write a different alternative; do not repeat or closely copy the current one.`
@@ -5326,6 +5774,15 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     const usePageReferenceImages = rawUsePageReferenceImages === true;
     if (!url || !styleId || !overlayText) {
       return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
+    }
+
+    const rawUrl = String(url || '').trim();
+    let effectiveUrl = rawUrl;
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+      if (expanded) effectiveUrl = expanded;
+    } catch (e) {
+      console.warn('urltopin regenerate-image resolveOutboundUrl error:', e.message || e);
     }
 
     const overlayForRender =
@@ -5382,26 +5839,14 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       return res.status(500).json({ error: 'Failed to render text-based pin' });
     }
 
-    const base = { ...extractMetaFromHtml('', url), ...(articleData || {}) };
-    const derivedDisplay = buildLinkDisplayLabelFromUrl(url, 80);
-    const derivedKw = deriveKeywordFromArticleUrl(url);
+    const base = { ...extractMetaFromHtml('', effectiveUrl), ...(articleData || {}) };
+    const derivedDisplay = buildLinkDisplayLabelFromUrl(effectiveUrl, 80);
+    const derivedKw = deriveKeywordFromArticleUrl(effectiveUrl);
     base.linkDisplay = derivedDisplay || base.linkDisplay || '';
     base.keyword = derivedKw;
+    await enrichEtsyListingBaseFromApis(base, effectiveUrl);
     if (base.title) {
-      base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
-    }
-    // Etsy fallback: use oEmbed to fetch a real title + thumbnail for reference images.
-    try {
-      const u = new URL(String(url || '').trim());
-      if (isEtsyHost(u.hostname) && (!base.title || base.title.length < 3)) {
-        const oe = await fetchEtsyOembed(u.href);
-        if (oe) {
-          if (!base.title && oe.title) base.title = oe.title.slice(0, 180);
-          if (oe.thumbnail_url) base.etsy_oembed_thumbnail = oe.thumbnail_url;
-        }
-      }
-    } catch {
-      /* ignore */
+      base.title = await maybeShortenPageTitleForUrlToPin(effectiveUrl, base.title, openai, base.canonicalUrl);
     }
     const year = new Date().getFullYear();
     const domain =
@@ -5411,17 +5856,31 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
 
     let regenNanoReferenceInputs = [];
     let regenNanoReferenceSource = null;
-    const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
-    const refHtmlUrl = amazonCtxUrl || url;
-    // Etsy: if oEmbed gave us a thumbnail, use it as a reference image even when HTML scraping fails.
-    if (isEtsyHost(new URL(url).hostname)) {
-      const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
-      if (etsyThumb) {
+    const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base.canonicalUrl);
+    const refHtmlUrl = amazonCtxUrl || effectiveUrl;
+    // Etsy: RapidAPI listing images when present; else oEmbed thumbnail.
+    if (isEtsyHost(new URL(effectiveUrl).hostname)) {
+      const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
+      if (rapidEtsyUrls.length > 0) {
         try {
-          regenNanoReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], req.user.id);
-          if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'page';
+          regenNanoReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(
+            rapidEtsyUrls.slice(0, 3),
+            req.user.id
+          );
+          if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'etsy_product';
         } catch (e) {
-          console.warn('urltopin regenerate Etsy oEmbed thumbnail mirror error:', e.message || e);
+          console.warn('urltopin regenerate Etsy RapidAPI images mirror error:', e.message || e);
+        }
+      }
+      if (regenNanoReferenceInputs.length === 0) {
+        const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
+        if (etsyThumb) {
+          try {
+            regenNanoReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], req.user.id);
+            if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'page';
+          } catch (e) {
+            console.warn('urltopin regenerate Etsy oEmbed thumbnail mirror error:', e.message || e);
+          }
         }
       }
     }
@@ -5566,6 +6025,13 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
           promptTier(
             'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
             'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+          );
+      } else if (regenNanoReferenceSource === 'etsy_product') {
+        imagePromptForNano +=
+          ' ' +
+          promptTier(
+            'Attached reference image(s) are from the Etsy listing (product photos). Use them as the primary hero subject: preserve jewelry/product shape, materials, colors, and overall look. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+            'Reference: use attached Etsy listing photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
           );
       } else {
         imagePromptForNano +=
