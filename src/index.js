@@ -2519,6 +2519,45 @@ async function fetchArticleHtmlViaPuppeteer(pageUrl) {
   }
 }
 
+/** When RapidAPI returns a usable listing, skip slow HTML + Puppeteer for Etsy PDPs. */
+async function tryEtsyRapidPrefetchForUrl(workingUrl) {
+  const key = String(process.env.RAPIDAPI_KEY || '').trim();
+  if (!key) return null;
+  try {
+    const raw = String(workingUrl || '').trim();
+    if (!raw) return null;
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!isEtsyHost(u.hostname)) return null;
+    const listingId = extractEtsyListingIdFromUrl(raw);
+    if (!listingId) return null;
+    return await fetchEtsyProductDataViaRapidApi(listingId);
+  } catch {
+    return null;
+  }
+}
+
+/** When RapidAPI returns a usable product, skip slow / blocked Amazon HTML fetches. */
+async function tryAmazonRapidPrefetchForUrl(workingUrl) {
+  const key = String(process.env.RAPIDAPI_KEY || '').trim();
+  if (!key) return null;
+  try {
+    const raw = String(workingUrl || '').trim();
+    if (!raw) return null;
+    if (!isAmazonProductPageForNanoReference(raw)) return null;
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!isAmazonRelatedHost(u.hostname)) return null;
+    const asin = extractAmazonAsinFromUrl(raw);
+    if (!asin) return null;
+    return await fetchAmazonProductDataViaRapidApi({
+      asin,
+      marketplace: resolveRapidApiAmazonMarketplaceFromHost(u.hostname),
+      language: 'en',
+    });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Fetch full article HTML and build richer base metadata + summary.
  * Falls back gracefully to meta tags only if fetch or parsing fails.
@@ -2542,15 +2581,36 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     typeof clientArticleData === 'object' &&
     (clientArticleData.title || clientArticleData.description || clientArticleData.domain);
 
+  let etsyRapidEarly = null;
+  let amazonRapidEarly = null;
+  if (String(process.env.RAPIDAPI_KEY || '').trim()) {
+    etsyRapidEarly = await tryEtsyRapidPrefetchForUrl(workingUrl);
+    if (!etsyRapidEarly) {
+      amazonRapidEarly = await tryAmazonRapidPrefetchForUrl(workingUrl);
+    }
+  }
+  const etsyRapidTitleOk =
+    etsyRapidEarly &&
+    typeof etsyRapidEarly.title === 'string' &&
+    etsyRapidEarly.title.trim().length >= 3;
+  const amazonRapidTitleOk =
+    amazonRapidEarly &&
+    typeof amazonRapidEarly.title === 'string' &&
+    amazonRapidEarly.title.trim().length >= 3;
+  const skipMerchantHtmlScrape = !!(etsyRapidTitleOk || amazonRapidTitleOk);
+
   // In "fast" mode (used for strategic_single fan-out requests), avoid refetching full HTML.
   // We already scraped client-side and pass basic metadata; the slight summary quality drop is
   // worth the latency win and reduces user abandonment.
+  // For Etsy/Amazon PDPs, when RapidAPI already returned a real title, skip HTML entirely (no Puppeteer).
   let html = '';
   if (!fast || !hasClientMeta) {
-    try {
-      html = await fetchArticleHtml(workingUrl);
-    } catch (e) {
-      console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
+    if (!skipMerchantHtmlScrape) {
+      try {
+        html = await fetchArticleHtml(workingUrl);
+      } catch (e) {
+        console.warn('fetchArticleBaseAndSummary fetch error:', e.message || e);
+      }
     }
   }
 
@@ -2565,17 +2625,31 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   base.linkDisplay = derivedDisplay || base.linkDisplay || '';
   base.keyword = derivedKw;
   Object.assign(base, assessUrlBrandingGate(workingUrl));
+
+  if (amazonRapidEarly && amazonRapidTitleOk) {
+    const t = String(amazonRapidEarly.title || '').trim();
+    if (t) base.title = t.slice(0, 300);
+    const d = typeof amazonRapidEarly.description === 'string' ? amazonRapidEarly.description.trim() : '';
+    if (d && (!base.description || String(base.description).trim().length < 30)) {
+      base.description = d.slice(0, 450);
+    }
+    base.amazon_blocked = false;
+    base.amazon_rapidapi_data = amazonRapidEarly;
+  }
+
   // Amazon fallback: if scraping yields a generic / blocked title, flag it so callers can abort
   // BEFORE spending credits (Nano Banana) and BEFORE deducting quota.
-  try {
-    const u = new URL(String(workingUrl || '').trim());
-    if (isAmazonRelatedHost(u.hostname) && looksLikeGenericAmazonTitle(base.title)) {
-      base.amazon_blocked = true;
-      // Keep title empty so downstream copywriters don't anchor on "Amazon product".
-      base.title = '';
+  if (!amazonRapidEarly) {
+    try {
+      const u = new URL(String(workingUrl || '').trim());
+      if (isAmazonRelatedHost(u.hostname) && looksLikeGenericAmazonTitle(base.title)) {
+        base.amazon_blocked = true;
+        // Keep title empty so downstream copywriters don't anchor on "Amazon product".
+        base.title = '';
+      }
+    } catch {
+      /* ignore */
     }
-  } catch {
-    /* ignore */
   }
 
   // Etsy: RapidAPI listing payload when configured; else oEmbed for missing title/thumbnail.
@@ -2607,7 +2681,11 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     bodyText ? bodyText.slice(0, 1000) : '',
   ].filter(Boolean);
 
-  const articleSummary = summaryParts.join('. ').slice(0, 1200);
+  let articleSummary = summaryParts.join('. ').slice(0, 1200);
+  if (amazonRapidEarly && amazonRapidTitleOk && skipMerchantHtmlScrape) {
+    const rs = buildAmazonRapidApiSummary(amazonRapidEarly);
+    if (rs) articleSummary = rs.slice(0, 1200);
+  }
 
   return { base, articleSummary };
 }
@@ -4916,10 +4994,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     // Amazon: if scraping is blocked, try paid product-data API BEFORE spending quota / Nano Banana.
     const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base.canonicalUrl);
-    let amazonRapid = null;
+    let amazonRapid = base.amazon_rapidapi_data || null;
     if (base?.amazon_blocked && isAmazonProductPageForNanoReference(amazonCtxUrl)) {
       const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
-      if (asin) {
+      if (asin && !amazonRapid) {
         try {
           const host = new URL(amazonCtxUrl).hostname;
           amazonRapid = await fetchAmazonProductDataViaRapidApi({
