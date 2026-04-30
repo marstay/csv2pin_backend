@@ -5787,14 +5787,9 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     } catch (e) {
       console.warn('urltopin regenerate-metadata resolveOutboundUrl error:', e.message || e);
     }
-    const base = { ...extractMetaFromHtml('', effectiveUrl), ...(articleData || {}) };
-    const derivedDisplay = buildLinkDisplayLabelFromUrl(effectiveUrl, 80);
-    const derivedKw = deriveKeywordFromArticleUrl(effectiveUrl);
-    base.linkDisplay = derivedDisplay || base.linkDisplay || '';
-    base.keyword = derivedKw;
-    if (base.title) {
-      base.title = await maybeShortenPageTitleForUrlToPin(effectiveUrl, base.title, openai, base.canonicalUrl);
-    }
+    const { base } = await fetchArticleBaseAndSummary(rawUrl, articleData || null, {
+      preResolvedUrl: effectiveUrl,
+    });
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
@@ -5917,15 +5912,9 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       return res.status(500).json({ error: 'Failed to render text-based pin' });
     }
 
-    const base = { ...extractMetaFromHtml('', effectiveUrl), ...(articleData || {}) };
-    const derivedDisplay = buildLinkDisplayLabelFromUrl(effectiveUrl, 80);
-    const derivedKw = deriveKeywordFromArticleUrl(effectiveUrl);
-    base.linkDisplay = derivedDisplay || base.linkDisplay || '';
-    base.keyword = derivedKw;
-    await enrichEtsyListingBaseFromApis(base, effectiveUrl);
-    if (base.title) {
-      base.title = await maybeShortenPageTitleForUrlToPin(effectiveUrl, base.title, openai, base.canonicalUrl);
-    }
+    const { base } = await fetchArticleBaseAndSummary(rawUrl, articleData || null, {
+      preResolvedUrl: effectiveUrl,
+    });
     const year = new Date().getFullYear();
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
@@ -5968,9 +5957,9 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     ) {
       try {
         // Prefer RapidAPI for Amazon (single fetch); it provides both title + images.
-        let amazonRapid = null;
+        let amazonRapid = base.amazon_rapidapi_data || null;
         const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
-        if (asin) {
+        if (asin && !amazonRapid) {
           try {
             const host = new URL(amazonCtxUrl).hostname;
             amazonRapid = await fetchAmazonProductDataViaRapidApi({
