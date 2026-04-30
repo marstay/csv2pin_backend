@@ -2768,7 +2768,7 @@ function sanitizeDescription(input) {
 }
 
 async function generatePinterestAltText(
-  { title, description, overlayText, styleLabel, linkDisplay },
+  { title, description, overlayText, styleLabel, linkDisplay, nanoBananaPrompt },
   openaiClient
 ) {
   try {
@@ -2777,24 +2777,32 @@ async function generatePinterestAltText(
     const headline = String(overlayText?.headline || '').trim();
     const sub = String(overlayText?.subheadline || '').trim();
     const ld = String(linkDisplay || '').trim();
+    const nb = String(nanoBananaPrompt || '').trim();
     if (!t && !headline) return '';
 
     const prompt =
-      `Write concise Pinterest image alt text for accessibility.\n` +
+      `Write Pinterest image alt text for accessibility.\n` +
+      `Describe what someone would see if they could not see the image.\n` +
       `Rules:\n` +
       `- Exactly 1 sentence.\n` +
       `- Max 240 characters.\n` +
-      `- Describe what the pin likely shows + the visible on-image text.\n` +
-      `- No hashtags. No URLs. No CTAs. No emojis.\n` +
-      `- If there's a headline/subheadline, include it verbatim in quotes.\n\n` +
-      `Context:\n` +
+      `- Describe the visual content (subject, setting, objects, colors/style, composition).\n` +
+      `- Do NOT quote or restate any headline/subheadline/overlay text.\n` +
+      `- Do NOT mention "headline" or "subheadline".\n` +
+      `- Avoid marketing language.\n` +
+      `- No hashtags. No URLs. No CTAs. No emojis.\n\n` +
+      (nb
+        ? `IMAGE PROMPT (source of truth for what the image contains):\n<<<${nb.slice(0, 2200)}>>>\n\n`
+        : '') +
+      `Context (not to be quoted):\n` +
       `- Pin title: ${t.slice(0, 120)}\n` +
       `- Pin description (context only): ${d.slice(0, 220)}\n` +
-      `- On-image headline: ${headline || '(none)'}\n` +
-      `- On-image subheadline: ${sub || '(none)'}\n` +
-      `- Style: ${String(styleLabel || '').slice(0, 80)}\n` +
-      `- Source label: ${ld.slice(0, 80)}\n\n` +
-      `Return only the alt text sentence.`;
+      `- Style label: ${String(styleLabel || '').slice(0, 80)}\n` +
+      `- Source label: ${ld.slice(0, 80)}\n` +
+      (headline || sub
+        ? `- Note: the image may include a text overlay (do not repeat its words).\n`
+        : '') +
+      `\nReturn only the alt text sentence.`;
 
     const completion = await openaiClient.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -2807,6 +2815,13 @@ async function generatePinterestAltText(
       .trim();
     out = out.replace(/^["'`]+|["'`]+$/g, '').trim();
     out = out.replace(/https?:\/\/\S+/g, '').replace(/#[A-Za-z0-9_]+/g, '').trim();
+    // If the model still describes the overlay as "headline/subheadline/reads:", scrub that phrasing.
+    out = out
+      .replace(/\b(featuring|with|showing)\s+(the\s+)?(headline|subheadline)\b[^.]*\.?/gi, '')
+      .replace(/\b(headline|subheadline)\b\s*(reads|says)?\s*[:\-–—]?\s*["'`][^"'`]{3,}["'`]/gi, '')
+      .replace(/\b(text\s+overlay)\b\s*(reads|says)?\s*[:\-–—]?\s*["'`][^"'`]{3,}["'`]/gi, 'text overlay')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
     if (out.length > 240) out = out.slice(0, 240).trim();
     return out;
   } catch (e) {
@@ -4756,6 +4771,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           overlayText,
           styleLabel: sp.label,
           linkDisplay: domain || base.linkDisplay || '',
+          nanoBananaPrompt: imagePrompt,
         },
         openai
       );
