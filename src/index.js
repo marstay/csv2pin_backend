@@ -1515,6 +1515,11 @@ function extractEtsyListingIdFromUrl(urlString) {
   }
 }
 
+/** True for `/listing/{id}/…` on Etsy — listing HTML is not fetchable server-side (403); use RapidAPI + oEmbed only. */
+function isEtsyListingPageUrl(urlString) {
+  return !!extractEtsyListingIdFromUrl(urlString);
+}
+
 function pushUniqueAmazonImageUrl(ordered, seen, raw) {
   const n = normalizeAmazonImageUrlString(raw);
   if (!n || seen.has(n)) return;
@@ -2670,12 +2675,16 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     amazonRapidEarly &&
     typeof amazonRapidEarly.title === 'string' &&
     amazonRapidEarly.title.trim().length >= 3;
-  const skipMerchantHtmlScrape = !!(etsyRapidTitleOk || amazonRapidTitleOk);
+  // Amazon: skip HTML when RapidAPI returned a real title. Etsy listing pages: always skip HTML (403 from Etsy;
+  // title/thumb come from RapidAPI + oEmbed in enrichEtsyListingBaseFromApis). All other URLs still use
+  // fetchArticleHtml (+ Puppeteer on hard blocks).
+  const skipEtsyListingHtml = isEtsyListingPageUrl(workingUrl);
+  const skipMerchantHtmlScrape = !!(etsyRapidTitleOk || amazonRapidTitleOk) || skipEtsyListingHtml;
 
   // In "fast" mode (used for strategic_single fan-out requests), avoid refetching full HTML.
   // We already scraped client-side and pass basic metadata; the slight summary quality drop is
   // worth the latency win and reduces user abandonment.
-  // For Etsy/Amazon PDPs, when RapidAPI already returned a real title, skip HTML entirely (no Puppeteer).
+  // For Amazon PDPs with RapidAPI title, or any Etsy listing URL, skip HTML entirely (no Puppeteer).
   let html = '';
   if (!fast || !hasClientMeta) {
     if (!skipMerchantHtmlScrape) {
@@ -4917,7 +4926,8 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
     const rawUrl = String(url || '').trim();
-    // Same pipeline as generate: redirect resolve → RapidAPI-first Amazon/Etsy → HTML only when needed.
+    // Shared pipeline with generate: short-link resolve; RapidAPI-first only for Etsy listings + Amazon PDPs
+    // when `RAPIDAPI_KEY` is set. All other URLs still load via full HTML scrape (+ Puppeteer fallback).
     const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, null, null);
 
     const hasScrapeContent =
@@ -5237,7 +5247,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       process.env.USE_DUMMY_IMAGES !== 'true'
     ) {
       try {
-        const pageHtml = await fetchArticleHtml(refHtmlUrl);
+        // Etsy listing HTML 403s server-side; refs already come from RapidAPI / oEmbed on the main URL path.
+        let pageHtml = '';
+        if (!isEtsyListingPageUrl(refHtmlUrl)) {
+          pageHtml = await fetchArticleHtml(refHtmlUrl);
+        }
         if (pageHtml && pageHtml.length > 200) {
           const candidates = extractGenericPageImageUrlsFromHtml(pageHtml, refHtmlUrl);
           if (candidates.length > 0) {
@@ -6094,7 +6108,10 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0'
     ) {
       try {
-        const pageHtml = await fetchArticleHtml(refHtmlUrl);
+        let pageHtml = '';
+        if (!isEtsyListingPageUrl(refHtmlUrl)) {
+          pageHtml = await fetchArticleHtml(refHtmlUrl);
+        }
         if (pageHtml && pageHtml.length > 200) {
           const candidates = extractGenericPageImageUrlsFromHtml(pageHtml, refHtmlUrl);
           if (candidates.length > 0) {
