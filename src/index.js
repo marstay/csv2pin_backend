@@ -2128,10 +2128,19 @@ async function processScheduledPin(pin) {
     }
 
     // Create Pinterest pin using existing logic
+    const altFromScheduled = (() => {
+      try {
+        const v = pin?.original_pin_data?.alt_text;
+        return typeof v === 'string' ? v.trim() : '';
+      } catch {
+        return '';
+      }
+    })();
     const requestBody = {
       board_id: pin.board_id,
       title: pin.title,
       description: pin.description,
+      ...(altFromScheduled ? { alt_text: altFromScheduled } : {}),
       media_source: {
         source_type: 'image_url',
         url: pin.image_url,
@@ -2756,6 +2765,54 @@ function sanitizeDescription(input) {
   // Enforce 450 char limit
   if (desc.length > 450) desc = desc.slice(0, 450);
   return desc;
+}
+
+async function generatePinterestAltText(
+  { title, description, overlayText, styleLabel, linkDisplay },
+  openaiClient
+) {
+  try {
+    const t = String(title || '').trim();
+    const d = String(description || '').trim();
+    const headline = String(overlayText?.headline || '').trim();
+    const sub = String(overlayText?.subheadline || '').trim();
+    const ld = String(linkDisplay || '').trim();
+    if (!t && !headline) return '';
+
+    const prompt =
+      `Write concise Pinterest image alt text for accessibility.\n` +
+      `Rules:\n` +
+      `- Exactly 1 sentence.\n` +
+      `- Max 240 characters.\n` +
+      `- Describe what the pin likely shows + the visible on-image text.\n` +
+      `- No hashtags. No URLs. No CTAs. No emojis.\n` +
+      `- If there's a headline/subheadline, include it verbatim in quotes.\n\n` +
+      `Context:\n` +
+      `- Pin title: ${t.slice(0, 120)}\n` +
+      `- Pin description (context only): ${d.slice(0, 220)}\n` +
+      `- On-image headline: ${headline || '(none)'}\n` +
+      `- On-image subheadline: ${sub || '(none)'}\n` +
+      `- Style: ${String(styleLabel || '').slice(0, 80)}\n` +
+      `- Source label: ${ld.slice(0, 80)}\n\n` +
+      `Return only the alt text sentence.`;
+
+    const completion = await openaiClient.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 120,
+      temperature: 0.2,
+    });
+    let out = String(completion.choices?.[0]?.message?.content || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    out = out.replace(/^["'`]+|["'`]+$/g, '').trim();
+    out = out.replace(/https?:\/\/\S+/g, '').replace(/#[A-Za-z0-9_]+/g, '').trim();
+    if (out.length > 240) out = out.slice(0, 240).trim();
+    return out;
+  } catch (e) {
+    console.warn('generatePinterestAltText error:', e.message || e);
+    return '';
+  }
 }
 
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
@@ -4692,6 +4749,16 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }
 
       const metaExtra = meta;
+      const altText = await generatePinterestAltText(
+        {
+          title: pinTitle,
+          description: pinDescription,
+          overlayText,
+          styleLabel: sp.label,
+          linkDisplay: domain || base.linkDisplay || '',
+        },
+        openai
+      );
       const pinRecord = {
         styleId: sp.id,
         styleLabel: sp.label,
@@ -4699,6 +4766,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         imageUrl,
         title: pinTitle,
         description: pinDescription,
+        altText,
         hashtags,
         link: url,
         overlayText,
@@ -4776,6 +4844,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           source: 'urltopin',
           overlayText,
           bakedInText: overlayTextForPrompt,
+          ...(altText ? { alt_text: altText } : {}),
           ...(userCompositeSourceUrl && {
             userCompositeSourceUrl,
             imageGenerationMode: 'user_composite',
@@ -6538,7 +6607,7 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
 
   if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
 
-  const { image_url, title, description, board_id, link, account_id } = req.body;
+  const { image_url, title, description, board_id, link, account_id, alt_text: rawAltText } = req.body;
   if (!image_url || !title || !description || !board_id) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
@@ -6549,10 +6618,17 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
   }
 
   try {
+    const alt_text =
+      String(rawAltText || '').trim() ||
+      (await generatePinterestAltText(
+        { title, description, overlayText: null, styleLabel: 'pinterest_create', linkDisplay: '' },
+        openai
+      ));
     const requestBody = {
       board_id,
       title,
       description,
+      ...(alt_text ? { alt_text } : {}),
       media_source: {
         source_type: 'image_url',
         url: image_url,
@@ -6615,7 +6691,8 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
     image_url, title, description, board_id, link, account_id,
     scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern,
     force_duplicate = false,
-    bake
+    bake,
+    alt_text: rawAltText
   } = req.body;
 
   // Validate required fields
@@ -6729,9 +6806,18 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
       }
     }
 
+    // Generate alt text (or accept provided) for accessibility.
+    const alt_text =
+      String(rawAltText || '').trim() ||
+      (await generatePinterestAltText(
+        { title, description, overlayText: null, styleLabel: 'pinterest_schedule', linkDisplay: '' },
+        openai
+      ));
+
     // Store original pin data for reference
     const originalPinData = {
       image_url: finalImageUrl, title, description, board_id, link, account_id,
+      ...(alt_text ? { alt_text } : {}),
       user_id: user.id, created_at: new Date().toISOString()
     };
 
