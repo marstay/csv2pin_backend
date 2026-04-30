@@ -1568,7 +1568,13 @@ function resolveRapidApiAmazonMarketplaceFromHost(hostname) {
   return 'com';
 }
 
+// Short-lived cache to avoid hammering RapidAPI when URL→Pin strategic mode fans out multiple calls.
+const AMAZON_RAPIDAPI_CACHE_TTL_MS = 2 * 60 * 1000;
+const amazonRapidApiCache = new Map(); // key -> { ts, data }
+const amazonRapidApiInFlight = new Map(); // key -> Promise<data|null>
+
 async function fetchAmazonProductDataViaRapidApi({ asin, marketplace, language }) {
+  let cacheKey = '';
   try {
     const key = String(process.env.RAPIDAPI_KEY || '').trim();
     const host = String(process.env.RAPIDAPI_AMAZON_HOST || '').trim() ||
@@ -1577,27 +1583,51 @@ async function fetchAmazonProductDataViaRapidApi({ asin, marketplace, language }
 
     const mp = String(marketplace || 'com').trim();
     const lang = String(language || 'en').trim();
+    cacheKey = `${host}::${mp}::${lang}::${String(asin).toUpperCase()}`;
+    const now = Date.now();
+    const cached = amazonRapidApiCache.get(cacheKey);
+    if (cached && cached.data && now - cached.ts < AMAZON_RAPIDAPI_CACHE_TTL_MS) {
+      return cached.data;
+    }
+    const inflight = amazonRapidApiInFlight.get(cacheKey);
+    if (inflight) {
+      return await inflight;
+    }
     const url =
       `https://${host}/product-details?asin=${encodeURIComponent(asin)}&marketplace=${encodeURIComponent(mp)}&language=${encodeURIComponent(lang)}`;
 
-    const resp = await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          'x-rapidapi-key': key,
-          'x-rapidapi-host': host,
-          Accept: 'application/json',
+    const p = (async () => {
+      const resp = await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            'x-rapidapi-key': key,
+            'x-rapidapi-host': host,
+            Accept: 'application/json',
+          },
         },
-      },
-      20000
-    );
-    if (!resp.ok) return null;
-    const json = await resp.json().catch(() => null);
-    if (!json || json.status !== true || !json.data) return null;
-    return json.data;
+        20000
+      );
+      if (!resp.ok) return null;
+      const json = await resp.json().catch(() => null);
+      if (!json || json.status !== true || !json.data) return null;
+      amazonRapidApiCache.set(cacheKey, { ts: Date.now(), data: json.data });
+      return json.data;
+    })();
+    amazonRapidApiInFlight.set(cacheKey, p);
+    const data = await p;
+    return data;
   } catch (e) {
     console.warn('fetchAmazonProductDataViaRapidApi:', e.message || e);
     return null;
+  } finally {
+    if (cacheKey) {
+      try {
+        amazonRapidApiInFlight.delete(cacheKey);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }
 
