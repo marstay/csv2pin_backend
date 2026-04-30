@@ -1269,8 +1269,16 @@ function isAmazonProductPageForNanoReference(urlString) {
   }
 }
 
-/** Nano Banana + Amazon reference images often 422 or look wrong on these infographic layouts. */
-const AMAZON_REF_EXCLUDED_INFOGRAPHIC_STYLES = new Set(['timeline_infographic', 'step_cards_3']);
+/** Nano Banana + reference images often 422 or look wrong on infographic-style layouts. */
+function isInfographicLikeStyleId(styleId) {
+  const s = String(styleId || '').trim().toLowerCase();
+  if (!s) return false;
+  // Explicit known styles
+  if (s === 'timeline_infographic' || s === 'step_cards_3') return true;
+  // Generic guard for any future "infographic" layouts
+  if (s.includes('infographic')) return true;
+  return false;
+}
 
 const AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS = [
   'minimal_elegant',
@@ -1288,7 +1296,7 @@ function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategic
   const plan = strategicPlan ? strategicPlan.map((p) => ({ ...p })) : null;
   let fb = 0;
   for (let i = 0; i < styles.length; i++) {
-    if (!AMAZON_REF_EXCLUDED_INFOGRAPHIC_STYLES.has(styles[i])) continue;
+    if (!isInfographicLikeStyleId(styles[i])) continue;
     const replacement =
       AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[fb % AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS.length];
     fb++;
@@ -1300,7 +1308,7 @@ function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategic
 
 function replaceInfographicStyleIdForAmazonNanoRefs(styleId, hasReferenceImages) {
   if (!hasReferenceImages || !styleId) return styleId;
-  if (!AMAZON_REF_EXCLUDED_INFOGRAPHIC_STYLES.has(styleId)) return styleId;
+  if (!isInfographicLikeStyleId(styleId)) return styleId;
   return AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[0];
 }
 
@@ -1683,6 +1691,32 @@ async function fetchAmazonAsinWidgetImageUrl(amazonUrlString) {
     return isAllowedAmazonCdnImageUrl(finalUrl) ? finalUrl : '';
   } catch {
     return '';
+  }
+}
+
+async function fetchEtsyOembed(listingUrl) {
+  try {
+    const raw = String(listingUrl || '').trim();
+    if (!raw) return null;
+    const u = new URL(raw);
+    if (!isEtsyHost(u.hostname)) return null;
+    const oembedUrl = `https://www.etsy.com/oembed?url=${encodeURIComponent(u.href)}&format=json`;
+    const resp = await fetchWithTimeout(
+      oembedUrl,
+      { headers: { ...URL_SCRAPE_HEADERS, Accept: 'application/json' } },
+      20000
+    );
+    if (!resp.ok) return null;
+    const json = await resp.json().catch(() => null);
+    if (!json || typeof json !== 'object') return null;
+    return {
+      title: typeof json.title === 'string' ? json.title.trim() : '',
+      thumbnail_url: typeof json.thumbnail_url === 'string' ? json.thumbnail_url.trim() : '',
+      provider_name: typeof json.provider_name === 'string' ? json.provider_name.trim() : '',
+    };
+  } catch (e) {
+    console.warn('fetchEtsyOembed:', e.message || e);
+    return null;
   }
 }
 
@@ -2139,6 +2173,20 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
       base.amazon_blocked = true;
       // Keep title empty so downstream copywriters don't anchor on "Amazon product".
       base.title = '';
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // Etsy fallback: if we failed to scrape (common), use Etsy oEmbed to get a real title + thumbnail.
+  try {
+    const u = new URL(String(url || '').trim());
+    if (isEtsyHost(u.hostname) && (!base.title || base.title.length < 3)) {
+      const oe = await fetchEtsyOembed(u.href);
+      if (oe) {
+        if (!base.title && oe.title) base.title = oe.title.slice(0, 180);
+        if (oe.thumbnail_url) base.etsy_oembed_thumbnail = oe.thumbnail_url;
+      }
     }
   } catch {
     /* ignore */
@@ -4526,6 +4574,20 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     let nanoBananaReferenceInputs = [];
     let nanoBananaReferenceSource = null;
     const refHtmlUrl = amazonCtxUrl || url;
+    if (!useTextBased && !useUserComposite) {
+      // Etsy: if oEmbed gave us a thumbnail, use it as a reference image even when HTML scraping fails.
+      const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
+      if (etsyThumb) {
+        try {
+          nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], req.user.id);
+          if (nanoBananaReferenceInputs.length > 0) {
+            nanoBananaReferenceSource = 'page';
+          }
+        } catch (e) {
+          console.warn('urltopin Etsy oEmbed thumbnail mirror error:', e.message || e);
+        }
+      }
+    }
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       !useTextBased &&
@@ -5328,30 +5390,90 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     if (base.title) {
       base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
     }
+    // Etsy fallback: use oEmbed to fetch a real title + thumbnail for reference images.
+    try {
+      const u = new URL(String(url || '').trim());
+      if (isEtsyHost(u.hostname) && (!base.title || base.title.length < 3)) {
+        const oe = await fetchEtsyOembed(u.href);
+        if (oe) {
+          if (!base.title && oe.title) base.title = oe.title.slice(0, 180);
+          if (oe.thumbnail_url) base.etsy_oembed_thumbnail = oe.thumbnail_url;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
     const year = new Date().getFullYear();
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
     const keyword = base.keyword || '';
-    const topic = base.title || 'Does Brown Sugar Expire?';
+    let topic = base.title || 'Does Brown Sugar Expire?';
 
     let regenNanoReferenceInputs = [];
     let regenNanoReferenceSource = null;
     const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
     const refHtmlUrl = amazonCtxUrl || url;
+    // Etsy: if oEmbed gave us a thumbnail, use it as a reference image even when HTML scraping fails.
+    if (isEtsyHost(new URL(url).hostname)) {
+      const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
+      if (etsyThumb) {
+        try {
+          regenNanoReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], req.user.id);
+          if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'page';
+        } catch (e) {
+          console.warn('urltopin regenerate Etsy oEmbed thumbnail mirror error:', e.message || e);
+        }
+      }
+    }
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       isAmazonProductPageForNanoReference(amazonCtxUrl)
     ) {
       try {
-        const azHtml = await fetchArticleHtml(amazonCtxUrl);
-        let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
-        if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
-          const widgetImg = await fetchAmazonAsinWidgetImageUrl(amazonCtxUrl);
-          if (widgetImg) candidates = [widgetImg];
+        // Prefer RapidAPI for Amazon (single fetch); it provides both title + images.
+        let amazonRapid = null;
+        const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
+        if (asin) {
+          try {
+            const host = new URL(amazonCtxUrl).hostname;
+            amazonRapid = await fetchAmazonProductDataViaRapidApi({
+              asin,
+              marketplace: resolveRapidApiAmazonMarketplaceFromHost(host),
+              language: 'en',
+            });
+          } catch {
+            amazonRapid = null;
+          }
         }
-        if (candidates.length > 0) {
-          regenNanoReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
-          if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'amazon_product';
+
+        if (amazonRapid) {
+          if (typeof amazonRapid.title === 'string' && amazonRapid.title.trim()) {
+            topic = amazonRapid.title.trim();
+          }
+          if (typeof amazonRapid.description === 'string' && amazonRapid.description.trim()) {
+            base.description = amazonRapid.description.trim().slice(0, 450);
+          }
+          const candidates = Array.isArray(amazonRapid.images)
+            ? amazonRapid.images
+                .map((im) => (im && typeof im === 'object' ? (im.hi_res || im.image || im.large || '') : ''))
+                .filter(Boolean)
+            : [];
+          if (candidates.length > 0) {
+            regenNanoReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+            if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'amazon_product';
+          }
+        } else {
+          // Fallback: try HTML-derived images (may be blocked) then widget image.
+          const azHtml = await fetchArticleHtml(amazonCtxUrl);
+          let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+          if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
+            const widgetImg = await fetchAmazonAsinWidgetImageUrl(amazonCtxUrl);
+            if (widgetImg) candidates = [widgetImg];
+          }
+          if (candidates.length > 0) {
+            regenNanoReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+            if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'amazon_product';
+          }
         }
       } catch (e) {
         console.warn('urltopin regenerate Amazon refs:', e.message || e);
