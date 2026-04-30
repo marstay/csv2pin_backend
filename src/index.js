@@ -1558,6 +1558,75 @@ function resolveAmazonMarketplaceCodeFromHost(hostname) {
   return 'US';
 }
 
+function resolveRapidApiAmazonMarketplaceFromHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  // RapidAPI example uses marketplace=com|co.uk|de etc.
+  if (h.endsWith('.co.uk')) return 'co.uk';
+  if (h.endsWith('.com.au')) return 'com.au';
+  const m = h.match(/amazon\.([a-z.]{2,})$/i);
+  if (m && m[1]) return m[1].toLowerCase();
+  return 'com';
+}
+
+async function fetchAmazonProductDataViaRapidApi({ asin, marketplace, language }) {
+  try {
+    const key = String(process.env.RAPIDAPI_KEY || '').trim();
+    const host = String(process.env.RAPIDAPI_AMAZON_HOST || '').trim() ||
+      'real-time-amazon-data-the-most-complete.p.rapidapi.com';
+    if (!key || !asin) return null;
+
+    const mp = String(marketplace || 'com').trim();
+    const lang = String(language || 'en').trim();
+    const url =
+      `https://${host}/product-details?asin=${encodeURIComponent(asin)}&marketplace=${encodeURIComponent(mp)}&language=${encodeURIComponent(lang)}`;
+
+    const resp = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          'x-rapidapi-key': key,
+          'x-rapidapi-host': host,
+          Accept: 'application/json',
+        },
+      },
+      20000
+    );
+    if (!resp.ok) return null;
+    const json = await resp.json().catch(() => null);
+    if (!json || json.status !== true || !json.data) return null;
+    return json.data;
+  } catch (e) {
+    console.warn('fetchAmazonProductDataViaRapidApi:', e.message || e);
+    return null;
+  }
+}
+
+function buildAmazonRapidApiSummary(data) {
+  if (!data || typeof data !== 'object') return '';
+  const parts = [];
+  const title = typeof data.title === 'string' ? data.title.trim() : '';
+  const desc = typeof data.description === 'string' ? data.description.trim() : '';
+  const brand =
+    data.tech_specs && typeof data.tech_specs === 'object' && typeof data.tech_specs.brand_name === 'string'
+      ? data.tech_specs.brand_name.trim()
+      : '';
+  const bullets = Array.isArray(data.bullet_points)
+    ? data.bullet_points.map((b) => String(b || '').trim()).filter(Boolean)
+    : [];
+  const cats = Array.isArray(data.category_path)
+    ? data.category_path.map((c) => (c && typeof c === 'object' && c.name ? String(c.name).trim() : '')).filter(Boolean)
+    : [];
+
+  if (title) parts.push(`Product: ${title}`);
+  if (brand) parts.push(`Brand: ${brand}`);
+  if (cats.length) parts.push(`Category: ${cats.slice(-3).join(' > ')}`);
+  if (desc) parts.push(`Description: ${desc}`);
+  if (bullets.length) parts.push(`Key points: ${bullets.slice(0, 8).join(' • ')}`);
+
+  const out = parts.join('\n');
+  return out.slice(0, 1400);
+}
+
 async function fetchAmazonAsinWidgetImageUrl(amazonUrlString) {
   try {
     const asin = extractAmazonAsinFromUrl(amazonUrlString);
@@ -1920,29 +1989,33 @@ const URL_SCRAPE_HEADERS = {
 };
 
 /**
- * Load public article HTML: fetch with browser headers first; on 403/401/503/429 or network error,
- * retry with Puppeteer (Medium often blocks datacenter fetch).
+ * Load public article HTML: fetch with browser headers first.
+ * - Amazon: single fetch only — if blocked/consent or non-OK, return '' so URL→Pin can use RapidAPI (no Puppeteer).
+ * - Other sites: on 403/401/503/429 or network error, retry with Puppeteer (e.g. Medium).
  */
 async function fetchArticleHtml(url) {
+  let hostIsAmazon = false;
+  try {
+    const u = new URL(String(url || '').trim());
+    hostIsAmazon = isAmazonRelatedHost(u.hostname);
+  } catch {
+    hostIsAmazon = false;
+  }
+
   try {
     const resp = await fetch(url, { redirect: 'follow', headers: URL_SCRAPE_HEADERS });
     if (resp.ok) {
       const html = await resp.text();
-      // Amazon often returns a 200 "consent / bot check" interstitial that breaks scraping.
-      // If we detect that pattern, retry via Puppeteer even though status is 200.
-      try {
-        const u = new URL(String(url || '').trim());
-        if (isAmazonRelatedHost(u.hostname) && detectAmazonBotOrConsentPage(html)) {
-          const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
-          if (puppetHtml && !detectAmazonBotOrConsentPage(puppetHtml)) return puppetHtml;
-        }
-      } catch {
-        /* ignore */
+      if (hostIsAmazon && detectAmazonBotOrConsentPage(html)) {
+        return '';
       }
       return html;
     }
     const status = resp.status;
     console.warn('fetchArticleHtml non-OK:', String(url).slice(0, 96), status);
+    if (hostIsAmazon) {
+      return '';
+    }
     if (status === 403 || status === 401 || status === 503 || status === 429) {
       const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
       if (puppetHtml) return puppetHtml;
@@ -1950,6 +2023,9 @@ async function fetchArticleHtml(url) {
     return '';
   } catch (e) {
     console.warn('fetchArticleHtml error:', e.message || e);
+    if (hostIsAmazon) {
+      return '';
+    }
     const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
     return puppetHtml || '';
   }
@@ -4338,18 +4414,50 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     }
 
     const fastForFanOut = isStrategicSingle && !!articleData;
-    const { base, articleSummary } =
+    const fetchedBase =
       req._fetchedArticle || (await fetchArticleBaseAndSummary(url, articleData, fastForFanOut ? { fast: true } : null));
+    const base = fetchedBase.base;
+    let articleSummary = fetchedBase.articleSummary;
 
-    // Amazon: if we can't read the real product page (blocked/consent), abort BEFORE quota deduction
-    // and BEFORE calling Nano Banana.
+    // Amazon: if scraping is blocked, try paid product-data API BEFORE spending quota / Nano Banana.
     const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
+    let amazonRapid = null;
     if (base?.amazon_blocked && isAmazonProductPageForNanoReference(amazonCtxUrl)) {
-      return res.status(409).json({
-        error: 'amazon_blocked',
-        message:
-          'Amazon blocked automated access to this product page, so we can’t reliably read the product title/content right now. Please try again later, or use a non-Amazon landing page (your blog post / product page) for this pin.',
-      });
+      const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
+      if (asin) {
+        try {
+          const host = new URL(amazonCtxUrl).hostname;
+          amazonRapid = await fetchAmazonProductDataViaRapidApi({
+            asin,
+            marketplace: resolveRapidApiAmazonMarketplaceFromHost(host),
+            language: 'en',
+          });
+        } catch {
+          amazonRapid = null;
+        }
+      }
+      if (!amazonRapid) {
+        return res.status(409).json({
+          error: 'amazon_blocked',
+          message:
+            'Amazon blocked automated access to this product page, so we can’t reliably read the product title/content right now. Please try again later, or use a non-Amazon landing page (your blog post / product page) for this pin.',
+        });
+      }
+      if (!base.title && typeof amazonRapid.title === 'string' && amazonRapid.title.trim()) {
+        base.title = amazonRapid.title.trim();
+      }
+      if (
+        (!base.description || looksLikeGenericAmazonTitle(base.description)) &&
+        typeof amazonRapid.description === 'string' &&
+        amazonRapid.description.trim()
+      ) {
+        base.description = amazonRapid.description.trim().slice(0, 450);
+      }
+      const rapidSummary = buildAmazonRapidApiSummary(amazonRapid);
+      if (rapidSummary) {
+        articleSummary = rapidSummary;
+      }
+      base.amazon_blocked = false;
     }
 
     // Own-photo composites use a separate monthly cap (no image model). AI pins use pins_used.
@@ -4396,6 +4504,24 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       isAmazonProductPageForNanoReference(amazonCtxUrl)
     ) {
       try {
+        // If we already have paid API data (because scraping was blocked), use its images directly.
+        if (amazonRapid && Array.isArray(amazonRapid.images) && amazonRapid.images.length > 0) {
+          const candidates = amazonRapid.images
+            .map((im) => (im && typeof im === 'object' ? (im.hi_res || im.image || im.large || '') : ''))
+            .filter(Boolean);
+          if (candidates.length > 0) {
+            nanoBananaReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
+            if (nanoBananaReferenceInputs.length > 0) {
+              nanoBananaReferenceSource = 'amazon_product';
+              console.log(
+                `urltopin: Nano Banana Amazon reference images (RapidAPI): ${nanoBananaReferenceInputs.length} (${String(amazonCtxUrl).slice(0, 96)})`
+              );
+            }
+          }
+        }
+        if (nanoBananaReferenceInputs.length > 0) {
+          // already populated from paid API
+        } else {
         const azHtml = await fetchArticleHtml(amazonCtxUrl);
         let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
         if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
@@ -4410,6 +4536,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
               `urltopin: Nano Banana Amazon reference images: ${nanoBananaReferenceInputs.length} (${String(amazonCtxUrl).slice(0, 96)})`
             );
           }
+        }
         }
       } catch (e) {
         console.warn('urltopin Amazon product images for Nano:', e.message || e);
