@@ -596,21 +596,94 @@ async function getCurrentUsageSnapshot(userId) {
   };
 }
 
+/**
+ * GoTrue `getUser` uses fetch; on Render ↔ Supabase you can see transient TLS blips (ECONNRESET).
+ * Retries a few times; callers should treat repeated failure as 503, not 401.
+ */
+function isTransientSupabaseNetworkError(err) {
+  if (!err) return false;
+  const cause = err.cause || err;
+  const code = cause.code || err.code;
+  if (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED' ||
+    code === 'ENOTFOUND' ||
+    code === 'UND_ERR_SOCKET' ||
+    code === 'EAI_AGAIN'
+  ) {
+    return true;
+  }
+  const msg = `${err.message || ''} ${cause.message || ''}`.toLowerCase();
+  if (
+    msg.includes('fetch failed') ||
+    msg.includes('socket disconnected') ||
+    msg.includes('tls connection') ||
+    msg.includes('network error') ||
+    msg.includes('aborted')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function supabaseAuthGetUser(accessToken) {
+  const maxAttempts = 3;
+  const baseDelayMs = 400;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const out = await supabaseAdmin.auth.getUser(accessToken);
+      const err = out?.error;
+      if (!err) return out;
+      lastErr = err;
+      if (!isTransientSupabaseNetworkError(err)) return out;
+    } catch (e) {
+      lastErr = e;
+      if (!isTransientSupabaseNetworkError(e)) {
+        return { data: { user: null }, error: e };
+      }
+    }
+    if (attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, baseDelayMs * attempt));
+    }
+  }
+  console.warn('supabaseAuthGetUser: exhausted retries', lastErr?.message || lastErr);
+  return { data: { user: null }, error: lastErr };
+}
+
+/** Returns authenticated user or null after sending 401 / 503 on `res`. */
+function respondSupabaseAuth(res, user, err) {
+  if (err && isTransientSupabaseNetworkError(err)) {
+    res.status(503).json({
+      error: 'Authentication service temporarily unavailable. Please retry in a moment.',
+      code: 'auth_upstream_error',
+    });
+    return null;
+  }
+  if (err || !user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return null;
+  }
+  return user;
+}
+
 async function requirePro(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user }, error } = await supabaseAuthGetUser(token);
+  const authed = respondSupabaseAuth(res, user, error);
+  if (!authed) return;
   const { data: profile } = await supabaseAdmin
     .from('profiles')
     .select('is_pro')
-    .eq('id', user.id)
+    .eq('id', authed.id)
     .single();
   if (!profile?.is_pro) {
     return res.status(403).json({ error: 'Pro membership required.' });
   }
-  req.user = user;
+  req.user = authed;
   next();
 }
 
@@ -6235,9 +6308,10 @@ async function requireUser(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
-  req.user = user;
+  const { data: { user }, error } = await supabaseAuthGetUser(token);
+  const authed = respondSupabaseAuth(res, user, error);
+  if (!authed) return;
+  req.user = authed;
   next();
 }
 
@@ -7264,8 +7338,9 @@ app.post('/api/pinterest/oauth', async (req, res) => {
   if (!code || !redirectUri) return res.status(400).json({ error: 'Missing code or redirectUri' });
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const reconnectRaw =
     typeof reconnectAccountIdBody === 'string' ? reconnectAccountIdBody.trim() : '';
@@ -7380,8 +7455,9 @@ app.get('/api/pinterest/accounts', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
   const { data, error } = await supabaseAdmin
     .from('pinterest_accounts')
     .select('id, account_name, created_at')
@@ -7397,8 +7473,9 @@ app.delete('/api/pinterest/accounts/:id', async (req, res) => {
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
 
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const accountId = req.params.id;
   if (!accountId) return res.status(400).json({ error: 'Missing account id' });
@@ -7469,8 +7546,9 @@ app.get('/api/pinterest/boards', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const accountId = extractAccountId(req);
   const accessToken = await getPinterestAccessTokenForUser(user.id, accountId);
@@ -7494,8 +7572,9 @@ app.post('/api/pinterest/create-board', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { name, description, privacy, account_id } = req.body || {};
   if (!name || typeof name !== 'string' || !name.trim()) {
@@ -7543,8 +7622,9 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
 
@@ -7623,8 +7703,9 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
 
@@ -7809,8 +7890,9 @@ app.get('/api/pinterest/scheduled-pins', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { status, limit = 50, offset = 0, date_from, date_to, account_id } = req.query;
 
@@ -7881,8 +7963,9 @@ app.get('/api/pinterest/scheduled-pins/preflight', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const windowHours = Math.min(24 * 14, Math.max(1, parseInt(req.query.window_hours || '72', 10))); // 1h..14d
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '100', 10)));
@@ -8008,8 +8091,9 @@ app.post('/api/pinterest/scheduled-pins/bulk-cancel', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const scope = req.body?.scope === 'all_waiting' ? 'all_waiting' : 'due';
   const nowIso = new Date().toISOString();
@@ -8092,8 +8176,9 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { id } = req.params;
   const { 
@@ -8190,8 +8275,9 @@ app.post('/api/pinterest/scheduled-pins/:id/post-now', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
 
@@ -8272,8 +8358,9 @@ app.delete('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { id } = req.params;
 
@@ -8372,8 +8459,9 @@ app.get('/api/pinterest/status', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { data: accounts, error: accError } = await supabaseAdmin
     .from('pinterest_accounts')
@@ -8431,8 +8519,9 @@ app.get('/api/pinterest/boards', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const accountId = extractAccountId(req);
   const accessToken = await getPinterestAccessTokenForUser(user.id, accountId);
@@ -8605,8 +8694,9 @@ app.delete('/api/pinterest/scheduled-pins/:id/permanent', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { id } = req.params;
 
@@ -8664,8 +8754,9 @@ app.get('/api/pinterest/pin-analytics/:pinId', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { pinId } = req.params;
   const { account_id } = req.query;
@@ -8767,8 +8858,9 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { account_id, force_sync = false } = req.body;
   
@@ -9114,8 +9206,9 @@ app.post('/api/pinterest/test-analytics/:pinId', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   const { pinId } = req.params;
 
@@ -9250,8 +9343,9 @@ app.post('/api/pinterest/reschedule-spam-blocked', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   try {
     await rescheduleSpamBlockedPins(user.id);
@@ -9274,8 +9368,9 @@ app.post('/api/pinterest/process-scheduled', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
   const token = authHeader.split(' ')[1];
-  const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
-  if (userError || !user) return res.status(401).json({ error: 'Unauthorized' });
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
 
   console.log(`🔧 Manual trigger for scheduled pins by user: ${user.id}`);
   
