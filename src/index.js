@@ -2025,12 +2025,14 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   if (base.title) {
     base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
   }
-  // Amazon fallback: if scraping yields a generic / blocked title, degrade gracefully to ASIN-based title.
+  // Amazon fallback: if scraping yields a generic / blocked title, flag it so callers can abort
+  // BEFORE spending credits (Nano Banana) and BEFORE deducting quota.
   try {
     const u = new URL(String(url || '').trim());
     if (isAmazonRelatedHost(u.hostname) && looksLikeGenericAmazonTitle(base.title)) {
-      const asin = extractAmazonAsinFromUrl(url) || extractAmazonAsinFromUrl(base.canonicalUrl || '') || '';
-      base.title = asin ? `Amazon product (ASIN ${asin})` : 'Amazon product';
+      base.amazon_blocked = true;
+      // Keep title empty so downstream copywriters don't anchor on "Amazon product".
+      base.title = '';
     }
   } catch {
     /* ignore */
@@ -4335,6 +4337,21 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
     }
 
+    const fastForFanOut = isStrategicSingle && !!articleData;
+    const { base, articleSummary } =
+      req._fetchedArticle || (await fetchArticleBaseAndSummary(url, articleData, fastForFanOut ? { fast: true } : null));
+
+    // Amazon: if we can't read the real product page (blocked/consent), abort BEFORE quota deduction
+    // and BEFORE calling Nano Banana.
+    const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
+    if (base?.amazon_blocked && isAmazonProductPageForNanoReference(amazonCtxUrl)) {
+      return res.status(409).json({
+        error: 'amazon_blocked',
+        message:
+          'Amazon blocked automated access to this product page, so we can’t reliably read the product title/content right now. Please try again later, or use a non-Amazon landing page (your blog post / product page) for this pin.',
+      });
+    }
+
     // Own-photo composites use a separate monthly cap (no image model). AI pins use pins_used.
     const pinsToGenerate = effectiveStyles.length;
     const aiPins = useUserComposite || useTextBased ? 0 : pinsToGenerate;
@@ -4362,10 +4379,6 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const requestRenderOptions =
       req.body?.renderOptions && typeof req.body.renderOptions === 'object' ? req.body.renderOptions : null;
     const bodyVariationSeed = Number(req.body?.variationSeed);
-
-    const fastForFanOut = isStrategicSingle && !!articleData;
-    const { base, articleSummary } =
-      req._fetchedArticle || (await fetchArticleBaseAndSummary(url, articleData, fastForFanOut ? { fast: true } : null));
     const year = new Date().getFullYear();
     const domain =
       (base.linkDisplay || base.domain || '').replace(/^https?:\/\//, '') || 'example.com';
@@ -4374,7 +4387,6 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     let nanoBananaReferenceInputs = [];
     let nanoBananaReferenceSource = null;
-    const amazonCtxUrl = pickAmazonContextUrl(url, base.canonicalUrl);
     const refHtmlUrl = amazonCtxUrl || url;
     if (
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
