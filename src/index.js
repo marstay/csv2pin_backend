@@ -4917,26 +4917,38 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
     const rawUrl = String(url || '').trim();
-    let effectiveUrl = rawUrl;
-    try {
-      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
-      if (expanded) effectiveUrl = expanded;
-    } catch (e) {
-      console.warn('urltopin scrape resolveOutboundUrl error:', e.message || e);
-    }
+    // Same pipeline as generate: redirect resolve → RapidAPI-first Amazon/Etsy → HTML only when needed.
+    const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, null, null);
 
-    const html = await fetchArticleHtml(effectiveUrl);
-    if (!html || html.length < 200) {
+    const hasScrapeContent =
+      (base.title && String(base.title).trim().length >= 3) ||
+      (base.description && String(base.description).trim().length >= 20);
+
+    if (!hasScrapeContent) {
       return res.status(502).json({
         error:
           'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
       });
     }
-    const meta = extractMetaFromHtml(html, effectiveUrl);
-    if (meta.title) {
-      meta.title = await maybeShortenPageTitleForUrlToPin(effectiveUrl, meta.title, openai, meta.canonicalUrl);
+
+    const meta = {
+      title: base.title || '',
+      description: base.description || '',
+      canonicalUrl: base.canonicalUrl || '',
+      domain: base.domain || '',
+      keyword: base.keyword || '',
+      linkDisplay: base.linkDisplay || '',
+      requiresManualBrandOrCta: !!base.requiresManualBrandOrCta,
+      brandingGateReason: base.brandingGateReason ?? null,
+      brandingGateMessage: base.brandingGateMessage ?? null,
+    };
+    if (articleSummary && String(articleSummary).trim().length > 0) {
+      meta.articleSummary = articleSummary;
     }
-    const brandingGate = assessUrlBrandingGate(effectiveUrl);
+    if (base.etsy_oembed_thumbnail) meta.etsy_oembed_thumbnail = base.etsy_oembed_thumbnail;
+    if (Array.isArray(base.etsy_rapidapi_image_urls) && base.etsy_rapidapi_image_urls.length > 0) {
+      meta.etsy_rapidapi_image_urls = base.etsy_rapidapi_image_urls;
+    }
     if (enrich) {
       try {
         meta.contentProfile = await enrichContentProfile(meta, openai);
@@ -4944,7 +4956,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
         console.warn('urltopin scrape enrich error:', e.message || e);
       }
     }
-    return res.json({ ...meta, ...brandingGate });
+    return res.json(meta);
   } catch (err) {
     console.error('urltopin scrape error:', err);
     return res.status(500).json({ error: err.message });
