@@ -1516,6 +1516,77 @@ function extractAmazonProductImageUrlsFromHtml(html, pageUrl = '') {
   return rankAmazonImageUrlCandidates(ordered);
 }
 
+function detectAmazonBotOrConsentPage(html) {
+  if (!html || typeof html !== 'string') return false;
+  const s = html.slice(0, 90000).toLowerCase();
+  // Common Amazon interstitial / bot / consent patterns.
+  if (s.includes('click the button below to continue shopping')) return true;
+  if (s.includes('type the characters you see in this image')) return true;
+  if (s.includes('enter the characters you see')) return true;
+  if (s.includes('sorry, we just need to make sure you\'re not a robot')) return true;
+  if (s.includes('robot check')) return true;
+  if (s.includes('validatecaptcha')) return true;
+  if (s.includes('captcha')) return true;
+  return false;
+}
+
+function looksLikeGenericAmazonTitle(title) {
+  const t = String(title || '').trim().toLowerCase();
+  if (!t) return true;
+  if (t === 'amazon.com') return true;
+  if (t === 'amazon') return true;
+  if (t.startsWith('amazon.com') && !t.includes(':')) return true;
+  if (t.includes('continue shopping')) return true;
+  if (t.includes('robot check')) return true;
+  if (t.includes('captcha')) return true;
+  return false;
+}
+
+function resolveAmazonMarketplaceCodeFromHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  // Minimal mapping; extend as needed.
+  if (h.endsWith('.co.uk')) return 'GB';
+  if (h.endsWith('.de')) return 'DE';
+  if (h.endsWith('.fr')) return 'FR';
+  if (h.endsWith('.it')) return 'IT';
+  if (h.endsWith('.es')) return 'ES';
+  if (h.endsWith('.ca')) return 'CA';
+  if (h.endsWith('.com.au')) return 'AU';
+  if (h.endsWith('.co.jp') || h.endsWith('.jp')) return 'JP';
+  if (h.endsWith('.in')) return 'IN';
+  // Default for amazon.com
+  return 'US';
+}
+
+async function fetchAmazonAsinWidgetImageUrl(amazonUrlString) {
+  try {
+    const asin = extractAmazonAsinFromUrl(amazonUrlString);
+    if (!asin) return '';
+    const u = new URL(String(amazonUrlString || '').trim());
+    const mp = resolveAmazonMarketplaceCodeFromHost(u.hostname);
+    const widgetHost = mp === 'US' ? 'ws-na.amazon-adsystem.com' : 'ws-eu.amazon-adsystem.com';
+    const widgetUrl =
+      `https://${widgetHost}/widgets/q?` +
+      `_encoding=UTF8&MarketPlace=${encodeURIComponent(mp)}` +
+      `&ASIN=${encodeURIComponent(asin)}` +
+      `&ServiceVersion=20070822&ID=AsinImage&WS=1&Format=_SL500_`;
+
+    const resp = await fetchWithTimeout(
+      widgetUrl,
+      { redirect: 'follow', headers: { ...URL_SCRAPE_HEADERS, Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' } },
+      20000
+    );
+    if (!resp.ok) return '';
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    if (!ct.startsWith('image/')) return '';
+    // Final response URL is usually the actual CDN image URL.
+    const finalUrl = resp.url || '';
+    return isAllowedAmazonCdnImageUrl(finalUrl) ? finalUrl : '';
+  } catch {
+    return '';
+  }
+}
+
 const MAX_AMAZON_REF_IMAGE_BYTES = 4 * 1024 * 1024;
 const AMAZON_NANO_MAX_REFERENCE_IMAGES = 3;
 
@@ -1856,7 +1927,19 @@ async function fetchArticleHtml(url) {
   try {
     const resp = await fetch(url, { redirect: 'follow', headers: URL_SCRAPE_HEADERS });
     if (resp.ok) {
-      return await resp.text();
+      const html = await resp.text();
+      // Amazon often returns a 200 "consent / bot check" interstitial that breaks scraping.
+      // If we detect that pattern, retry via Puppeteer even though status is 200.
+      try {
+        const u = new URL(String(url || '').trim());
+        if (isAmazonRelatedHost(u.hostname) && detectAmazonBotOrConsentPage(html)) {
+          const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
+          if (puppetHtml && !detectAmazonBotOrConsentPage(puppetHtml)) return puppetHtml;
+        }
+      } catch {
+        /* ignore */
+      }
+      return html;
     }
     const status = resp.status;
     console.warn('fetchArticleHtml non-OK:', String(url).slice(0, 96), status);
@@ -1941,6 +2024,16 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   Object.assign(base, assessUrlBrandingGate(url));
   if (base.title) {
     base.title = await maybeShortenPageTitleForUrlToPin(url, base.title, openai, base.canonicalUrl);
+  }
+  // Amazon fallback: if scraping yields a generic / blocked title, degrade gracefully to ASIN-based title.
+  try {
+    const u = new URL(String(url || '').trim());
+    if (isAmazonRelatedHost(u.hostname) && looksLikeGenericAmazonTitle(base.title)) {
+      const asin = extractAmazonAsinFromUrl(url) || extractAmazonAsinFromUrl(base.canonicalUrl || '') || '';
+      base.title = asin ? `Amazon product (ASIN ${asin})` : 'Amazon product';
+    }
+  } catch {
+    /* ignore */
   }
 
   // Very lightweight body text extraction from HTML
@@ -4292,7 +4385,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     ) {
       try {
         const azHtml = await fetchArticleHtml(amazonCtxUrl);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+        let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+        if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
+          const widgetImg = await fetchAmazonAsinWidgetImageUrl(amazonCtxUrl);
+          if (widgetImg) candidates = [widgetImg];
+        }
         if (candidates.length > 0) {
           nanoBananaReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
           if (nanoBananaReferenceInputs.length > 0) {
@@ -5078,7 +5175,11 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     ) {
       try {
         const azHtml = await fetchArticleHtml(amazonCtxUrl);
-        const candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+        let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+        if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
+          const widgetImg = await fetchAmazonAsinWidgetImageUrl(amazonCtxUrl);
+          if (widgetImg) candidates = [widgetImg];
+        }
         if (candidates.length > 0) {
           regenNanoReferenceInputs = await mirrorAmazonImageUrlsForNanoBanana(candidates, req.user.id);
           if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'amazon_product';
