@@ -1281,7 +1281,7 @@ function assessUrlBrandingGate(urlString) {
         requiresManualBrandOrCta: true,
         brandingGateReason: 'short_link',
         brandingGateMessage:
-          'This URL looks like a short or redirect link. Before generating pins, open Pin look & brand and enter your brand name or CTA (that text is what we use in the pin footer).',
+          'This URL looks like a short or redirect link. Before generating pins, enter your brand name or CTA (that text is what we use in the pin footer).',
       };
     }
 
@@ -1303,7 +1303,7 @@ function assessUrlBrandingGate(urlString) {
       const msg =
         reason === 'amazon_product_affiliate'
           ? 'This looks like an Amazon product or affiliate link. Pins should show your brand in the footer, not Amazon. Before generating, open Pin look & brand and add your brand name or CTA (e.g. your site name).'
-          : 'This looks like an Amazon page. Before generating pins, open Pin look & brand and add your brand name or CTA so the footer represents you, not the store.';
+          : 'This looks like an Amazon page. Before generating pins, add your brand name or CTA so the footer represents you, not the store.';
 
       return {
         requiresManualBrandOrCta: true,
