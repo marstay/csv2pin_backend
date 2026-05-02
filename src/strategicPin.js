@@ -455,9 +455,21 @@ function normalizeNumberInText(text, stepCount) {
 
 const ANGLE_OPTIONS = ['mistake', 'beginner', 'advanced', 'time-saving', 'emotional', 'secret', 'warning', 'benefit'];
 
+function shuffleCopy(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/** Shared instruction for LLM + image prompts: block overused Pinterest hooks. */
+const PIN_COPY_ANTI_CLICHE_INSTRUCTION = `ANTI-CLICHÉ: Do not use these exact phrases or tired close variants: "most people get this wrong", "check before you decide", "here's what actually works", "the truth about … they don't tell you", "stop wasting time and money", "do it the smart way instead", "key things you should know", "can you really trust", "get the real answer", "i tried … for 30 days", "here's what actually happened", "practical tips you can actually use", "plain-english guide, no fluff", "nobody talks about" (as empty hype). Write hooks that fit THIS article with fresh wording.`;
+
 /**
  * Pick an angle based on strategy, content profile, and already used angles.
- * Keeps variation while staying intentional.
+ * Shuffles order so the same angle is not always first; when the pool is exhausted, picks randomly.
  */
 function pickAngle(strategy, contentProfile, usedAngles = []) {
   const basePoolByStrategy = {
@@ -477,11 +489,11 @@ function pickAngle(strategy, contentProfile, usedAngles = []) {
     pool = pool.filter((a) => emotionalFavored.includes(a)).concat(pool);
   }
 
-  const unused = pool.filter((a) => !usedAngles.includes(a));
-  const candidates = unused.length > 0 ? unused : pool;
+  const uniquePool = [...new Set(pool.filter((a) => ANGLE_OPTIONS.includes(a)))];
+  const unused = uniquePool.filter((a) => !usedAngles.includes(a));
+  const candidates = unused.length > 0 ? shuffleCopy(unused) : shuffleCopy(uniquePool);
 
-  const chosen = candidates.find((a) => ANGLE_OPTIONS.includes(a)) || ANGLE_OPTIONS[0];
-  return chosen;
+  return candidates[0] || ANGLE_OPTIONS[0];
 }
 
 const BASE_TEMPLATE = `Generate a Pinterest pin.
@@ -499,17 +511,19 @@ STRATEGY:
 {{strategy}}
 {{layout_rule}}
 
-ANGLE (use this perspective): {{suggested_angle}}
-- mistake: "Most people get this wrong"
-- beginner: "If you're new to..."
-- advanced: "Pro tip", "Expert-level"
-- time-saving: "5 minutes", "Quick hack"
-- emotional: "I was shocked", "Game-changer"
-- secret: "Hidden trick", "Nobody talks about"
-- warning: "Stop doing X", "Avoid this"
-- benefit: "Get more X", "Save money"
+ANGLE (perspective for this pin — express in YOUR OWN words, not template slogans): {{suggested_angle}}
+- mistake: common errors, myths, or "why X backfires" (avoid the exact phrase "most people get this wrong")
+- beginner: welcoming, "start here", foundations
+- advanced: depth, nuance, expert-level insight
+- time-saving: speed, efficiency, minimal effort
+- emotional: relatable feeling, stakes, aspiration (avoid generic "game-changer")
+- secret: insider angle, overlooked detail (not the words "hidden trick" every time)
+- warning: risk, what to avoid, urgency
+- benefit: outcome, savings, results
 
-Follow the strategy rules below. Use the angle to give a distinct PERSPECTIVE - not just different wording.
+${PIN_COPY_ANTI_CLICHE_INSTRUCTION}
+
+Follow the strategy rules below. Use the angle to give a distinct PERSPECTIVE — not recycled Pinterest filler.
 
 Also return:
 - reason: one short sentence (max 80 chars) explaining why THIS pin works for Pinterest (e.g. "Creates curiosity without revealing the answer", "Numbers signal clear value for saves")
@@ -529,6 +543,7 @@ IMPORTANT:
 - Ensure semantic consistency between the title and the type of items you imply in the copy.
 - If the title uses "mistakes", "things you're doing wrong", or similar, the content (overlay and implied steps/items) MUST describe mistakes or wrong behaviors to avoid, not correct tips.
 - If the content is positive recommendations (tips/steps/ways), then the title should use positive framing (tips/steps/ways) instead of "mistakes".
+- title and overlay_headline must not copy phrases from the "ALREADY USED IN THIS BATCH" or "AVOID REPEATING" lists below.
 No markdown, no code fences.`;
 
 /**
@@ -585,12 +600,13 @@ Return JSON only (no markdown) with this exact shape:
  * @param {string} [params.layoutId] - layout ID for number consistency (step_count)
  * @param {string[]} [params.keyIdeas] - optional list of key ideas for this article
  * @param {Array<{headline:string,subheadline?:string}>} [params.usedOverlayTexts] - overlay texts already used for this layout; avoid repeating them
+ * @param {Array<{title?:string,overlay_headline?:string,overlay_subheadline?:string}>} [params.priorPinCopy] - earlier pins in this batch; avoid repeating their titles/overlays
  * @param {string} [params.layoutOverlayGuidance] - layout-specific guidance for overlay_headline/subheadline (from STYLE_ON_IMAGE_TEXT_GUIDANCE)
  * @param {Object} openai
  * @returns {Promise<Object>} { title, overlay_headline, overlay_subheadline, description, hashtags, image_prompt_hint, step_count }
  */
 async function generateStrategicPinMetadata(
-  { articleSummary, keyword, strategy, layoutId, suggestedAngle, keyIdeas, usedOverlayTexts, layoutOverlayGuidance },
+  { articleSummary, keyword, strategy, layoutId, suggestedAngle, keyIdeas, usedOverlayTexts, priorPinCopy, layoutOverlayGuidance },
   openai
 ) {
   const rules = STRATEGY_COPY_RULES[strategy]?.rules || STRATEGY_COPY_RULES.curiosity_hook.rules;
@@ -606,6 +622,16 @@ async function generateStrategicPinMetadata(
     Array.isArray(usedOverlayTexts) && usedOverlayTexts.length > 0
       ? `\n\nAVOID REPEATING: The following overlay headlines/subheadlines were already used for other pins of this layout. Generate a DIFFERENT overlay_headline and overlay_subheadline:\n${usedOverlayTexts
           .map((u) => `- "${u.headline}"${u.subheadline ? ` / "${u.subheadline}"` : ''}`)
+          .join('\n')}\n`
+      : '';
+
+  const priorBlock =
+    Array.isArray(priorPinCopy) && priorPinCopy.length > 0
+      ? `\n\nALREADY USED IN THIS BATCH — do not reuse or lightly tweak these titles or overlays; write new hooks:\n${priorPinCopy
+          .map(
+            (p, idx) =>
+              `- Pin ${idx + 1}: title "${(p.title || '').slice(0, 120)}" | overlay "${(p.overlay_headline || '').slice(0, 80)}"${p.overlay_subheadline ? ` | sub "${p.overlay_subheadline.slice(0, 80)}"` : ''}`
+          )
           .join('\n')}\n`
       : '';
 
@@ -627,6 +653,7 @@ async function generateStrategicPinMetadata(
     .replace('{{layout_rule}}', layoutRule)
     .replace('{{suggested_angle}}', angle)
     + avoidBlock
+    + priorBlock
     + layoutGuidanceBlock
     + `\n\nSTRATEGY RULES:\n${rulesToUse}\n\nReturn JSON only.`;
 
@@ -694,4 +721,5 @@ export {
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
   NICHE_MIXES,
+  PIN_COPY_ANTI_CLICHE_INSTRUCTION,
 };

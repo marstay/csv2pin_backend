@@ -16,6 +16,7 @@ import {
   checkDiversity,
   rankPins,
   getStrategyReason,
+  PIN_COPY_ANTI_CLICHE_INSTRUCTION,
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
@@ -3882,27 +3883,27 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
 
 const STYLE_ON_IMAGE_TEXT_GUIDANCE = {
   curiosity_shock:
-    'Generate a bold curiosity hook that creates shock or surprise. Use patterns like "Most People Get This Wrong About X" or "The Truth About X They Don\'t Tell You". Make people want to click. Max 60 chars for headline. Subheadline: short supporting line like "Check Before You Decide" or "Here\'s What Actually Works".',
+    'Generate one bold, original curiosity headline about the topic (max 60 chars). Rotate devices: myth vs reality, unexpected downside, "why X fails", contrarian angle — not the same hook shape every time. Subheadline: short teaser (max 50 chars), new wording per pin.',
   question_style:
-    'Generate a viral question that invites clicks. Must be a direct question people want answered. Examples: "Can You Really Trust X?" or "Is X Actually Worth It?". Max 60 chars. Subheadline: promise line like "Get the Real Answer" or "What the Experts Say".',
+    'Generate a direct question headline people want answered (max 60 chars). Vary question type (trust, timing, comparison, "is it worth it", "what happens if") — do not default to the same question frame every time. Subheadline: promise or credibility line (max 50 chars), fresh phrasing.',
   viral_curiosity:
-    'Generate a story-style headline that creates curiosity. Use patterns like "I Tried X For 30 Days..." or "What Happened When I Stopped X". Max 60 chars. Subheadline: "Here\'s What Actually Happened" or "The Results Surprised Me".',
+    'Generate a story- or experiment-style headline (max 60 chars): time-boxed try, habit change, surprising result — vary the narrative. Subheadline (max 50 chars): different each time.',
   money_saving:
-    'Generate a value-focused headline about saving time or money. Punchy, practical. Examples: "Stop Wasting Time & Money on X" or "The Smart Way to Do X". Max 60 chars. Subheadline: "Do It The Smart Way Instead" or "Save Hours Every Week".',
+    'Generate a value headline about saving time, money, or effort (max 60 chars). Subheadline: concrete payoff (max 50 chars). Avoid repeating the same "waste vs smart way" pairing across pins.',
   minimal_typography:
-    'Generate a short bold statement. Minimal, high-impact. One powerful phrase. Max 50 chars. Subheadline: "Key Things You Should Know" or similar. Keep both very short.',
+    'Generate a short, high-impact headline (max 50 chars). Subheadline: one crisp supporting line — must not reuse the same subhead as other pins in the batch.',
   cozy_baking:
-    'Generate a friendly, practical headline. Warm and inviting. Max 60 chars. Subheadline: "Practical tips you can actually use" or "Simple tips for everyday".',
+    'Generate a warm, practical headline (max 60 chars). Subheadline: friendly helper line with varied wording.',
   clean_appetizing:
-    'Generate a clear, appetizing headline. Soft and approachable. Max 60 chars. Subheadline: "Updated guide" or "Everything you need to know".',
+    'Generate a clear, inviting headline (max 60 chars). Subheadline: soft guide line (scope, year, or "what you\'ll learn") — vary phrasing.',
   clumpy_fix:
-    'Generate a practical how-to headline. Simple fix or method. Examples: "The Simple Fix for X" or "How to Get X Right". Max 60 chars. Subheadline: "Plain-English guide, no fluff".',
+    'Generate a simple how-to or fix headline (max 60 chars). Subheadline: clarity promise; vary wording, not a fixed tagline.',
   minimal_elegant:
-    'Generate an elegant, refined headline. Premium feel, minimal words. Max 50 chars. Subheadline: keep very short or empty.',
+    'Generate an elegant, minimal headline (max 50 chars). Subheadline: very short or empty.',
   before_after:
-    'Generate a before/after contrast headline. Can be the topic or "Before vs After: X". Max 60 chars. Subheadline: "See the difference" or "The transformation".',
+    'Generate a before/after or transformation headline (max 60 chars). Subheadline: contrast or outcome line with varied phrasing.',
   timeline_infographic:
-    'Generate a concise step-by-step headline. Examples: "The X Timeline" or "5 Steps to Master X". Max 60 chars. Subheadline: "Step-by-step guide" or "Your roadmap".',
+    'Generate a step-by-step or roadmap headline (max 60 chars). Subheadline: guide framing — avoid repeating the same roadmap/steps cliché every time.',
   grid_3_images: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
   grid_4_images: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
   stacked_strips: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
@@ -3922,7 +3923,7 @@ async function generateStyleOnImageText({ styleId, topic, domain, keyword, year,
       .map((u) => `- "${u.headline}"${u.subheadline ? ` / "${u.subheadline}"` : ''}`)
       .join('\n')}\n`;
   }
-  const content = `Article/topic: ${topic}\n${keyword ? `Keyword: ${keyword}\n` : ''}Domain: ${domain}\nYear: ${year}\n${description ? `Context: ${description.slice(0, 200)}\n` : ''}\nStyle: ${styleId}\n\n${guidance}${avoidNote}\n\nReturn JSON only: {"headline":"...","subheadline":"..."}. No markdown.`;
+  const content = `Article/topic: ${topic}\n${keyword ? `Keyword: ${keyword}\n` : ''}Domain: ${domain}\nYear: ${year}\n${description ? `Context: ${description.slice(0, 200)}\n` : ''}\nStyle: ${styleId}\n\n${guidance}${avoidNote}\n\n${PIN_COPY_ANTI_CLICHE_INSTRUCTION}\n\nReturn JSON only: {"headline":"...","subheadline":"..."}. No markdown.`;
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -5011,7 +5012,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       imageSource = 'ai',
       userImageUrls: rawUserImageUrls,
       usePageReferenceImages: rawUsePageReferenceImages,
+      metadataOnly: rawMetadataOnly,
     } = req.body || {};
+    const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
     const usePageReferenceImages = rawUsePageReferenceImages === true;
     let userImageUrls = rawUserImageUrls;
     if (typeof userImageUrls === 'string' && userImageUrls.trim()) {
@@ -5130,8 +5133,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     // Own-photo composites use a separate monthly cap (no image model). AI pins use pins_used.
     const pinsToGenerate = effectiveStyles.length;
-    const aiPins = useUserComposite || useTextBased ? 0 : pinsToGenerate;
-    const userPhotoPins = useUserComposite || useTextBased ? pinsToGenerate : 0;
+    const aiPins = metadataOnly || useUserComposite || useTextBased ? 0 : pinsToGenerate;
+    const userPhotoPins = metadataOnly ? 0 : useUserComposite || useTextBased ? pinsToGenerate : 0;
     const usageResult = await applyPinQuotaDelta(req.user.id, {
       aiDelta: aiPins,
       userPhotoDelta: userPhotoPins,
@@ -5164,7 +5167,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     let nanoBananaReferenceInputs = [];
     let nanoBananaReferenceSource = null;
     const refHtmlUrl = amazonCtxUrl || effectiveUrl;
-    if (!useTextBased && !useUserComposite) {
+    if (!metadataOnly && !useTextBased && !useUserComposite) {
       // Etsy: prefer RapidAPI listing images for Nano Banana; fallback to oEmbed thumbnail.
       const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
       if (rapidEtsyUrls.length > 0) {
@@ -5195,6 +5198,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }
     }
     if (
+      !metadataOnly &&
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       !useTextBased &&
       !useUserComposite &&
@@ -5240,6 +5244,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         console.warn('urltopin Amazon product images for Nano:', e.message || e);
       }
     } else if (
+      !metadataOnly &&
       usePageReferenceImages &&
       process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0' &&
       !useTextBased &&
@@ -5342,6 +5347,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
       const usedOverlayByLayout = new Map(); // layoutId -> [{ headline, subheadline }, ...]
       const metaResults = [];
+      const priorPinCopy = [];
       for (let i = 0; i < plan.length; i++) {
         const p = plan[i];
         const angle = pickAngle(p.strategy, contentProfile, usedAngles);
@@ -5357,11 +5363,17 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             suggestedAngle: angle,
             keyIdeas,
             usedOverlayTexts,
+            priorPinCopy: priorPinCopy.length ? [...priorPinCopy] : undefined,
             layoutOverlayGuidance,
           },
           openai
         );
         metaResults.push(meta);
+        priorPinCopy.push({
+          title: meta.title || '',
+          overlay_headline: meta.overlay_headline || '',
+          overlay_subheadline: meta.overlay_subheadline || '',
+        });
         const used = usedOverlayByLayout.get(p.layoutId) || [];
         used.push({ headline: meta.overlay_headline || '', subheadline: meta.overlay_subheadline || '' });
         usedOverlayByLayout.set(p.layoutId, used);
@@ -5421,6 +5433,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           strategy: meta.strategy,
           goal: meta.goal,
           step_count: meta.step_count ?? null,
+          ...(meta.angle && { angle: meta.angle }),
+          ...(meta.reason && { reason: meta.reason }),
         });
       }
     } else {
@@ -5565,6 +5579,41 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         subheadline: onImageSubheadline,
         source: pinFooterSourceLine,
       };
+
+      if (metadataOnly) {
+        const metaExtra = meta;
+        return {
+          styleId: sp.id,
+          styleLabel: sp.label,
+          imagePrompt,
+          imageUrl: '',
+          title: pinTitle,
+          description: pinDescription,
+          altText: '',
+          hashtags,
+          link: url,
+          overlayText,
+          bakedInText: overlayTextForPrompt,
+          metadataOnly: true,
+          imageGenerationMode: 'metadata_only',
+          ...((isStrategic || isStrategicSingle) && metaExtra.strategy && {
+            strategy: metaExtra.strategy,
+            goal: metaExtra.goal,
+            goalLabel:
+              metaExtra.goal === 'clicks'
+                ? 'High Click Potential'
+                : metaExtra.goal === 'saves'
+                  ? 'Save-Friendly'
+                  : metaExtra.goal === 'engagement'
+                    ? 'Engagement Focused'
+                    : metaExtra.goal === 'trust'
+                      ? 'Trust & Clarity'
+                      : 'Experimental',
+            ...(metaExtra.angle && { angle: metaExtra.angle }),
+            ...(metaExtra.strategy && { reason: metaExtra.reason || getStrategyReason(metaExtra.strategy) }),
+          }),
+        };
+      }
 
       let imageUrl = '';
       let userCompositeSourceUrl = null;
@@ -5864,7 +5913,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }
       finalPins = rankPins(finalPins);
     }
-    return res.json({ pins: finalPins });
+    return res.json(metadataOnly ? { pins: finalPins, metadataOnly: true } : { pins: finalPins });
   } catch (err) {
     console.error('urltopin generate error:', err);
     return res.status(500).json({ error: err.message });
