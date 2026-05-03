@@ -64,7 +64,7 @@ const PLAN_PIN_LIMITS = {
   starter: 60,
   creator: 150,
   pro: 450,
-  agency: 1200,
+  agency: 1000,
 };
 
 /** Monthly caps for “your photo + text overlay” pins (no image model). Separate from AI pin quota. */
