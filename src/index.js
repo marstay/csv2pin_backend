@@ -389,6 +389,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
       // Store absolute counters, but enforce limits against the "effective" (baseline-adjusted) usage.
       const newAi = currentAi + aiDelta;
       const newUserPhoto = currentUserPhoto + userPhotoDelta;
+      const usageNowIso = new Date().toISOString();
 
       const { error: upsertError } = await supabaseAdmin.from('pin_usage').upsert(
         {
@@ -396,6 +397,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
           year_month: yearMonth,
           pins_used: newAi,
           user_photo_pins_used: newUserPhoto,
+          updated_at: usageNowIso,
         },
         { onConflict: 'user_id,year_month' }
       );
