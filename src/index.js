@@ -6738,6 +6738,73 @@ app.post('/api/analyze-image', requireUser, async (req, res) => {
 
 // --- Dodo Payments checkout session for subscriptions ---
 
+/**
+ * Resolve Dodo subscription id after checkout (for billing_subscriptions.dodo_subscription_id).
+ * Per Dodo OpenAPI: GET /checkouts/{id} returns GetCheckoutSessionsStatus (payment_id, not subscription_id);
+ * GET /payments/{payment_id} returns PaymentResponse.subscription_id for subscription checkouts.
+ * @param {string} checkoutSessionId from create-checkout response (session_id / id)
+ * @returns {Promise<string|null>}
+ */
+async function fetchDodoSubscriptionIdFromCheckoutSession(checkoutSessionId) {
+  const raw = String(checkoutSessionId || '').trim();
+  if (!raw || !DODO_API_KEY) return null;
+  try {
+    const resp = await fetch(`${DODO_BASE_URL}/checkouts/${encodeURIComponent(raw)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${DODO_API_KEY}`,
+      },
+    });
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      console.warn('Dodo GET checkout failed', {
+        status: resp.status,
+        checkoutSessionId: raw,
+        details: json,
+      });
+      return null;
+    }
+
+    const paymentId = String(json?.payment_id ?? json?.paymentId ?? '').trim();
+    if (paymentId) {
+      const payResp = await fetch(`${DODO_BASE_URL}/payments/${encodeURIComponent(paymentId)}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${DODO_API_KEY}`,
+        },
+      });
+      const payJson = await payResp.json().catch(() => ({}));
+      if (!payResp.ok) {
+        console.warn('Dodo GET payment failed', {
+          status: payResp.status,
+          checkoutSessionId: raw,
+          paymentId,
+          details: payJson,
+        });
+      } else {
+        const sub = payJson?.subscription_id ?? payJson?.subscriptionId ?? null;
+        const id = sub ? String(sub).trim() : '';
+        if (id) return id;
+        console.warn('Dodo payment has no subscription_id', {
+          checkoutSessionId: raw,
+          paymentId,
+          payment_status: payJson?.status,
+        });
+      }
+    } else {
+      console.warn('Dodo checkout has no payment_id yet', {
+        checkoutSessionId: raw,
+        payment_status: json?.payment_status ?? json?.paymentStatus,
+      });
+    }
+
+    return null;
+  } catch (e) {
+    console.warn('Dodo GET checkout error:', e.message || e);
+    return null;
+  }
+}
+
 app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
   try {
     if (!DODO_API_KEY) {
@@ -6901,7 +6968,75 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
       });
     }
 
-    const result = await applyPlanActivationForUser(req.user.id, planType, 'payment_success_fallback');
+    const checkoutId = String(checkoutSessionId || pending.pending?.sessionId || '').trim();
+    let dodoSubId = null;
+    if (checkoutId && DODO_API_KEY) {
+      dodoSubId = await fetchDodoSubscriptionIdFromCheckoutSession(checkoutId);
+    }
+    if (!dodoSubId) {
+      console.warn('activate-plan: could not resolve dodo_subscription_id from checkout', {
+        userId: req.user.id,
+        planType,
+        checkoutId: checkoutId || null,
+      });
+    }
+
+    // Webhook may have activated first: avoid replacing a good row with a duplicate; backfill Dodo id if missing.
+    const { data: activeRow } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, plan_type, dodo_subscription_id')
+      .eq('user_id', req.user.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (activeRow && activeRow.plan_type === planType) {
+      if (activeRow.dodo_subscription_id) {
+        return res.json({
+          ok: true,
+          planType,
+          pinsLimit: PLAN_PIN_LIMITS[planType],
+          note: 'already_active',
+        });
+      }
+      if (dodoSubId) {
+        await supabaseAdmin
+          .from('billing_subscriptions')
+          .update({
+            dodo_subscription_id: dodoSubId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', activeRow.id)
+          .eq('user_id', req.user.id);
+        console.log('✅ activate-plan backfilled dodo_subscription_id', {
+          userId: req.user.id,
+          planType,
+          subscriptionId: dodoSubId,
+        });
+        return res.json({
+          ok: true,
+          planType,
+          pinsLimit: PLAN_PIN_LIMITS[planType],
+          backfilled_dodo_id: true,
+        });
+      }
+      console.warn('activate-plan: active row exists but Dodo subscription id unknown (webhook may backfill)', {
+        userId: req.user.id,
+        planType,
+        checkoutId: checkoutId || null,
+      });
+      return res.json({
+        ok: true,
+        planType,
+        pinsLimit: PLAN_PIN_LIMITS[planType],
+        note: 'active_missing_dodo_provider_id',
+      });
+    }
+
+    const result = await applyPlanActivationForUser(req.user.id, planType, 'payment_success_fallback', {
+      dodoSubscriptionId: dodoSubId,
+    });
     if (!result.ok) {
       return res.status(500).json({ error: 'Failed to activate plan', details: result.error });
     }
@@ -6909,7 +7044,8 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
     console.log('✅ activate-plan fallback succeeded', {
       userId: req.user.id,
       planType,
-      checkoutSessionId: checkoutSessionId || null,
+      checkoutSessionId: checkoutId || null,
+      dodo_subscription_id: dodoSubId || null,
       via: 'payment-success',
     });
     return res.json({ ok: true, planType: result.planType, pinsLimit: result.pinsLimit });

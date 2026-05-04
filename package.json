@@ -189,7 +189,8 @@
     "zod": "^3.25.76"
   },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "export:subscribers": "node scripts/export-subscribers-csv.mjs"
   },
   "repository": {
     "type": "git",

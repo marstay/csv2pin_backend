@@ -80,4 +80,8 @@ jspm_packages/
 .Spotlight-V100
 .Trashes
 ehthumbs.db
-Thumbs.db 
+Thumbs.db
+
+# One-off admin exports (PII)
+subscribers-*.csv
+subscribers-emails-*.txt
