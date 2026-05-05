@@ -960,6 +960,60 @@ function deriveKeywordFromArticleUrl(urlString) {
   }
 }
 
+function titleLooksMeaningfulForKeywordSuppression(rawTitle) {
+  const t = String(rawTitle || '').trim();
+  if (t.length < 8) return false;
+  const lower = t.toLowerCase();
+  // Common generic titles that show up on shops / CMS templates.
+  const generic = new Set([
+    'home',
+    'homepage',
+    'index',
+    'blog',
+    'post',
+    'article',
+    'product',
+    'products',
+    'shop',
+    'store',
+    'my shop',
+    'checkout',
+    'cart',
+    'search',
+  ]);
+  if (generic.has(lower)) return false;
+  // If it's mostly punctuation/short tokens, treat as not meaningful.
+  const letters = t.replace(/[^\p{L}]+/gu, '');
+  if (letters.length < 6) return false;
+  return true;
+}
+
+function looksLikeLatinSlugKeyword(rawKeyword) {
+  const k = String(rawKeyword || '').trim();
+  if (!k) return false;
+  if (k.length < 6) return false;
+  // Only ASCII letters/digits/hyphens/space/underscore.
+  const asciiOnly = /^[a-z0-9 _-]+$/i.test(k);
+  if (!asciiOnly) return false;
+  const hyphens = (k.match(/-/g) || []).length;
+  const digits = (k.match(/\d/g) || []).length;
+  if (/^\d{3,}/.test(k)) return true;
+  if (hyphens >= 3) return true;
+  if (digits >= 4) return true;
+  return false;
+}
+
+function titleHasNonLatinScript(rawTitle) {
+  const t = String(rawTitle || '').trim();
+  if (!t) return false;
+  // If there are letters outside Latin, treat as non-Latin script.
+  // This catches Greek, Cyrillic, Arabic, Hebrew, etc.
+  const lettersOnly = t.replace(/[^\p{L}]+/gu, '');
+  if (!lettersOnly) return false;
+  // If any letter is NOT Latin script, return true.
+  return /[^\p{Script=Latin}]/u.test(lettersOnly);
+}
+
 function isAmazonRelatedHost(host) {
   const h = normalizeUrlHostname(host);
   // Amazon short domains + regional amzn TLDs (amzn.asia, amzn.in, etc.)
@@ -2646,6 +2700,7 @@ async function tryAmazonRapidPrefetchForUrl(workingUrl) {
 async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   const fast = !!opts?.fast;
   const preResolved = String(opts?.preResolvedUrl || '').trim();
+  const outputLanguage = String(opts?.outputLanguage || '').trim().toLowerCase();
   let workingUrl = String(url || '').trim();
   if (preResolved) {
     workingUrl = preResolved;
@@ -2742,6 +2797,22 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
 
   if (base.title) {
     base.title = await maybeShortenPageTitleForUrlToPin(workingUrl, base.title, openai, base.canonicalUrl);
+  }
+
+  // If we already have a meaningful page title (esp. non-Latin languages like Greek),
+  // avoid using a Latin/Greeklish URL slug as the "keyword" in prompts.
+  // Keep slug keyword as fallback for ecommerce pages when title is missing/generic.
+  try {
+    const u = new URL(String(workingUrl || '').trim());
+    const isAmazon = isAmazonRelatedHost(u.hostname);
+    const meaningfulTitle = titleLooksMeaningfulForKeywordSuppression(base.title);
+    const wantNonEnglish = !!(outputLanguage && outputLanguage !== 'auto' && outputLanguage !== 'en');
+    const nonLatinTitle = titleHasNonLatinScript(base.title);
+    if (!isAmazon && meaningfulTitle && (wantNonEnglish || nonLatinTitle) && looksLikeLatinSlugKeyword(base.keyword)) {
+      base.keyword = '';
+    }
+  } catch {
+    /* ignore */
   }
 
   // Very lightweight body text extraction from HTML
@@ -3573,7 +3644,7 @@ function sanitizeDescription(input) {
 }
 
 async function generatePinterestAltText(
-  { title, description, overlayText, styleLabel, linkDisplay, nanoBananaPrompt },
+  { title, description, overlayText, styleLabel, linkDisplay, nanoBananaPrompt, outputLanguage, strictLanguage },
   openaiClient
 ) {
   try {
@@ -3585,6 +3656,12 @@ async function generatePinterestAltText(
     const nb = String(nanoBananaPrompt || '').trim();
     if (!t && !headline) return '';
 
+    const lang = String(outputLanguage || '').trim().toLowerCase();
+    const languageLine =
+      lang && lang !== 'auto'
+        ? `\n\nLANGUAGE REQUIREMENT: Write the alt text in ${lang.toUpperCase()} only. Do not use English.\n`
+        : '';
+
     const prompt =
       `Write Pinterest image alt text for accessibility.\n` +
       `Describe what someone would see if they could not see the image.\n` +
@@ -3595,7 +3672,9 @@ async function generatePinterestAltText(
       `- Do NOT quote or restate any headline/subheadline/overlay text.\n` +
       `- Do NOT mention "headline" or "subheadline".\n` +
       `- Avoid marketing language.\n` +
-      `- No hashtags. No URLs. No CTAs. No emojis.\n\n` +
+      `- No hashtags. No URLs. No CTAs. No emojis.\n` +
+      languageLine +
+      `\n` +
       (nb
         ? `IMAGE PROMPT (source of truth for what the image contains):\n<<<${nb.slice(0, 2200)}>>>\n\n`
         : '') +
@@ -3628,6 +3707,62 @@ async function generatePinterestAltText(
       .replace(/\s{2,}/g, ' ')
       .trim();
     if (out.length > 240) out = out.slice(0, 240).trim();
+
+    if (strictLanguage && lang && lang !== 'auto' && out) {
+      const detectLang = async (text) => {
+        const tt = String(text || '').trim();
+        if (!tt) return 'unknown';
+        try {
+          const completion = await openaiClient.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+              {
+                role: 'user',
+                content:
+                  'Detect the primary language of the text.\n' +
+                  'Return JSON only with key "lang" as an ISO 639-1 code when possible (e.g. "en", "el", "sk"), or "unknown".\n' +
+                  `Text:\n<<<${tt.slice(0, 600)}>>>`,
+              },
+            ],
+            max_tokens: 30,
+            temperature: 0,
+          });
+          const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (!m) return 'unknown';
+          const parsed = JSON.parse(m[0]);
+          const v = String(parsed.lang || '').trim().toLowerCase();
+          return v || 'unknown';
+        } catch {
+          return 'unknown';
+        }
+      };
+
+      const detected = await detectLang(out);
+      if (detected !== 'unknown' && detected !== lang) {
+        const retryPrompt =
+          prompt +
+          `\nCRITICAL: Output MUST be in ${lang.toUpperCase()} only. If you cannot comply, output an empty string.\n`;
+        const retry = await openaiClient.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: retryPrompt }],
+          max_tokens: 120,
+          temperature: 0.2,
+        });
+        let next = String(retry.choices?.[0]?.message?.content || '').replace(/\s+/g, ' ').trim();
+        next = next.replace(/^["'`]+|["'`]+$/g, '').trim();
+        next = next.replace(/https?:\/\/\S+/g, '').replace(/#[A-Za-z0-9_]+/g, '').trim();
+        next = next
+          .replace(/\b(featuring|with|showing)\s+(the\s+)?(headline|subheadline)\b[^.]*\.?/gi, '')
+          .replace(/\b(headline|subheadline)\b\s*(reads|says)?\s*[:\-–—]?\s*["'`][^"'`]{3,}["'`]/gi, '')
+          .replace(/\b(text\s+overlay)\b\s*(reads|says)?\s*[:\-–—]?\s*["'`][^"'`]{3,}["'`]/gi, 'text overlay')
+          .replace(/\s{2,}/g, ' ')
+          .trim();
+        if (next.length > 240) next = next.slice(0, 240).trim();
+        if (next) out = next;
+      }
+    }
+
     return out;
   } catch (e) {
     console.warn('generatePinterestAltText error:', e.message || e);
@@ -3914,7 +4049,18 @@ const STYLE_ON_IMAGE_TEXT_GUIDANCE = {
   step_cards_3: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
 };
 
-async function generateStyleOnImageText({ styleId, topic, domain, keyword, year, description, avoidText, usedOverlayTexts }) {
+async function generateStyleOnImageText({
+  styleId,
+  topic,
+  domain,
+  keyword,
+  year,
+  description,
+  avoidText,
+  usedOverlayTexts,
+  outputLanguage,
+  strictLanguage,
+}) {
   const guidance = STYLE_ON_IMAGE_TEXT_GUIDANCE[styleId] ||
     'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.';
   let avoidNote = '';
@@ -3925,7 +4071,21 @@ async function generateStyleOnImageText({ styleId, topic, domain, keyword, year,
       .map((u) => `- "${u.headline}"${u.subheadline ? ` / "${u.subheadline}"` : ''}`)
       .join('\n')}\n`;
   }
-  const content = `Article/topic: ${topic}\n${keyword ? `Keyword: ${keyword}\n` : ''}Domain: ${domain}\nYear: ${year}\n${description ? `Context: ${description.slice(0, 200)}\n` : ''}\nStyle: ${styleId}\n\n${guidance}${avoidNote}\n\n${PIN_COPY_ANTI_CLICHE_INSTRUCTION}\n\nReturn JSON only: {"headline":"...","subheadline":"..."}. No markdown.`;
+  const lang = String(outputLanguage || '').trim().toLowerCase();
+  const langNote =
+    lang && lang !== 'auto'
+      ? `\n\nLANGUAGE REQUIREMENT: Write BOTH headline and subheadline in ${lang.toUpperCase()} only. Do not use English.\n`
+      : '';
+  const content =
+    `Article/topic: ${topic}\n` +
+    `${keyword ? `Keyword: ${keyword}\n` : ''}` +
+    `Domain: ${domain}\n` +
+    `Year: ${year}\n` +
+    `${description ? `Context: ${description.slice(0, 200)}\n` : ''}` +
+    `Style: ${styleId}\n\n` +
+    `${guidance}${avoidNote}` +
+    `${langNote}\n` +
+    `${PIN_COPY_ANTI_CLICHE_INSTRUCTION}\n\nReturn JSON only: {"headline":"...","subheadline":"..."}. No markdown.`;
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -4978,13 +5138,20 @@ app.post('/api/urltopin/scrape', async (req, res) => {
 
 app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
   try {
-    const { url, articleData, count: rawCount, pinsPerUrl: rawPinsPerUrl } = req.body || {};
+    const {
+      url,
+      articleData,
+      count: rawCount,
+      pinsPerUrl: rawPinsPerUrl,
+      outputLanguage: rawOutputLanguage,
+    } = req.body || {};
     if (!url) {
       return res.status(400).json({ error: 'Missing url' });
     }
     const requestedCount = Number.parseInt(rawPinsPerUrl ?? rawCount ?? 10, 10);
     const count = [3, 5, 10].includes(requestedCount) ? requestedCount : 10;
-    const { base } = await fetchArticleBaseAndSummary(url, articleData || null);
+    const outputLanguage = String(rawOutputLanguage || '').trim().toLowerCase();
+    const { base } = await fetchArticleBaseAndSummary(url, articleData || null, { outputLanguage });
     const contentProfile = await enrichContentProfile(base, openai);
     const plan = planStrategies(contentProfile, count);
     const strategyCounts = {};
@@ -5011,11 +5178,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       mode,
       count,
       strategicSingle,
+      outputLanguage: rawOutputLanguage,
+      strictLanguage: rawStrictLanguage,
       imageSource = 'ai',
       userImageUrls: rawUserImageUrls,
       usePageReferenceImages: rawUsePageReferenceImages,
       metadataOnly: rawMetadataOnly,
     } = req.body || {};
+    const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
+    const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
     const usePageReferenceImages = rawUsePageReferenceImages === true;
     let userImageUrls = rawUserImageUrls;
@@ -5058,7 +5229,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         req._strategicSingle = true;
       }
     } else if (isStrategic) {
-      const fetched = await fetchArticleBaseAndSummary(rawUrl, articleData, { preResolvedUrl: effectiveUrl });
+      const fetched = await fetchArticleBaseAndSummary(rawUrl, articleData, {
+        preResolvedUrl: effectiveUrl,
+        outputLanguage,
+      });
       const { base } = fetched;
       const contentProfile = await enrichContentProfile(base, openai);
       const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
@@ -5088,6 +5262,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       (await fetchArticleBaseAndSummary(rawUrl, articleData, {
         ...(fastForFanOut ? { fast: true } : {}),
         preResolvedUrl: effectiveUrl,
+        outputLanguage,
       }));
     const base = fetchedBase.base;
     let articleSummary = fetchedBase.articleSummary;
@@ -5367,6 +5542,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             usedOverlayTexts,
             priorPinCopy: priorPinCopy.length ? [...priorPinCopy] : undefined,
             layoutOverlayGuidance,
+            outputLanguage,
+            strictLanguage,
           },
           openai
         );
@@ -5461,13 +5638,23 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
-              body: JSON.stringify({ content: titlePrompt, type: 'title' }),
+              body: JSON.stringify({
+                content: titlePrompt,
+                type: 'title',
+                outputLanguage,
+                strictLanguage,
+              }),
               signal: c1.signal,
             }),
             fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-field`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': tokenHeader },
-              body: JSON.stringify({ content: descPrompt, type: 'description' }),
+              body: JSON.stringify({
+                content: descPrompt,
+                type: 'description',
+                outputLanguage,
+                strictLanguage,
+              }),
               signal: c2.signal,
             }),
             generateStyleOnImageText({
@@ -5479,6 +5666,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
               description: base.description || '',
               avoidText: effectiveStyles.length === 1 && avoidText ? avoidText : null,
               usedOverlayTexts: effectiveStyles.length > 1 ? usedOverlayTexts : null,
+              outputLanguage,
+              strictLanguage,
             }),
           ]);
           clearTimeout(t1);
@@ -5768,6 +5957,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           styleLabel: sp.label,
           linkDisplay: domain || base.linkDisplay || '',
           nanoBananaPrompt: imagePrompt,
+          outputLanguage,
+          strictLanguage,
         },
         openai
       );
@@ -5925,10 +6116,21 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 // POST /api/urltopin/regenerate-metadata, regenerate only title or description (fast, no image)
 app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
   try {
-    const { url, articleData, styleId, type, currentTitle, currentDescription } = req.body || {};
+    const {
+      url,
+      articleData,
+      styleId,
+      type,
+      currentTitle,
+      currentDescription,
+      outputLanguage: rawOutputLanguage,
+      strictLanguage: rawStrictLanguage,
+    } = req.body || {};
     if (!url || !styleId || !type || (type !== 'title' && type !== 'description')) {
       return res.status(400).json({ error: 'Missing or invalid url, styleId, or type (must be "title" or "description")' });
     }
+    const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
+    const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const rawUrl = String(url || '').trim();
     let effectiveUrl = rawUrl;
     try {
@@ -5959,19 +6161,83 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
       ? `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. Curiosity-driven, descriptive, use emotional triggers or questions. Only return the title, nothing else. Avoid quotes.${varietyHint}\n\n${contentBase}`
       : `Write an engaging Pinterest pin description (max 450 characters) for this content. Explain the benefit or insight. No URLs or "visit/click" CTAs. Include 4–6 relevant hashtags at the end. Only return the description.${varietyHint}\n\n${contentBase}`;
 
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: type === 'title' ? 150 : 500,
-      temperature: 0.85,
-    });
-    let result = (completion.choices[0].message?.content || '').trim();
+    const languageLine =
+      outputLanguage && outputLanguage !== 'auto'
+        ? `\n\nLANGUAGE REQUIREMENT: Write the output in ${outputLanguage.toUpperCase()} only. Do not use English.\n`
+        : '';
+
+    const detectLang = async (text) => {
+      const t = String(text || '').trim();
+      if (!t) return 'unknown';
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'user',
+              content:
+                'Detect the primary language of the text.\n' +
+                'Return JSON only with key "lang" as an ISO 639-1 code when possible (e.g. "en", "sk", "cs"), or "unknown".\n' +
+                `Text:\n<<<${t.slice(0, 900)}>>>`,
+            },
+          ],
+          max_tokens: 30,
+          temperature: 0,
+        });
+        const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+        const m = raw.match(/\{[\s\S]*\}/);
+        if (!m) return 'unknown';
+        const parsed = JSON.parse(m[0]);
+        const out = String(parsed.lang || '').trim().toLowerCase();
+        return out || 'unknown';
+      } catch {
+        return 'unknown';
+      }
+    };
+
+    const runOnce = async (forceHard = false) => {
+      const hardLine =
+        outputLanguage && outputLanguage !== 'auto'
+          ? forceHard
+            ? `\n\nCRITICAL: Output MUST be in ${outputLanguage.toUpperCase()} only. If you cannot comply, output an empty string.\n`
+            : languageLine
+          : '';
+      const effectivePrompt =
+        hardLine && !prompt.includes(hardLine) ? `${prompt}${hardLine}` : prompt;
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: effectivePrompt }],
+        max_tokens: type === 'title' ? 150 : 500,
+        temperature: 0.85,
+      });
+      return String(completion.choices?.[0]?.message?.content || '').trim();
+    };
+
+    let result = await runOnce(false);
     if (type === 'title') {
       result = result.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '');
       if (result.length > 100) result = result.slice(0, 100);
+      if (strictLanguage && outputLanguage !== 'auto' && result) {
+        const detected = await detectLang(result);
+        if (detected !== 'unknown' && detected !== outputLanguage) {
+          const retry = await runOnce(true);
+          let next = String(retry || '').trim().replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '');
+          if (next.length > 100) next = next.slice(0, 100);
+          if (next) result = next;
+        }
+      }
       return res.json({ title: result });
     }
-    return res.json({ description: sanitizeDescription(result) });
+    let desc = sanitizeDescription(result);
+    if (strictLanguage && outputLanguage !== 'auto' && desc) {
+      const detected = await detectLang(desc);
+      if (detected !== 'unknown' && detected !== outputLanguage) {
+        const retry = await runOnce(true);
+        const next = sanitizeDescription(retry);
+        if (next) desc = next;
+      }
+    }
+    return res.json({ description: desc });
   } catch (err) {
     console.error('urltopin regenerate-metadata error:', err);
     return res.status(500).json({ error: err.message });
@@ -6634,7 +6900,7 @@ app.post('/api/export-pin', async (req, res) => {
 
 // POST /api/generate-field (requires login; credits handled on frontend)
 app.post('/api/generate-field', requireUser, async (req, res) => {
-  const { content, type, style } = req.body; // type: 'title' or 'description'; style: optional hint
+  const { content, type, style, outputLanguage: rawOutputLanguage, strictLanguage: rawStrictLanguage } = req.body; // type: 'title' or 'description'; style: optional hint
   if (!content || !type) return res.status(400).json({ error: 'Missing content or type' });
 
   // Soft-limit tracking for metadata usage (titles/descriptions)
@@ -6643,21 +6909,70 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
   );
 
   const isShortTitle = type === 'title' && style === 'short_50';
+  const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
+  const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
+  const languageLine =
+    outputLanguage && outputLanguage !== 'auto'
+      ? `\n\nLANGUAGE REQUIREMENT: Write the output in ${outputLanguage.toUpperCase()} only. Do not use English.\n`
+      : '';
   const prompt = type === 'title'
     ? (
       isShortTitle
-        ? `Write a concise Pinterest pin title (max 50 characters). Focus on the main keyword and benefit. No quotes or hashtags. Return only the title.\n${content}`
-        : `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Include emotional triggers, urgency, numbers, or questions where possible. Make it descriptive and specific rather than generic. Use engaging words that create intrigue. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:\n${content}`
+        ? `Write a concise Pinterest pin title (max 50 characters). Focus on the main keyword and benefit. No quotes or hashtags. Return only the title.${languageLine}\n${content}`
+        : `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Include emotional triggers, urgency, numbers, or questions where possible. Make it descriptive and specific rather than generic. Use engaging words that create intrigue. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:${languageLine}\n${content}`
     )
-    : `Write an engaging Pinterest pin description (max 450 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Avoid phrases like "+visit site+", "+click the link+", or adding URLs. Include 4–6 relevant hashtags at the end. Only return the description, nothing else:\n${content}`;
+    : `Write an engaging Pinterest pin description (max 450 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Avoid phrases like "+visit site+", "+click the link+", or adding URLs. Include 4–6 relevant hashtags at the end. Only return the description, nothing else:${languageLine}\n${content}`;
   try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [{ role: 'user', content: prompt }],
+    const detectLang = async (text) => {
+      const t = String(text || '').trim();
+      if (!t) return 'unknown';
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'user',
+              content:
+                'Detect the primary language of the text.\n' +
+                'Return JSON only with key "lang" as an ISO 639-1 code when possible (e.g. "en", "sk", "cs"), or "unknown".\n' +
+                `Text:\n<<<${t.slice(0, 900)}>>>`,
+            },
+          ],
+          max_tokens: 30,
+          temperature: 0,
+        });
+        const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+        const m = raw.match(/\{[\s\S]*\}/);
+        if (!m) return 'unknown';
+        const parsed = JSON.parse(m[0]);
+        const out = String(parsed.lang || '').trim().toLowerCase();
+        return out || 'unknown';
+      } catch {
+        return 'unknown';
+      }
+    };
+
+    const runOnce = async (forceLanguageHarder = false) => {
+      const hardLine =
+        outputLanguage && outputLanguage !== 'auto'
+          ? forceLanguageHarder
+            ? `\n\nCRITICAL: Output MUST be in ${outputLanguage.toUpperCase()} only. If you cannot comply, output an empty string.\n`
+            : languageLine
+          : '';
+      const effectivePrompt =
+        forceLanguageHarder && hardLine && !prompt.includes(hardLine)
+          ? prompt.replace(languageLine, hardLine)
+          : prompt;
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: effectivePrompt }],
       max_tokens: type === 'title' ? 150 : 500,
       temperature: 0.7,
-    });
-    let result = completion.choices[0].message.content.trim();
+      });
+      return completion.choices?.[0]?.message?.content?.trim() || '';
+    };
+
+    let result = await runOnce(false);
     if (type === 'title') {
       // Remove only problematic characters, keep basic punctuation like . , ! ? -
       result = result.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '');
@@ -6672,6 +6987,25 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
       }
     }
     if (type === 'description') result = sanitizeDescription(result);
+
+    if (strictLanguage && outputLanguage !== 'auto' && result) {
+      const detected = await detectLang(result);
+      if (detected !== 'unknown' && detected !== outputLanguage) {
+        const retry = await runOnce(true);
+        let next = String(retry || '').trim();
+        if (type === 'title') {
+          next = next.replace(/["'`~@#$%^&*()_+=\[\]{}|;:<>\\/]+/g, '');
+          if (isShortTitle && next.length > 50) {
+            const cut = next.lastIndexOf(' ', 49);
+            next = (cut > 20 ? next.slice(0, cut) : next.slice(0, 50)).trim();
+          }
+          if (!isShortTitle && next.length > 100) next = next.slice(0, 100);
+        }
+        if (type === 'description') next = sanitizeDescription(next);
+        if (next) result = next;
+      }
+    }
+
     res.json({ result });
   } catch (err) {
     res.status(500).json({ error: err.message });

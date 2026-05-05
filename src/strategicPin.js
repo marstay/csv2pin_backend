@@ -606,7 +606,18 @@ Return JSON only (no markdown) with this exact shape:
  * @returns {Promise<Object>} { title, overlay_headline, overlay_subheadline, description, hashtags, image_prompt_hint, step_count }
  */
 async function generateStrategicPinMetadata(
-  { articleSummary, keyword, strategy, layoutId, suggestedAngle, keyIdeas, usedOverlayTexts, priorPinCopy, layoutOverlayGuidance },
+  {
+    articleSummary,
+    keyword,
+    strategy,
+    layoutId,
+    suggestedAngle,
+    keyIdeas,
+    usedOverlayTexts,
+    priorPinCopy,
+    layoutOverlayGuidance,
+    outputLanguage,
+  },
   openai
 ) {
   const rules = STRATEGY_COPY_RULES[strategy]?.rules || STRATEGY_COPY_RULES.curiosity_hook.rules;
@@ -655,7 +666,11 @@ async function generateStrategicPinMetadata(
     + avoidBlock
     + priorBlock
     + layoutGuidanceBlock
-    + `\n\nSTRATEGY RULES:\n${rulesToUse}\n\nReturn JSON only.`;
+    + `\n\nSTRATEGY RULES:\n${rulesToUse}\n`
+    + (outputLanguage && String(outputLanguage).trim().toLowerCase() !== 'auto'
+      ? `\nLANGUAGE REQUIREMENT: All fields (title, overlay_headline, overlay_subheadline, description, hashtags) must be written in ${String(outputLanguage).trim().toUpperCase()}.\nDo not use English.\n`
+      : '')
+    + `\nReturn JSON only.`;
 
   try {
     const completion = await openai.chat.completions.create({
