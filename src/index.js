@@ -237,14 +237,19 @@ async function applyPlanActivationForUser(
     return { ok: false, error: insertError.message || String(insertError) };
   }
 
+  // Activation can happen before the user ever signs in (so `profiles` may not exist yet).
+  // Use upsert to avoid silently leaving the user looking like "free" in the UI.
   await supabaseAdmin
     .from('profiles')
-    .update({
-      plan_type: planType,
-      is_pro: planType !== 'free',
-      updated_at: now.toISOString(),
-    })
-    .eq('id', userId);
+    .upsert(
+      {
+        id: userId,
+        plan_type: planType,
+        is_pro: planType !== 'free',
+        updated_at: now.toISOString(),
+      },
+      { onConflict: 'id' }
+    );
 
   console.log('✅ plan activated', { userId, planType, source });
   return { ok: true, planType, pinsLimit };
@@ -8011,12 +8016,17 @@ app.post('/api/pinterest/oauth', async (req, res) => {
       }
 
       // Enforce plan limits (new link only)
-      const { data: profile } = await supabaseAdmin
-        .from('profiles')
-        .select('plan_type')
-        .eq('id', user.id)
-        .single();
-      const planType = profile?.plan_type || 'free';
+      // Prefer active subscription (billing_subscriptions is source-of-truth),
+      // fallback to profile for legacy.
+      const sub = await getActiveSubscriptionForUser(user.id);
+      const { data: profile } = sub?.plan_type
+        ? { data: null }
+        : await supabaseAdmin
+            .from('profiles')
+            .select('plan_type')
+            .eq('id', user.id)
+            .single();
+      const planType = sub?.plan_type || profile?.plan_type || 'free';
       const { data: existing } = await supabaseAdmin
         .from('pinterest_accounts')
         .select('id')
