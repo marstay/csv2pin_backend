@@ -7530,6 +7530,16 @@ app.post('/api/dodo/webhook', async (req, res) => {
       'subscription.update',
     ];
 
+    const updateTarget = (() => {
+      // Safety: Always target by specific Dodo subscription id when we have it.
+      // Fallback to user_id only when Dodo didn't include an id (older/odd events).
+      const q = supabaseAdmin.from('billing_subscriptions');
+      if (dodoSubId) {
+        return q.eq('dodo_subscription_id', dodoSubId);
+      }
+      return q.eq('user_id', userId);
+    })();
+
     if (activateSignals.some((sig) => eventType.includes(sig))) {
       if (!planType || !PLAN_PIN_LIMITS[planType]) {
         console.warn('dodo webhook activation ignored: missing/invalid plan metadata', {
@@ -7539,11 +7549,34 @@ app.post('/api/dodo/webhook', async (req, res) => {
         });
         return res.json({ ok: true, ignored: true, reason: 'missing_plan_metadata' });
       }
+      // Idempotency: if this exact Dodo subscription is already active for this user+plan, just backfill fields.
+      if (dodoSubId) {
+        const { data: existing } = await supabaseAdmin
+          .from('billing_subscriptions')
+          .select('id, user_id, status, plan_type, dodo_subscription_id')
+          .eq('dodo_subscription_id', dodoSubId)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (existing && existing.user_id === userId && existing.status === 'active' && existing.plan_type === planType) {
+          await supabaseAdmin
+            .from('billing_subscriptions')
+            .update({
+              ...(periodStartRaw ? { current_period_start: periodStartRaw } : {}),
+              ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', existing.id)
+            .eq('user_id', userId);
+          return res.json({ ok: true, action: 'noop_already_active', userId, planType });
+        }
+      }
+
       const activated = await applyPlanActivationForUser(userId, planType, `dodo_webhook:${eventType}`, {
-        periodStart: periodStartRaw || null,
-        periodEnd: periodEndRaw || null,
-        dodoSubscriptionId: dodoSubId,
-      });
+          periodStart: periodStartRaw || null,
+          periodEnd: periodEndRaw || null,
+          dodoSubscriptionId: dodoSubId,
+        });
       if (!activated.ok) {
         console.error('dodo webhook activation failed', { eventType, userId, planType, error: activated.error });
         return res.status(500).json({ error: 'Failed to activate plan from webhook' });
@@ -7557,8 +7590,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
       cancelAtPeriodEndSignals.some((sig) => eventType.includes(sig)) &&
       (dataObj?.cancel_at_next_billing_date === true || dataObj?.cancel_at_period_end === true)
     ) {
-      await supabaseAdmin
-        .from('billing_subscriptions')
+      await updateTarget
         .update({
           cancel_at_period_end: true,
           cancelled_at: new Date().toISOString(),
@@ -7566,21 +7598,27 @@ app.post('/api/dodo/webhook', async (req, res) => {
           ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
           updated_at: new Date().toISOString(),
         })
-        .eq('user_id', userId)
         .eq('status', 'active');
       return res.json({ ok: true, action: 'cancel_scheduled', userId });
     }
 
     if (cancelSignals.some((sig) => eventType.includes(sig))) {
-      await supabaseAdmin
-        .from('billing_subscriptions')
+      await updateTarget
         .update({ status: 'cancelled', updated_at: new Date().toISOString() })
-        .eq('user_id', userId)
         .eq('status', 'active');
-      await supabaseAdmin
-        .from('profiles')
-        .update({ plan_type: 'free', is_pro: false, updated_at: new Date().toISOString() })
-        .eq('id', userId);
+      // Only downgrade profile if the user truly has no other active subscriptions left.
+      const { data: stillActive } = await supabaseAdmin
+        .from('billing_subscriptions')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .limit(1);
+      if (!stillActive || stillActive.length === 0) {
+        await supabaseAdmin
+          .from('profiles')
+          .update({ plan_type: 'free', is_pro: false, updated_at: new Date().toISOString() })
+          .eq('id', userId);
+      }
       return res.json({ ok: true, action: 'cancelled', userId });
     }
 
