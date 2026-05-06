@@ -3660,6 +3660,73 @@ function sanitizeDescription(input) {
   return desc;
 }
 
+const AFFILIATE_DISCLOSURE_MAX_CUSTOM_LEN = 40;
+
+/** Parse affiliate disclosure from request body. Default off — unchanged behavior when omitted. */
+function normalizeAffiliateDisclosureRequest(body) {
+  const raw = String(body?.affiliateDisclosure ?? 'off').trim().toLowerCase();
+  const mode =
+    raw === 'ad' || raw === 'affiliate' || raw === 'custom' || raw === 'off' ? raw : 'off';
+  let custom = String(body?.affiliateDisclosureCustom ?? '').trim();
+  if (custom.length > AFFILIATE_DISCLOSURE_MAX_CUSTOM_LEN) {
+    custom = custom.slice(0, AFFILIATE_DISCLOSURE_MAX_CUSTOM_LEN);
+  }
+  if (mode === 'off') return { mode: 'off', tag: null };
+  if (mode === 'ad') return { mode: 'ad', tag: '#ad' };
+  if (mode === 'affiliate') return { mode: 'affiliate', tag: '#affiliate' };
+  if (mode === 'custom') {
+    if (!custom) return { mode: 'off', tag: null };
+    const firstToken = custom.split(/\s+/)[0];
+    let tag = firstToken.startsWith('#') ? firstToken : `#${firstToken}`;
+    tag = tag.replace(/[^#A-Za-z0-9_-]/g, '');
+    if (tag.length < 2 || tag === '#') return { mode: 'off', tag: null };
+    return { mode: 'custom', tag: tag.slice(0, AFFILIATE_DISCLOSURE_MAX_CUSTOM_LEN + 1) };
+  }
+  return { mode: 'off', tag: null };
+}
+
+/**
+ * When disclosure is on, append one hashtag as the last hashtag in the description. No-op when off.
+ * @param {string} description
+ * @param {{ mode: string, tag: string | null }} disclosure
+ * @param {{ maxLength?: number }} [opts] — if set, trim earlier text so result fits (keeps disclosure tag).
+ */
+function appendAffiliateDisclosureToDescription(description, disclosure, opts = {}) {
+  if (!disclosure || disclosure.mode === 'off' || !disclosure.tag) {
+    return String(description ?? '');
+  }
+  const tag = String(disclosure.tag).trim();
+  if (!tag) return String(description ?? '');
+  let desc = String(description ?? '').replace(/\s+$/u, '');
+  const allTags = desc.match(/#[\w-]+/g);
+  if (allTags && allTags[allTags.length - 1].toLowerCase() === tag.toLowerCase()) {
+    return desc;
+  }
+  const suffix = desc ? ` ${tag}` : tag;
+  let out = `${desc}${suffix}`;
+  const maxLen = opts.maxLength;
+  if (maxLen && out.length > maxLen) {
+    const room = maxLen - suffix.length;
+    if (room < 1) return tag.slice(0, maxLen);
+    let trimmed = desc.slice(0, room).replace(/\s+$/u, '');
+    const lastSpace = trimmed.lastIndexOf(' ');
+    if (lastSpace > 10) trimmed = trimmed.slice(0, lastSpace).replace(/\s+$/u, '');
+    out = trimmed ? `${trimmed}${suffix}` : tag;
+    if (out.length > maxLen) {
+      trimmed = desc.slice(0, Math.max(0, maxLen - suffix.length)).replace(/\s+$/u, '');
+      const ls = trimmed.lastIndexOf(' ');
+      if (ls > 10) trimmed = trimmed.slice(0, ls).replace(/\s+$/u, '');
+      out = trimmed ? `${trimmed}${suffix}` : tag;
+    }
+  }
+  return out;
+}
+
+function hashtagsFromPinDescription(description) {
+  const m = String(description || '').match(/#[\w-]+/g);
+  return m ? m.slice(0, 10) : [];
+}
+
 async function generatePinterestAltText(
   { title, description, overlayText, styleLabel, linkDisplay, nanoBananaPrompt, outputLanguage, strictLanguage },
   openaiClient
@@ -5205,6 +5272,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
+    const affiliateDisclosure = normalizeAffiliateDisclosureRequest(req.body || {});
     const usePageReferenceImages = rawUsePageReferenceImages === true;
     let userImageUrls = rawUserImageUrls;
     if (typeof userImageUrls === 'string' && userImageUrls.trim()) {
@@ -5790,15 +5858,23 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
       if (metadataOnly) {
         const metaExtra = meta;
+        const descriptionForPin = appendAffiliateDisclosureToDescription(
+          pinDescription,
+          affiliateDisclosure
+        );
+        const hashtagsForPin =
+          affiliateDisclosure.mode === 'off'
+            ? hashtags
+            : hashtagsFromPinDescription(descriptionForPin);
         return {
           styleId: sp.id,
           styleLabel: sp.label,
           imagePrompt,
           imageUrl: '',
           title: pinTitle,
-          description: pinDescription,
+          description: descriptionForPin,
           altText: '',
-          hashtags,
+          hashtags: hashtagsForPin,
           link: url,
           overlayText,
           bakedInText: overlayTextForPrompt,
@@ -5979,15 +6055,23 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         },
         openai
       );
+      const descriptionForPin = appendAffiliateDisclosureToDescription(
+        pinDescription,
+        affiliateDisclosure
+      );
+      const hashtagsForPin =
+        affiliateDisclosure.mode === 'off'
+          ? hashtags
+          : hashtagsFromPinDescription(descriptionForPin);
       const pinRecord = {
         styleId: sp.id,
         styleLabel: sp.label,
         imagePrompt,
         imageUrl,
         title: pinTitle,
-        description: pinDescription,
+        description: descriptionForPin,
         altText,
-        hashtags,
+        hashtags: hashtagsForPin,
         link: url,
         overlayText,
         bakedInText: overlayTextForPrompt,
@@ -6042,7 +6126,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           style_label: sp.label,
           image_url: imageUrl || null,
           pin_title: pinTitle || null,
-          pin_description: pinDescription || null,
+          pin_description: descriptionForPin || null,
           pin_link: url,
         };
 
@@ -6079,7 +6163,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             user_id: req.user.id,
             pinterest_account_id: null,
             title: pinTitle,
-            description: pinDescription,
+            description: descriptionForPin,
             image_url: imageUrl || null,
             board_id: '', // required by schema when not yet scheduled
             link: url,
@@ -6148,6 +6232,7 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
     }
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
+    const affiliateDisclosure = normalizeAffiliateDisclosureRequest(req.body || {});
     const rawUrl = String(url || '').trim();
     let effectiveUrl = rawUrl;
     try {
@@ -6254,6 +6339,7 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
         if (next) desc = next;
       }
     }
+    desc = appendAffiliateDisclosureToDescription(desc, affiliateDisclosure, { maxLength: 450 });
     return res.json({ description: desc });
   } catch (err) {
     console.error('urltopin regenerate-metadata error:', err);
