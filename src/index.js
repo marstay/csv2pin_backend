@@ -86,11 +86,22 @@ const PLAN_METADATA_LIMITS = {
 
 const pendingDodoActivations = new Map();
 
+// Free plan: 10 AI pins total for lifetime (not per month).
+// We implement this by storing free-plan usage in a single "lifetime" bucket row in pin_usage.
+// Keep it a valid YYYY-MM-DD date since pin_usage.year_month is stored as a date-like string.
+const FREE_LIFETIME_YEAR_MONTH = '1970-01-01';
+
 function currentYearMonthDate() {
   const now = new Date();
   // Use UTC month start to avoid timezone edge cases with Postgres date
   const monthStartUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   return monthStartUtc.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+}
+
+function pinUsageBucketForPlan(planType) {
+  const pt = String(planType || 'free').trim().toLowerCase();
+  if (pt === 'free') return FREE_LIFETIME_YEAR_MONTH;
+  return currentYearMonthDate();
 }
 
 async function getActiveSubscriptionForUser(userId) {
@@ -312,9 +323,9 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
   const key = String(userId);
   let promise = pinUsageLocks.get(key);
   const run = async () => {
-    const yearMonth = currentYearMonthDate();
     const sub = await getActiveSubscriptionForUser(userId);
     const planType = sub?.plan_type || 'free';
+    const yearMonth = pinUsageBucketForPlan(planType);
     const planPinsLimit = planAiPinsLimit(sub);
     const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(sub);
     const baselineAi = Math.max(0, Number(sub?.usage_baseline_pins_used ?? 0) || 0);
@@ -506,6 +517,7 @@ async function getCurrentUsageSnapshot(userId) {
   // Active subscription row (if any)
   const subscription = await getActiveSubscriptionForUser(userId);
   const planType = subscription?.plan_type || 'free';
+  const pinUsageBucket = pinUsageBucketForPlan(planType);
   const planPinsLimit = planAiPinsLimit(subscription);
   const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(subscription);
   const baselineAi = Math.max(0, Number(subscription?.usage_baseline_pins_used ?? 0) || 0);
@@ -526,7 +538,7 @@ async function getCurrentUsageSnapshot(userId) {
       .from('pin_usage')
       .select('pins_used, user_photo_pins_used')
       .eq('user_id', userId)
-      .eq('year_month', yearMonth)
+      .eq('year_month', pinUsageBucket)
       .single();
     if (pinError) {
       // Ignore "no rows" error, log others
