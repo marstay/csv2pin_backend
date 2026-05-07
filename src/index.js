@@ -109,7 +109,7 @@ async function getActiveSubscriptionForUser(userId) {
     const { data, error } = await supabaseAdmin
       .from('billing_subscriptions')
       .select(
-        'id, plan_type, pins_limit_per_month, status, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
+        'id, plan_type, pins_limit_per_month, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
       )
       .eq('user_id', userId)
       .eq('status', 'active')
@@ -151,12 +151,76 @@ function markPendingDodoActivation(userId, planType, sessionId = null) {
   if (!userId || !planType) return;
   pendingDodoActivations.set(String(userId), {
     planType: String(planType),
+    billingInterval: 'month',
     sessionId: sessionId ? String(sessionId) : null,
     createdAt: Date.now(),
   });
 }
 
-function consumePendingDodoActivation(userId, requestedPlanType) {
+function normalizeBillingInterval(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (v === 'year' || v === 'annual' || v === 'annually') return 'year';
+  return 'month';
+}
+
+function planRank(planType) {
+  const p = String(planType || '').trim().toLowerCase();
+  if (p === 'starter') return 1;
+  if (p === 'creator') return 2;
+  if (p === 'pro') return 3;
+  if (p === 'agency') return 4;
+  return 0; // free/unknown
+}
+
+function resolveDodoProductIdForPlan(planType, billingInterval) {
+  const pt = String(planType || '').trim();
+  const bi = normalizeBillingInterval(billingInterval);
+  const productMapMonthly = {
+    free: process.env.DODO_PRODUCT_FREE_ID,
+    starter: process.env.DODO_PRODUCT_STARTER_ID,
+    creator: process.env.DODO_PRODUCT_CREATOR_ID,
+    pro: process.env.DODO_PRODUCT_PRO_ID,
+    agency: process.env.DODO_PRODUCT_AGENCY_ID,
+  };
+  const productMapAnnual = {
+    free: process.env.DODO_PRODUCT_FREE_ID,
+    starter: process.env.DODO_PRODUCT_STARTER_ANNUAL_ID,
+    creator: process.env.DODO_PRODUCT_CREATOR_ANNUAL_ID,
+    pro: process.env.DODO_PRODUCT_PRO_ANNUAL_ID,
+    agency: process.env.DODO_PRODUCT_AGENCY_ANNUAL_ID,
+  };
+  const map = bi === 'year' ? productMapAnnual : productMapMonthly;
+  return map[pt] || null;
+}
+
+function inferBillingIntervalFromDodoProductId(productId) {
+  const id = String(productId || '').trim();
+  if (!id) return 'month';
+  const annualIds = new Set(
+    [
+      process.env.DODO_PRODUCT_STARTER_ANNUAL_ID,
+      process.env.DODO_PRODUCT_CREATOR_ANNUAL_ID,
+      process.env.DODO_PRODUCT_PRO_ANNUAL_ID,
+      process.env.DODO_PRODUCT_AGENCY_ANNUAL_ID,
+    ]
+      .map((x) => String(x || '').trim())
+      .filter(Boolean)
+  );
+  if (annualIds.has(id)) return 'year';
+  return 'month';
+}
+
+function markPendingDodoActivationWithInterval(userId, planType, billingInterval, sessionId = null) {
+  if (!userId || !planType) return;
+  pendingDodoActivations.set(String(userId), {
+    planType: String(planType),
+    billingInterval: normalizeBillingInterval(billingInterval),
+    sessionId: sessionId ? String(sessionId) : null,
+    createdAt: Date.now(),
+  });
+}
+
+function consumePendingDodoActivation(userId, requestedPlanType, requestedInterval) {
   const key = String(userId || '');
   const row = pendingDodoActivations.get(key);
   if (!row) return { ok: false, reason: 'missing_pending_checkout' };
@@ -167,6 +231,16 @@ function consumePendingDodoActivation(userId, requestedPlanType) {
   }
   if (String(row.planType) !== String(requestedPlanType)) {
     return { ok: false, reason: 'plan_mismatch_with_pending_checkout', pendingPlanType: row.planType };
+  }
+  const reqInt = normalizeBillingInterval(requestedInterval);
+  const rowInt = normalizeBillingInterval(row.billingInterval);
+  if (rowInt !== reqInt) {
+    return {
+      ok: false,
+      reason: 'interval_mismatch_with_pending_checkout',
+      pendingInterval: rowInt,
+      requestedInterval: reqInt,
+    };
   }
   pendingDodoActivations.delete(key);
   return { ok: true, pending: row };
@@ -183,6 +257,7 @@ async function applyPlanActivationForUser(
   }
 
   const now = new Date();
+  const billingInterval = normalizeBillingInterval(opts?.billingInterval || opts?.billing_interval || 'month');
   const periodStart = String(opts?.periodStart || now.toISOString());
   const periodEnd = String(opts?.periodEnd || (() => {
     const nextMonth = new Date(now);
@@ -191,6 +266,24 @@ async function applyPlanActivationForUser(
   })());
   const pinsLimit = PLAN_PIN_LIMITS[planType];
   const dodoSubscriptionId = opts?.dodoSubscriptionId ? String(opts.dodoSubscriptionId) : null;
+
+  // Safety: upgrades currently create a *new* Dodo subscription. If we don't cancel the old one,
+  // the user can be billed twice (monthly→monthly, monthly→annual, annual→annual).
+  // Capture the currently-active subscription ids BEFORE we mutate billing_subscriptions.
+  let previousActiveDodoSubscriptionIds = [];
+  try {
+    const { data: activeRows } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('dodo_subscription_id')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .limit(10);
+    previousActiveDodoSubscriptionIds = (activeRows || [])
+      .map((r) => String(r?.dodo_subscription_id || '').trim())
+      .filter(Boolean);
+  } catch {
+    previousActiveDodoSubscriptionIds = [];
+  }
 
   // Baseline current usage so upgrades/renewals don't "steal" allowance from earlier periods.
   const yearMonth = currentYearMonthDate();
@@ -224,6 +317,7 @@ async function applyPlanActivationForUser(
       plan_type: planType,
       pins_limit_per_month: pinsLimit,
       status: 'active',
+      billing_interval: billingInterval,
       current_period_start: periodStart,
       current_period_end: periodEnd,
       cancel_at_period_end: false,
@@ -235,6 +329,54 @@ async function applyPlanActivationForUser(
 
   if (insertError) {
     return { ok: false, error: insertError.message || String(insertError) };
+  }
+
+  // If we have a new subscription id, schedule cancellation of any previous active Dodo subscriptions
+  // (exclude the new one; keep behavior safe when Dodo id is missing).
+  if (DODO_API_KEY && dodoSubscriptionId) {
+    const toCancel = [...new Set(previousActiveDodoSubscriptionIds)]
+      .filter((id) => id && id !== dodoSubscriptionId);
+    for (const oldId of toCancel) {
+      try {
+        const dodoResp = await fetch(
+          `${DODO_BASE_URL}/subscriptions/${encodeURIComponent(oldId)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${DODO_API_KEY}`,
+            },
+            body: JSON.stringify({ cancel_at_next_billing_date: true }),
+          }
+        );
+        const dodoJson = await dodoResp.json().catch(() => ({}));
+        if (!dodoResp.ok) {
+          console.warn('applyPlanActivationForUser: Dodo cancel old subscription failed', {
+            status: dodoResp.status,
+            details: dodoJson,
+            oldSubId: oldId,
+            userId,
+            planType,
+            source,
+          });
+        } else {
+          console.log('✅ applyPlanActivationForUser: scheduled cancel in Dodo for old subscription', {
+            userId,
+            oldSubId: oldId,
+            newSubId: dodoSubscriptionId,
+            source,
+          });
+        }
+      } catch (e) {
+        console.warn('applyPlanActivationForUser: Dodo cancel old subscription error', {
+          oldSubId,
+          userId,
+          planType,
+          source,
+          error: e?.message || e,
+        });
+      }
+    }
   }
 
   // Activation can happen before the user ever signs in (so `profiles` may not exist yet).
@@ -591,6 +733,7 @@ async function getCurrentUsageSnapshot(userId) {
           id: subscription.id || null,
           status: subscription.status || null,
           plan_type: subscription.plan_type || null,
+          billing_interval: subscription.billing_interval || 'month',
           current_period_start: subscription.current_period_start || null,
           current_period_end: subscription.current_period_end || null,
           cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
@@ -7248,10 +7391,11 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       return res.status(500).json({ error: 'Dodo Payments API key not configured' });
     }
 
-    const { planType, discountCode, couponCode, referralKey, affonsoReferral } = req.body || {};
+    const { planType, billingInterval: rawBillingInterval, discountCode, couponCode, referralKey, affonsoReferral } = req.body || {};
     if (!planType) {
       return res.status(400).json({ error: 'Missing planType' });
     }
+    const billingInterval = normalizeBillingInterval(rawBillingInterval);
 
     const referralSlug = String(referralKey || '')
       .trim()
@@ -7271,17 +7415,26 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     const discount_code = fromClient || fromPartner || fromEnv || undefined;
 
     // Map internal plan types to Dodo product IDs via environment variables
-    const productMap = {
+    const productMapMonthly = {
       free: process.env.DODO_PRODUCT_FREE_ID,
       starter: process.env.DODO_PRODUCT_STARTER_ID,
       creator: process.env.DODO_PRODUCT_CREATOR_ID,
       pro: process.env.DODO_PRODUCT_PRO_ID,
       agency: process.env.DODO_PRODUCT_AGENCY_ID,
     };
+    const productMapAnnual = {
+      free: process.env.DODO_PRODUCT_FREE_ID,
+      starter: process.env.DODO_PRODUCT_STARTER_ANNUAL_ID,
+      creator: process.env.DODO_PRODUCT_CREATOR_ANNUAL_ID,
+      pro: process.env.DODO_PRODUCT_PRO_ANNUAL_ID,
+      agency: process.env.DODO_PRODUCT_AGENCY_ANNUAL_ID,
+    };
 
-    const productId = productMap[planType];
+    const productId = (billingInterval === 'year' ? productMapAnnual : productMapMonthly)[planType];
     if (!productId) {
-      return res.status(400).json({ error: `No Dodo product configured for planType "${planType}"` });
+      return res.status(400).json({
+        error: `No Dodo product configured for planType "${planType}" (${billingInterval})`,
+      });
     }
 
   // Compute frontend base (strip any /app or deeper path)
@@ -7300,11 +7453,12 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       metadata: {
         supabase_user_id: req.user.id,
         app_plan_type: planType,
+        app_billing_interval: billingInterval,
         ...(referralSlug ? { referral_key: referralSlug } : {}),
         ...(affonso_referral ? { affonso_referral } : {}),
       },
     // Redirect back to app after success/failure
-    return_url: `${frontendBase.replace(/\/$/, '')}/payment-success?plan=${encodeURIComponent(planType)}`,
+    return_url: `${frontendBase.replace(/\/$/, '')}/payment-success?plan=${encodeURIComponent(planType)}&interval=${encodeURIComponent(billingInterval)}`,
     // Let customers enter or change a code on the hosted checkout; pre-apply when we have one.
     feature_flags: {
       allow_discount_code: true,
@@ -7338,10 +7492,11 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     const checkoutUrl = json.checkout_url || json.url || null;
     const sessionId = json.session_id || json.id || null;
 
-    markPendingDodoActivation(req.user.id, planType, sessionId || null);
+    markPendingDodoActivationWithInterval(req.user.id, planType, billingInterval, sessionId || null);
     console.log('🧾 Dodo checkout created', {
       userId: req.user.id,
       planType,
+      billingInterval,
       sessionId: sessionId || null,
       hasCheckoutUrl: Boolean(checkoutUrl),
     });
@@ -7385,18 +7540,21 @@ app.get('/api/account/plan', requireUser, async (req, res) => {
 // Simple endpoint to mark a plan as active for the current user
 app.post('/api/account/activate-plan', requireUser, async (req, res) => {
   try {
-    const { planType, checkoutSessionId } = req.body || {};
+    const { planType, billingInterval: rawBillingInterval, checkoutSessionId } = req.body || {};
     if (!planType || !PLAN_PIN_LIMITS[planType]) {
       return res.status(400).json({ error: 'Invalid planType' });
     }
+    const billingInterval = normalizeBillingInterval(rawBillingInterval);
 
-    const pending = consumePendingDodoActivation(req.user.id, planType);
+    const pending = consumePendingDodoActivation(req.user.id, planType, billingInterval);
     if (!pending.ok) {
       console.warn('activate-plan blocked (no verified pending checkout)', {
         userId: req.user.id,
         planType,
+        billingInterval,
         reason: pending.reason,
         pendingPlanType: pending.pendingPlanType || null,
+        pendingInterval: pending.pendingInterval || null,
       });
       return res.status(409).json({
         error: 'No verified pending checkout for this plan. Please complete checkout again.',
@@ -7442,6 +7600,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
           .from('billing_subscriptions')
           .update({
             dodo_subscription_id: dodoSubId,
+            billing_interval: billingInterval,
             updated_at: new Date().toISOString(),
           })
           .eq('id', activeRow.id)
@@ -7473,6 +7632,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
 
     const result = await applyPlanActivationForUser(req.user.id, planType, 'payment_success_fallback', {
       dodoSubscriptionId: dodoSubId,
+      billingInterval,
     });
     if (!result.ok) {
       return res.status(500).json({ error: 'Failed to activate plan', details: result.error });
@@ -7570,6 +7730,150 @@ app.post('/api/account/cancel', requireUser, async (req, res) => {
   }
 });
 
+// Change subscription plan in-place (Dodo Change Plan API). Used for upgrades/downgrades on existing subscriptions.
+app.post('/api/account/change-plan', requireUser, async (req, res) => {
+  try {
+    const { planType: rawPlanType, billingInterval: rawBillingInterval } = req.body || {};
+    const targetPlanType = String(rawPlanType || '').trim();
+    if (!targetPlanType || !PLAN_PIN_LIMITS[targetPlanType]) {
+      return res.status(400).json({ error: 'Invalid planType' });
+    }
+    const targetInterval = normalizeBillingInterval(rawBillingInterval);
+    const nowIso = new Date().toISOString();
+
+    const { data: activeSub, error: fetchErr } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, plan_type, status, current_period_end, dodo_subscription_id')
+      .eq('user_id', req.user.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (fetchErr) {
+      console.error('account/change-plan fetch active subscription error:', fetchErr);
+      return res.status(500).json({ error: 'Failed to load active subscription' });
+    }
+    if (!activeSub?.dodo_subscription_id) {
+      return res.status(400).json({ error: 'No active Dodo subscription found for this account.' });
+    }
+    if (!DODO_API_KEY) {
+      return res.status(500).json({ error: 'Dodo Payments API key not configured' });
+    }
+
+    // Retrieve current subscription details from Dodo so we can infer current interval from product_id.
+    const dodoSubId = String(activeSub.dodo_subscription_id).trim();
+    const getResp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(dodoSubId)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+    });
+    const getJson = await getResp.json().catch(() => ({}));
+    if (!getResp.ok) {
+      console.warn('account/change-plan: Dodo GET subscription failed', {
+        status: getResp.status,
+        subId: dodoSubId,
+        details: getJson,
+      });
+      return res.status(502).json({ error: 'Failed to load subscription from billing provider.' });
+    }
+    const currentProductId = String(getJson?.product_id || getJson?.productId || '').trim();
+    const currentInterval = inferBillingIntervalFromDodoProductId(currentProductId);
+    const currentPlanType = String(activeSub.plan_type || '').trim();
+
+    // Determine upgrade/downgrade and apply your policy.
+    const curRank = planRank(currentPlanType);
+    const tgtRank = planRank(targetPlanType);
+    const isDowngrade =
+      (tgtRank > 0 && curRank > 0 && tgtRank < curRank) ||
+      (currentInterval === 'year' && targetInterval === 'month' && tgtRank === curRank);
+
+    // Select proration + timing policy:
+    // - monthly -> higher monthly: full_immediately (charge full new plan and reset month)
+    // - monthly -> annual: full_immediately
+    // - annual -> higher annual: prorated_immediately
+    // - downgrades: next_billing_date + do_not_bill (keep benefits until renewal)
+    let effective_at = 'immediately';
+    let proration_billing_mode = 'prorated_immediately';
+
+    if (isDowngrade) {
+      effective_at = 'next_billing_date';
+      proration_billing_mode = 'do_not_bill';
+    } else if (currentInterval === 'month' && targetInterval === 'month' && tgtRank > curRank) {
+      proration_billing_mode = 'full_immediately';
+    } else if (currentInterval === 'month' && targetInterval === 'year') {
+      proration_billing_mode = 'full_immediately';
+    } else if (currentInterval === 'year' && targetInterval === 'year' && tgtRank > curRank) {
+      proration_billing_mode = 'prorated_immediately';
+    } else if (currentInterval === targetInterval && tgtRank === curRank) {
+      // no-op plan change
+      return res.json({ ok: true, noop: true, message: 'Already on this plan.' });
+    } else {
+      // Default for other upgrade-like moves: immediate proration
+      proration_billing_mode = 'prorated_immediately';
+    }
+
+    const targetProductId = resolveDodoProductIdForPlan(targetPlanType, targetInterval);
+    if (!targetProductId) {
+      return res.status(400).json({
+        error: `No Dodo product configured for planType "${targetPlanType}" (${targetInterval})`,
+      });
+    }
+
+    const changeBody = {
+      product_id: targetProductId,
+      quantity: 1,
+      proration_billing_mode,
+      effective_at,
+      on_payment_failure: 'prevent_change',
+      metadata: {
+        supabase_user_id: req.user.id,
+        app_plan_type: targetPlanType,
+        app_billing_interval: targetInterval,
+        app_change_requested_at: nowIso,
+      },
+    };
+
+    const changeResp = await fetch(
+      `${DODO_BASE_URL}/subscriptions/${encodeURIComponent(dodoSubId)}/change-plan`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${DODO_API_KEY}`,
+        },
+        body: JSON.stringify(changeBody),
+      }
+    );
+    const changeJson = await changeResp.json().catch(() => ({}));
+    if (!changeResp.ok) {
+      const status = changeResp.status;
+      console.warn('account/change-plan: Dodo change-plan failed', {
+        status,
+        subId: dodoSubId,
+        body: changeBody,
+        details: changeJson,
+      });
+      if (status === 409) {
+        return res.status(409).json({ error: 'A plan change is already pending for this subscription.' });
+      }
+      return res.status(502).json({ error: 'Failed to change plan with billing provider.', details: changeJson });
+    }
+
+    return res.json({
+      ok: true,
+      subscription_id: dodoSubId,
+      current: { planType: currentPlanType, interval: currentInterval, product_id: currentProductId || null },
+      target: { planType: targetPlanType, interval: targetInterval, product_id: targetProductId },
+      effective_at,
+      proration_billing_mode,
+      provider: changeJson,
+      note: 'Plan change requested. Webhooks will finalize state.',
+    });
+  } catch (err) {
+    console.error('account/change-plan error:', err);
+    return res.status(500).json({ error: 'Failed to change plan', details: err.message || String(err) });
+  }
+});
+
 // Dodo webhook: primary source of subscription truth.
 app.post('/api/dodo/webhook', async (req, res) => {
   try {
@@ -7579,6 +7883,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
     const metadata = dataObj?.metadata || event?.metadata || {};
     const userId = String(metadata?.supabase_user_id || '').trim();
     const planType = String(metadata?.app_plan_type || metadata?.plan_type || '').trim();
+    const billingInterval = normalizeBillingInterval(metadata?.app_billing_interval || metadata?.billing_interval || 'month');
     const dodoSubId =
       String(dataObj?.subscription_id || dataObj?.id || dataObj?.subscription?.id || '').trim() || null;
     const periodStartRaw =
@@ -7655,6 +7960,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
             .update({
               ...(periodStartRaw ? { current_period_start: periodStartRaw } : {}),
               ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
+              billing_interval: billingInterval,
               updated_at: new Date().toISOString(),
             })
             .eq('id', existing.id)
@@ -7667,6 +7973,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
           periodStart: periodStartRaw || null,
           periodEnd: periodEndRaw || null,
           dodoSubscriptionId: dodoSubId,
+          billingInterval,
         });
       if (!activated.ok) {
         console.error('dodo webhook activation failed', { eventType, userId, planType, error: activated.error });
