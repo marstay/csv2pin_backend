@@ -163,6 +163,11 @@ function normalizeBillingInterval(raw) {
   return 'month';
 }
 
+function normalizeEmail(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  return s || null;
+}
+
 function planRank(planType) {
   const p = String(planType || '').trim().toLowerCase();
   if (p === 'starter') return 1;
@@ -7529,6 +7534,41 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     }
     const billingInterval = normalizeBillingInterval(rawBillingInterval);
 
+    // Safety: prevent duplicate active subscriptions across multiple Supabase accounts for the same email.
+    // Policy: BLOCK (no auto-cancel) and instruct user to contact support.
+    const authedEmail = normalizeEmail(req.user?.email);
+    if (authedEmail) {
+      try {
+        const { data: otherProfiles } = await supabaseAdmin
+          .from('profiles')
+          .select('id, email')
+          .ilike('email', authedEmail)
+          .neq('id', req.user.id)
+          .limit(10);
+
+        const otherUserIds = (otherProfiles || []).map((p) => String(p?.id || '').trim()).filter(Boolean);
+        if (otherUserIds.length > 0) {
+          const { data: otherActiveSubs } = await supabaseAdmin
+            .from('billing_subscriptions')
+            .select('id, user_id, plan_type, status, dodo_subscription_id')
+            .in('user_id', otherUserIds)
+            .eq('status', 'active')
+            .limit(1);
+
+          if (otherActiveSubs && otherActiveSubs.length > 0) {
+            return res.status(409).json({
+              error: 'duplicate_account_detected',
+              code: 'duplicate_account_detected',
+              message:
+                'We detected another account with an active subscription for this email. To prevent double billing, checkout is blocked. Please contact support and we will merge/fix your account.',
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('create-checkout-session: duplicate-account check failed (continuing)', e?.message || e);
+      }
+    }
+
     const referralSlug = String(referralKey || '')
       .trim()
       .toLowerCase();
@@ -7679,33 +7719,83 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
     const billingInterval = normalizeBillingInterval(rawBillingInterval);
 
     const pending = consumePendingDodoActivation(req.user.id, planType, billingInterval);
-    if (!pending.ok) {
-      console.warn('activate-plan blocked (no verified pending checkout)', {
+    const checkoutId = String(checkoutSessionId || pending.pending?.sessionId || '').trim();
+
+    let dodoSubId = null;
+    if (checkoutId && DODO_API_KEY) {
+      dodoSubId = await fetchDodoSubscriptionIdFromCheckoutSession(checkoutId);
+    }
+    const canVerifyViaCheckout = Boolean(checkoutId && dodoSubId);
+
+    if (!pending.ok && !canVerifyViaCheckout) {
+      console.warn('activate-plan blocked (no verified pending checkout and no verifiable checkout session)', {
         userId: req.user.id,
         planType,
         billingInterval,
         reason: pending.reason,
         pendingPlanType: pending.pendingPlanType || null,
         pendingInterval: pending.pendingInterval || null,
+        checkoutId: checkoutId || null,
       });
       return res.status(409).json({
-        error: 'No verified pending checkout for this plan. Please complete checkout again.',
-        code: 'missing_verified_checkout',
+        error: 'Payment is complete, but activation could not be verified yet. Please retry in a minute.',
+        code: 'activation_not_yet_verifiable',
         reason: pending.reason,
       });
     }
 
-    const checkoutId = String(checkoutSessionId || pending.pending?.sessionId || '').trim();
-    let dodoSubId = null;
-    if (checkoutId && DODO_API_KEY) {
-      dodoSubId = await fetchDodoSubscriptionIdFromCheckoutSession(checkoutId);
-    }
     if (!dodoSubId) {
       console.warn('activate-plan: could not resolve dodo_subscription_id from checkout', {
         userId: req.user.id,
         planType,
         checkoutId: checkoutId || null,
       });
+    }
+
+    // If we resolved a provider subscription id, verify it belongs to this user/plan via metadata.
+    if (dodoSubId && DODO_API_KEY) {
+      try {
+        const getResp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(dodoSubId)}`, {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+        });
+        const getJson = await getResp.json().catch(() => ({}));
+        if (!getResp.ok) {
+          console.warn('activate-plan: Dodo GET subscription failed (continuing)', {
+            status: getResp.status,
+            subId: dodoSubId,
+            details: getJson,
+          });
+        } else {
+          const md = getJson?.metadata || {};
+          const mdUserId = String(md?.supabase_user_id || '').trim();
+          const mdPlan = String(md?.app_plan_type || md?.plan_type || '').trim();
+          const mdInterval = normalizeBillingInterval(md?.app_billing_interval || md?.billing_interval || billingInterval);
+          if (mdUserId && mdUserId !== req.user.id) {
+            return res.status(409).json({
+              error: 'checkout_belongs_to_different_account',
+              code: 'checkout_belongs_to_different_account',
+              message: 'This payment appears to belong to a different account. Please contact support.',
+            });
+          }
+          if (mdPlan && mdPlan !== planType) {
+            return res.status(409).json({
+              error: 'checkout_plan_mismatch',
+              code: 'checkout_plan_mismatch',
+              message: 'This payment does not match the selected plan. Please contact support.',
+            });
+          }
+          if (mdInterval && mdInterval !== billingInterval) {
+            return res.status(409).json({
+              error: 'checkout_interval_mismatch',
+              code: 'checkout_interval_mismatch',
+              message: 'This payment does not match the selected billing interval. Please contact support.',
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('activate-plan: Dodo GET subscription metadata check error (continuing)', e?.message || e);
+      }
     }
 
     // Webhook may have activated first: avoid replacing a good row with a duplicate; backfill Dodo id if missing.
@@ -7760,6 +7850,24 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
         pinsLimit: PLAN_PIN_LIMITS[planType],
         note: 'active_missing_dodo_provider_id',
       });
+    }
+
+    // Safety: prevent claiming a provider subscription id that is already linked to another user in our DB.
+    if (dodoSubId) {
+      const { data: existingByDodo } = await supabaseAdmin
+        .from('billing_subscriptions')
+        .select('id, user_id, status, plan_type')
+        .eq('dodo_subscription_id', dodoSubId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existingByDodo && String(existingByDodo.user_id) !== String(req.user.id)) {
+        return res.status(409).json({
+          error: 'subscription_already_linked_to_another_user',
+          code: 'subscription_already_linked_to_another_user',
+          message: 'This subscription is already linked to a different account. Please contact support.',
+        });
+      }
     }
 
     const result = await applyPlanActivationForUser(req.user.id, planType, 'payment_success_fallback', {
@@ -8086,6 +8194,15 @@ app.post('/api/dodo/webhook', async (req, res) => {
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle();
+        if (existing && String(existing.user_id) !== String(userId)) {
+          console.warn('dodo webhook activation blocked: subscription already linked to another user', {
+            eventType,
+            userId,
+            existingUserId: existing.user_id,
+            dodoSubId,
+          });
+          return res.json({ ok: true, ignored: true, reason: 'subscription_already_linked_to_another_user' });
+        }
         if (existing && existing.user_id === userId && existing.status === 'active' && existing.plan_type === planType) {
           await supabaseAdmin
             .from('billing_subscriptions')
