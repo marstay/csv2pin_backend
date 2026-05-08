@@ -4179,10 +4179,11 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
             lastProgressState = stateNorm;
             sameProgressStateCount = 1;
           }
-          if (
-            stuckSameStatePolls > 0 &&
-            sameProgressStateCount >= stuckSameStatePolls
-          ) {
+          // Don't abandon when the provider is simply queued (waiting/pending/queued).
+          // Those states can legitimately remain constant for minutes during high load.
+          const queueStates = new Set(['waiting', 'wait', 'pending', 'queuing', 'queueing', 'queued', 'submitted', 'created']);
+          const canBeAbandoned = !queueStates.has(stateNorm);
+          if (stuckSameStatePolls > 0 && canBeAbandoned && sameProgressStateCount >= stuckSameStatePolls) {
             console.warn(
               `Nano Banana 2 task ${taskId} unchanged in "${stateNorm}" for ${sameProgressStateCount} polls; abandoning and retrying new task` +
                 (logLabel ? ` (style: ${logLabel})` : '')
@@ -4243,6 +4244,22 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
   }
 
   return null;
+}
+
+async function withSoftTimeout(promise, timeoutMs) {
+  const ms = Number(timeoutMs);
+  if (!Number.isFinite(ms) || ms <= 0) return await promise;
+  let t;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        t = setTimeout(() => resolve(null), ms);
+      }),
+    ]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
 }
 
 const STYLE_ON_IMAGE_TEXT_GUIDANCE = {
@@ -6117,11 +6134,19 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       } else if (!useUserComposite) {
         try {
           const nanoOpts = nanoBananaReferenceInputs.length ? { imageInput: nanoBananaReferenceInputs } : {};
-          const nanoUrl = await generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts);
+          const providerSoftTimeoutMs =
+            Math.max(30_000, parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000);
+          const nanoUrl = await withSoftTimeout(
+            generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts),
+            providerSoftTimeoutMs
+          );
           imageUrl = nanoUrl || '';
           if (!imageUrl) {
             console.warn('urltopin nano-banana first attempt returned no image (style:', sp.label, '), retrying once');
-            const retryUrl = await generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts);
+            const retryUrl = await withSoftTimeout(
+              generateImageWithNanoBanana(imagePrompt, sp.label, nanoOpts),
+              providerSoftTimeoutMs
+            );
             imageUrl = retryUrl || '';
           }
 
@@ -6211,6 +6236,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         styleLabel: sp.label,
         imagePrompt,
         imageUrl,
+        ...(imageUrl
+          ? {}
+          : {
+              image_error: 'image_provider_unavailable_or_queued',
+              image_error_message:
+                'Image provider is busy or unavailable. Please keep this tab open and retry later, or switch to Text-based pins / My photos.',
+            }),
         title: pinTitle,
         description: descriptionForPin,
         altText,
@@ -6342,6 +6374,31 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     });
 
     const pins = await Promise.all(pinPromises);
+
+    // If some pins fail to produce an image (provider queue / timeout), refund quota so users
+    // are not charged for pins they can't see/use.
+    if (!metadataOnly) {
+      const failedAi = pins.filter((p) => p?.imageGenerationMode === 'ai' && !String(p?.imageUrl || '').trim()).length;
+      const failedUserPhoto = pins.filter(
+        (p) => p?.imageGenerationMode === 'user_composite' && !String(p?.imageUrl || '').trim()
+      ).length;
+      const failedTextBased = pins.filter(
+        (p) => p?.imageGenerationMode === 'text_based' && !String(p?.imageUrl || '').trim()
+      ).length;
+
+      // Only AI pins affect aiDelta; user composites + text based share the user_photo bucket.
+      // (Text-based pins are counted as user_photo pins in this codebase.)
+      const refundAi = Math.max(0, failedAi);
+      const refundUserPhoto = Math.max(0, failedUserPhoto + failedTextBased);
+      if (refundAi > 0 || refundUserPhoto > 0) {
+        try {
+          await applyPinQuotaDelta(req.user.id, { aiDelta: refundAi ? -refundAi : 0, userPhotoDelta: refundUserPhoto ? -refundUserPhoto : 0 });
+        } catch (e) {
+          console.warn('urltopin: quota refund failed:', e?.message || e);
+        }
+      }
+    }
+
     let finalPins = pins;
     if (isStrategic || isStrategicSingle) {
       const diverse = checkDiversity(pins);
@@ -6779,7 +6836,12 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
 
     let imageUrl = '';
     try {
-      imageUrl = await generateImageWithNanoBanana(imagePromptForNano, nanoStyleId, regenNanoOpts);
+      const providerSoftTimeoutMs =
+        Math.max(30_000, parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000);
+      imageUrl = await withSoftTimeout(
+        generateImageWithNanoBanana(imagePromptForNano, nanoStyleId, regenNanoOpts),
+        providerSoftTimeoutMs
+      );
       if (!imageUrl) {
         try {
           const imgRes = await fetch(`${process.env.SELF_API_URL || 'http://localhost:' + PORT}/api/generate-image`, {
