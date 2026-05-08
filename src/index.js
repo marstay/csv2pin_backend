@@ -3732,6 +3732,63 @@ async function syncUserAnalytics(userId, accessToken) {
 // Start background job processor
 let schedulerInterval;
 let analyticsInterval;
+let refImageCleanupInterval;
+
+async function cleanupOldUrlToPinReferenceImages() {
+  // Deletes only our temporary reference images mirrored into Storage for Nano Banana.
+  if (!supabaseAdmin?.storage) return;
+  const bucket = 'ai-images';
+  const ttlHours = Math.max(1, parseInt(process.env.URLTOPIN_REF_IMAGE_TTL_HOURS || '48', 10) || 48);
+  const cutoffMs = Date.now() - ttlHours * 60 * 60 * 1000;
+  const prefixes = ['amazon-ref-', 'page-ref-'];
+  const batchSize = 80;
+
+  try {
+    let offset = 0;
+    let totalCandidates = 0;
+    let totalDeleted = 0;
+    for (;;) {
+      const { data: items, error } = await supabaseAdmin.storage
+        .from(bucket)
+        .list('', { limit: 1000, offset, sortBy: { column: 'created_at', order: 'asc' } });
+      if (error) {
+        console.warn('ref image cleanup: list error:', error.message || error);
+        return;
+      }
+      if (!items || items.length === 0) break;
+
+      const toDelete = [];
+      for (const it of items) {
+        const name = String(it?.name || '');
+        if (!prefixes.some((p) => name.startsWith(p))) continue;
+        const createdRaw = it?.created_at || it?.updated_at || null;
+        const createdMs = createdRaw ? new Date(createdRaw).getTime() : NaN;
+        if (!Number.isFinite(createdMs) || createdMs > cutoffMs) continue;
+        totalCandidates += 1;
+        toDelete.push(name);
+      }
+
+      for (let i = 0; i < toDelete.length; i += batchSize) {
+        const chunk = toDelete.slice(i, i + batchSize);
+        const { error: delErr } = await supabaseAdmin.storage.from(bucket).remove(chunk);
+        if (delErr) {
+          console.warn('ref image cleanup: remove error:', delErr.message || delErr);
+        } else {
+          totalDeleted += chunk.length;
+        }
+      }
+
+      if (items.length < 1000) break;
+      offset += items.length;
+    }
+
+    if (totalCandidates > 0) {
+      console.log(`🧹 Cleaned up ${totalDeleted}/${totalCandidates} URL→Pin reference images older than ${ttlHours}h`);
+    }
+  } catch (e) {
+    console.warn('ref image cleanup: unexpected error:', e?.message || e);
+  }
+}
 
 function startScheduler() {
   if (schedulerInterval) {
@@ -3761,6 +3818,14 @@ function startAnalyticsSync() {
   console.log('📊 Analytics sync processor started (runs every 12 hours)');
 }
 
+function startRefImageCleanup() {
+  if (refImageCleanupInterval) clearInterval(refImageCleanupInterval);
+  // Run every 6 hours; also run once shortly after startup.
+  refImageCleanupInterval = setInterval(cleanupOldUrlToPinReferenceImages, 6 * 60 * 60 * 1000);
+  setTimeout(cleanupOldUrlToPinReferenceImages, 60 * 1000);
+  console.log('🧹 URL→Pin reference image cleanup started (runs every 6 hours)');
+}
+
 function stopScheduler() {
   if (schedulerInterval) {
     clearInterval(schedulerInterval);
@@ -3771,6 +3836,11 @@ function stopScheduler() {
     clearInterval(analyticsInterval);
     analyticsInterval = null;
     console.log('📊 Analytics sync processor stopped');
+  }
+  if (refImageCleanupInterval) {
+    clearInterval(refImageCleanupInterval);
+    refImageCleanupInterval = null;
+    console.log('🧹 URL→Pin reference image cleanup stopped');
   }
 }
 
@@ -10473,4 +10543,5 @@ app.listen(PORT, () => {
   // Start the scheduled pin processor
   startScheduler();
   startAnalyticsSync();
+  startRefImageCleanup();
 }); 
