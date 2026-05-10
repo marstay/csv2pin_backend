@@ -402,6 +402,97 @@ async function applyPlanActivationForUser(
   return { ok: true, planType, pinsLimit };
 }
 
+/** For payment.* webhooks, `data.object.id` is often the payment id — never use it as subscription id. */
+function extractDodoSubscriptionIdForWebhook(eventType, dataObj) {
+  const t = String(eventType || '').toLowerCase();
+  if (t.includes('payment.')) {
+    const s = dataObj?.subscription_id ?? dataObj?.subscriptionId ?? dataObj?.subscription;
+    if (typeof s === 'string' && s.trim()) return s.trim();
+    if (s && typeof s === 'object' && s.id) return String(s.id).trim();
+    return null;
+  }
+  return (
+    String(dataObj?.subscription_id || dataObj?.id || dataObj?.subscription?.id || '').trim() || null
+  );
+}
+
+async function lookupUserIdByDodoSubscriptionId(dodoSubId) {
+  const id = String(dodoSubId || '').trim();
+  if (!id) return '';
+  try {
+    const { data: row } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('user_id')
+      .eq('dodo_subscription_id', id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return row?.user_id ? String(row.user_id) : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Renewal / payment failure: Dodo marks subscription on hold or failed charge.
+ * Mark our row past_due and revoke paid access (profile free) if no other active sub.
+ */
+/**
+ * Only grant paid access when Dodo confirms a successful charge or an active subscription.
+ * Do NOT use checkout.* or subscription.created — they can fire before payment succeeds (card declined / abandoned checkout).
+ */
+function dodoWebhookEventConfirmsPaidSubscription(eventType, dataObj) {
+  const t = String(eventType || '').toLowerCase();
+  if (t.includes('payment.succeeded')) {
+    const ps = String(dataObj?.status || '').toLowerCase();
+    if (!ps) return true;
+    return ps === 'succeeded' || ps === 'completed';
+  }
+  if (t.includes('subscription.renewed')) return true;
+  if (t.includes('subscription.active') || t.includes('subscription.activated')) {
+    const st = String(dataObj?.status || '').toLowerCase();
+    if (!st) return true;
+    return st === 'active' || st === 'trialing';
+  }
+  return false;
+}
+
+async function markBillingSubscriptionPastDueAndDowngradeProfile(userId, dodoSubId, logReason) {
+  const uid = String(userId || '').trim();
+  if (!uid) return { ok: false, error: 'missing_user_id' };
+  const now = new Date().toISOString();
+  const subId = String(dodoSubId || '').trim();
+
+  let q = supabaseAdmin
+    .from('billing_subscriptions')
+    .update({ status: 'past_due', updated_at: now })
+    .eq('user_id', uid)
+    .eq('status', 'active');
+  if (subId) {
+    q = q.eq('dodo_subscription_id', subId);
+  }
+  const { error: updErr } = await q;
+  if (updErr) {
+    console.warn('markBillingSubscriptionPastDue: update error', { updErr, uid, subId, logReason });
+  } else {
+    console.warn('billing: subscription marked past_due', { userId: uid, dodoSubId: subId || null, logReason });
+  }
+
+  const { data: stillActive } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .select('id')
+    .eq('user_id', uid)
+    .eq('status', 'active')
+    .limit(1);
+  if (!stillActive || stillActive.length === 0) {
+    await supabaseAdmin
+      .from('profiles')
+      .update({ plan_type: 'free', is_pro: false, updated_at: now })
+      .eq('id', uid);
+  }
+  return { ok: true };
+}
+
 async function resolvePlanTypeForUser(userId) {
   const sub = await getActiveSubscriptionForUser(userId);
   if (sub?.plan_type) return sub.plan_type;
@@ -8124,8 +8215,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
     const userId = String(metadata?.supabase_user_id || '').trim();
     const planType = String(metadata?.app_plan_type || metadata?.plan_type || '').trim();
     const billingInterval = normalizeBillingInterval(metadata?.app_billing_interval || metadata?.billing_interval || 'month');
-    const dodoSubId =
-      String(dataObj?.subscription_id || dataObj?.id || dataObj?.subscription?.id || '').trim() || null;
+    const dodoSubId = extractDodoSubscriptionIdForWebhook(eventType, dataObj);
     const periodStartRaw =
       dataObj?.current_period_start ||
       dataObj?.current_period_started_at ||
@@ -8141,16 +8231,9 @@ app.post('/api/dodo/webhook', async (req, res) => {
       null;
 
     if (!eventType) return res.status(400).json({ error: 'Missing event type' });
-    if (!userId) {
-      console.warn('dodo webhook ignored: missing supabase_user_id metadata', { eventType });
-      return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
-    }
-
+    // See Dodo subscription guide: rely on payment.succeeded + subscription.active / renewed — not checkout.* or subscription.created.
     const activateSignals = [
-      'checkout.completed',
-      'checkout.succeeded',
       'payment.succeeded',
-      'subscription.created',
       'subscription.activated',
       'subscription.active',
       'subscription.renewed',
@@ -8177,6 +8260,17 @@ app.post('/api/dodo/webhook', async (req, res) => {
     })();
 
     if (activateSignals.some((sig) => eventType.includes(sig))) {
+      if (!dodoWebhookEventConfirmsPaidSubscription(eventType, dataObj)) {
+        console.warn('dodo webhook activation skipped: event does not confirm paid/active subscription', {
+          eventType,
+          status: dataObj?.status || null,
+        });
+        return res.json({ ok: true, ignored: true, reason: 'not_paid_or_not_active', eventType });
+      }
+      if (!userId) {
+        console.warn('dodo webhook activation ignored: missing supabase_user_id metadata', { eventType });
+        return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
+      }
       if (!planType || !PLAN_PIN_LIMITS[planType]) {
         console.warn('dodo webhook activation ignored: missing/invalid plan metadata', {
           eventType,
@@ -8216,6 +8310,33 @@ app.post('/api/dodo/webhook', async (req, res) => {
             .eq('user_id', userId);
           return res.json({ ok: true, action: 'noop_already_active', userId, planType });
         }
+        // Failed renewal (past_due) then successful charge — reactivate same row, do not insert duplicate.
+        if (existing && existing.user_id === userId && existing.status === 'past_due' && dodoSubId) {
+          const nowIso = new Date().toISOString();
+          await supabaseAdmin
+            .from('billing_subscriptions')
+            .update({
+              status: 'active',
+              plan_type: planType,
+              pins_limit_per_month: PLAN_PIN_LIMITS[planType],
+              billing_interval: billingInterval,
+              ...(periodStartRaw ? { current_period_start: periodStartRaw } : {}),
+              ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
+              updated_at: nowIso,
+            })
+            .eq('id', existing.id)
+            .eq('user_id', userId);
+          await supabaseAdmin.from('profiles').upsert(
+            {
+              id: userId,
+              plan_type: planType,
+              is_pro: planType !== 'free',
+              updated_at: nowIso,
+            },
+            { onConflict: 'id' }
+          );
+          return res.json({ ok: true, action: 'reactivated_from_past_due', userId, planType });
+        }
       }
 
       const activated = await applyPlanActivationForUser(userId, planType, `dodo_webhook:${eventType}`, {
@@ -8231,42 +8352,92 @@ app.post('/api/dodo/webhook', async (req, res) => {
       return res.json({ ok: true, action: 'activated', userId, planType });
     }
 
-    // Some providers send "subscription.updated" when a customer schedules cancellation at period end.
-    // In this case, keep the plan active until current_period_end, but mark cancel_at_period_end for UI.
-    if (
-      cancelAtPeriodEndSignals.some((sig) => eventType.includes(sig)) &&
-      (dataObj?.cancel_at_next_billing_date === true || dataObj?.cancel_at_period_end === true)
-    ) {
-      await updateTarget
-        .update({
-          cancel_at_period_end: true,
-          cancelled_at: new Date().toISOString(),
-          ...(dodoSubId ? { dodo_subscription_id: dodoSubId } : {}),
-          ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('status', 'active');
-      return res.json({ ok: true, action: 'cancel_scheduled', userId });
+    // Declined card / insufficient funds on a subscription charge — Dodo: payment.failed, subscription.on_hold, etc.
+    if (eventType.includes('payment.failed')) {
+      const subId = dodoSubId;
+      if (!subId) {
+        return res.json({ ok: true, ignored: true, reason: 'payment_failed_no_subscription' });
+      }
+      let uid = userId;
+      if (!uid) {
+        uid = await lookupUserIdByDodoSubscriptionId(subId);
+      }
+      if (!uid) {
+        return res.json({ ok: true, ignored: true, reason: 'payment_failed_unknown_subscription' });
+      }
+      await markBillingSubscriptionPastDueAndDowngradeProfile(uid, subId, `dodo_webhook:${eventType}`);
+      return res.json({ ok: true, action: 'marked_past_due_payment_failed', userId: uid });
+    }
+
+    if (eventType.includes('subscription.on_hold') || eventType.includes('subscription.failed')) {
+      let uid = userId;
+      if (!uid && dodoSubId) {
+        uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
+      }
+      if (!uid || !dodoSubId) {
+        return res.json({ ok: true, ignored: true, reason: 'subscription_hold_unknown' });
+      }
+      await markBillingSubscriptionPastDueAndDowngradeProfile(uid, dodoSubId, `dodo_webhook:${eventType}`);
+      return res.json({ ok: true, action: 'marked_past_due_subscription', userId: uid });
+    }
+
+    // Some providers send "subscription.updated" when a customer schedules cancellation at period end,
+    // or when status becomes on_hold / failed after a failed renewal.
+    if (cancelAtPeriodEndSignals.some((sig) => eventType.includes(sig))) {
+      const st = String(dataObj?.status || '').toLowerCase();
+      if (st === 'on_hold' || st === 'failed' || st === 'past_due') {
+        let uid = userId;
+        if (!uid && dodoSubId) {
+          uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
+        }
+        if (uid && dodoSubId) {
+          await markBillingSubscriptionPastDueAndDowngradeProfile(uid, dodoSubId, `subscription.updated:status=${st}`);
+          return res.json({ ok: true, action: 'marked_past_due_status', userId: uid });
+        }
+      }
+      if (dataObj?.cancel_at_next_billing_date === true || dataObj?.cancel_at_period_end === true) {
+        if (!userId) {
+          console.warn('dodo webhook cancel_scheduled ignored: missing supabase_user_id metadata', { eventType });
+          return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
+        }
+        await updateTarget
+          .update({
+            cancel_at_period_end: true,
+            cancelled_at: new Date().toISOString(),
+            ...(dodoSubId ? { dodo_subscription_id: dodoSubId } : {}),
+            ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('status', 'active');
+        return res.json({ ok: true, action: 'cancel_scheduled', userId });
+      }
     }
 
     if (cancelSignals.some((sig) => eventType.includes(sig))) {
       await updateTarget
         .update({ status: 'cancelled', updated_at: new Date().toISOString() })
         .eq('status', 'active');
+      let uidForProfile = userId;
+      if (!uidForProfile && dodoSubId) {
+        uidForProfile = await lookupUserIdByDodoSubscriptionId(dodoSubId);
+      }
+      if (!uidForProfile) {
+        return res.json({ ok: true, ignored: true, reason: 'cancel_missing_user' });
+      }
       // Only downgrade profile if the user truly has no other active subscriptions left.
       const { data: stillActive } = await supabaseAdmin
         .from('billing_subscriptions')
         .select('id')
-        .eq('user_id', userId)
+        .eq('user_id', uidForProfile)
         .eq('status', 'active')
         .limit(1);
       if (!stillActive || stillActive.length === 0) {
         await supabaseAdmin
           .from('profiles')
           .update({ plan_type: 'free', is_pro: false, updated_at: new Date().toISOString() })
-          .eq('id', userId);
+          .eq('id', uidForProfile);
       }
-      return res.json({ ok: true, action: 'cancelled', userId });
+      return res.json({ ok: true, action: 'cancelled', userId: uidForProfile });
     }
 
     return res.json({ ok: true, ignored: true, reason: 'unhandled_event', eventType });
