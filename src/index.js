@@ -20,6 +20,7 @@ import {
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
+import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
 dotenv.config();
 
 console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
@@ -27,6 +28,25 @@ console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+async function getTrendsPinterestAccessToken() {
+  const envTok = String(process.env.PINTEREST_TRENDS_ACCESS_TOKEN || '').trim();
+  if (envTok) return envTok;
+  const { data: accounts, error } = await supabaseAdmin
+    .from('pinterest_accounts')
+    .select('id, access_token, refresh_token, token_expires_at, updated_at')
+    .not('access_token', 'is', null)
+    .order('updated_at', { ascending: false })
+    .limit(10);
+  if (error || !accounts?.length) return null;
+  for (const account of accounts) {
+    const { accessToken } = await ensureValidPinterestAccessToken(account);
+    if (accessToken) return accessToken;
+  }
+  return null;
+}
+
+initTrendsEngine(openai, { getPinterestAccessToken: getTrendsPinterestAccessToken });
 
 // Dodo Payments config
 const DODO_BASE_URL = (process.env.DODO_BASE_URL || 'https://test.dodopayments.com').replace(/\/$/, '');
@@ -9969,6 +9989,55 @@ app.get('/api/pinterest/boards', async (req, res) => {
 });
 
 
+app.get('/api/trends', async (req, res) => {
+  try {
+    const catalog = await getTrendsCatalog();
+    const category = String(req.query.category || '').trim();
+    const trends = Array.isArray(catalog?.trends) ? catalog.trends : [];
+    const filtered = category ? trends.filter((t) => t.category === category) : trends;
+    res.json({
+      generatedAt: catalog?.generatedAt || null,
+      season: catalog?.season || null,
+      source: catalog?.source || 'automated',
+      dataProviders: catalog?.dataProviders || [],
+      stale: Boolean(catalog?.stale),
+      trends: filtered,
+    });
+  } catch (e) {
+    console.error('GET /api/trends failed:', e?.message || e);
+    res.status(503).json({ error: 'trends_unavailable' });
+  }
+});
+
+app.get('/api/trends/:slug', async (req, res) => {
+  try {
+    const trend = await getTrendBySlug(req.params.slug);
+    if (!trend) return res.status(404).json({ error: 'trend_not_found' });
+    res.json({ trend });
+  } catch (e) {
+    console.error('GET /api/trends/:slug failed:', e?.message || e);
+    res.status(503).json({ error: 'trends_unavailable' });
+  }
+});
+
+app.post('/api/trends/refresh', async (req, res) => {
+  const adminKey = String(process.env.TRENDS_ADMIN_KEY || '').trim();
+  if (!adminKey) return res.status(404).json({ error: 'not_found' });
+  const provided = String(req.headers['x-trends-admin-key'] || '').trim();
+  if (!provided || provided !== adminKey) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const catalog = await getTrendsCatalog({ force: true });
+    res.json({
+      ok: true,
+      generatedAt: catalog?.generatedAt || null,
+      count: Array.isArray(catalog?.trends) ? catalog.trends.length : 0,
+    });
+  } catch (e) {
+    console.error('POST /api/trends/refresh failed:', e?.message || e);
+    res.status(503).json({ error: 'trends_refresh_failed' });
+  }
+});
+
 // Test endpoint
 app.get('/api/test', (req, res) => {
   res.json({ message: 'Backend is working' });
@@ -10837,4 +10906,5 @@ app.listen(PORT, () => {
   startScheduler();
   startAnalyticsSync();
   startRefImageCleanup();
+  startTrendsScheduler();
 }); 
