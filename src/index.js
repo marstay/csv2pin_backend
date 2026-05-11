@@ -957,6 +957,9 @@ const URL_SHORTENER_HOSTNAMES = new Set([
   'a.co',
   'amzn.to',
   'amzn.eu',
+  // Amazon affiliate / Genius-style short links (must expand so ASIN + Amazon flows run)
+  'amzlink.to',
+  'amznlink.to',
   'netlify.app',
   'netlify.com',
   'etsy.me',
@@ -1275,6 +1278,8 @@ function isAmazonRelatedHost(host) {
   // Amazon short domains + regional amzn TLDs (amzn.asia, amzn.in, etc.)
   if (h === 'a.co' || h.startsWith('amzn.')) return true;
   if (h === 'amzn.to' || h.endsWith('.amzn.to')) return true;
+  if (h === 'amzlink.to' || h.endsWith('.amzlink.to')) return true;
+  if (h === 'amznlink.to' || h.endsWith('.amznlink.to')) return true;
   if (h.startsWith('amazon.')) return true;
   if (h.endsWith('.amazon.com')) return true;
   return false;
