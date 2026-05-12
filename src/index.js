@@ -8209,7 +8209,10 @@ app.post('/api/account/change-plan', requireUser, async (req, res) => {
         details: changeJson,
       });
       if (status === 409) {
-        return res.status(409).json({ error: 'A plan change is already pending for this subscription.' });
+        return res.status(409).json({
+          error:
+            'A plan change or cancellation is already pending on your subscription, so we cannot apply another upgrade right now. This often happens if cancel-at-period-end was scheduled earlier. Please contact us through the Contact page on URL2Pin and we will help you finish the upgrade.',
+        });
       }
       return res.status(502).json({ error: 'Failed to change plan with billing provider.', details: changeJson });
     }
