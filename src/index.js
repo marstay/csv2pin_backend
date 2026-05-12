@@ -672,7 +672,7 @@ async function getLatestPayingSubscriptionRow(userId) {
   return data || null;
 }
 
-async function resolveBillingUpgradeAction(userId, targetPlanType, targetInterval) {
+async function resolveBillingUpgradeAction(userId, targetPlanType, targetInterval, recurseDepth = 0) {
   const targetPlan = String(targetPlanType || '').trim();
   const targetInt = normalizeBillingInterval(targetInterval);
   if (!targetPlan || !PLAN_PIN_LIMITS[targetPlan]) {
@@ -685,13 +685,19 @@ async function resolveBillingUpgradeAction(userId, targetPlanType, targetInterva
   }
 
   if (localSub.status === 'past_due') {
-    return {
-      action: 'contact_support',
-      code: 'past_due',
-      message:
-        'Your subscription has a past-due payment. Please contact us through the Contact page on URL2Pin so we can help you restore billing before changing plans.',
-      subscription: localSub,
-    };
+    const dodoSubId = String(localSub.dodo_subscription_id || '').trim();
+    if (dodoSubId) {
+      const dodoGet = await fetchDodoSubscriptionJson(dodoSubId);
+      const dodoStatus = String(dodoGet.json?.status || dodoGet.json?.subscription_status || '').trim();
+      if (dodoGet.ok && dodoSubscriptionStatusAllowsPlanChange(dodoStatus)) {
+        await reactivatePastDueSubscriptionRow(userId, localSub);
+        if (recurseDepth < 1) {
+          return resolveBillingUpgradeAction(userId, targetPlan, targetInt, recurseDepth + 1);
+        }
+      }
+    }
+    await closePastDueSubscriptionRow(userId, localSub);
+    return { action: 'checkout', reason: 'past_due_restarted' };
   }
 
   const dodoSubId = String(localSub.dodo_subscription_id || '').trim();
@@ -748,6 +754,206 @@ function formatBillingClientMessage(payload) {
   if (typeof payload.message === 'string' && payload.message.trim()) return payload.message.trim();
   if (typeof payload.error === 'string' && payload.error.trim()) return payload.error.trim();
   return 'Something went wrong. Please try again or contact support.';
+}
+
+const persistentPendingCheckouts = new Map();
+const PENDING_CHECKOUT_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
+async function findDuplicateActiveSubscriptionOnOtherAccount(currentUserId, email) {
+  const authedEmail = normalizeEmail(email);
+  const uid = String(currentUserId || '').trim();
+  if (!authedEmail || !uid) return null;
+  try {
+    const { data: otherProfiles } = await supabaseAdmin
+      .from('profiles')
+      .select('id, email')
+      .ilike('email', authedEmail)
+      .neq('id', uid)
+      .limit(10);
+    const otherUserIds = (otherProfiles || []).map((p) => String(p?.id || '').trim()).filter(Boolean);
+    if (otherUserIds.length === 0) return null;
+    const { data: otherActiveSubs } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, user_id, plan_type, status, dodo_subscription_id, billing_interval')
+      .in('user_id', otherUserIds)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(2);
+    if (!otherActiveSubs || otherActiveSubs.length !== 1) return null;
+    return {
+      otherUserId: String(otherActiveSubs[0].user_id || '').trim(),
+      subscription: otherActiveSubs[0],
+    };
+  } catch (e) {
+    console.warn('findDuplicateActiveSubscriptionOnOtherAccount error:', e?.message || e);
+    return null;
+  }
+}
+
+async function tryConsolidateDuplicateEmailSubscription(currentUserId, email) {
+  const dup = await findDuplicateActiveSubscriptionOnOtherAccount(currentUserId, email);
+  if (!dup?.subscription?.id || !dup.otherUserId) {
+    return { ok: false, reason: 'no_duplicate' };
+  }
+  const now = new Date().toISOString();
+  const sub = dup.subscription;
+  const { error: moveErr } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .update({ user_id: currentUserId, updated_at: now })
+    .eq('id', sub.id)
+    .eq('user_id', dup.otherUserId);
+  if (moveErr) {
+    console.warn('tryConsolidateDuplicateEmailSubscription move error:', moveErr.message || moveErr);
+    return { ok: false, reason: 'move_failed' };
+  }
+  await supabaseAdmin
+    .from('profiles')
+    .update({ plan_type: 'free', is_pro: false, updated_at: now })
+    .eq('id', dup.otherUserId);
+  await supabaseAdmin
+    .from('profiles')
+    .update({
+      plan_type: sub.plan_type || 'free',
+      is_pro: String(sub.plan_type || 'free') !== 'free',
+      updated_at: now,
+    })
+    .eq('id', currentUserId);
+  return { ok: true, subscription: sub, otherUserId: dup.otherUserId };
+}
+
+async function reactivatePastDueSubscriptionRow(userId, localSub) {
+  const planType = String(localSub?.plan_type || 'free').trim() || 'free';
+  const now = new Date().toISOString();
+  await supabaseAdmin
+    .from('billing_subscriptions')
+    .update({ status: 'active', updated_at: now })
+    .eq('id', localSub.id)
+    .eq('user_id', userId);
+  await supabaseAdmin
+    .from('profiles')
+    .update({ plan_type: planType, is_pro: planType !== 'free', updated_at: now })
+    .eq('id', userId);
+}
+
+async function closePastDueSubscriptionRow(userId, localSub) {
+  if (!localSub?.id) return;
+  await supabaseAdmin
+    .from('billing_subscriptions')
+    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .eq('id', localSub.id)
+    .eq('user_id', userId);
+}
+
+async function isDodoCheckoutSessionUnpaid(checkoutSessionId) {
+  const raw = String(checkoutSessionId || '').trim();
+  if (!raw || !DODO_API_KEY) return false;
+  try {
+    const resp = await fetch(`${DODO_BASE_URL}/checkouts/${encodeURIComponent(raw)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+    });
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok) return false;
+    const paymentId = String(json?.payment_id ?? json?.paymentId ?? '').trim();
+    if (paymentId) return false;
+    const paymentStatus = String(json?.payment_status ?? json?.paymentStatus ?? '').toLowerCase();
+    if (paymentStatus && ['succeeded', 'completed', 'paid'].includes(paymentStatus)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function savePendingCheckoutRecord(userId, planType, billingInterval, sessionId, checkoutUrl) {
+  const uid = String(userId || '').trim();
+  const session = String(sessionId || '').trim();
+  if (!uid || !session) return;
+  const interval = normalizeBillingInterval(billingInterval);
+  const now = new Date().toISOString();
+  const row = {
+    user_id: uid,
+    checkout_session_id: session,
+    checkout_url: checkoutUrl || null,
+    plan_type: String(planType || '').trim(),
+    billing_interval: interval,
+    status: 'open',
+    updated_at: now,
+  };
+  const { error } = await supabaseAdmin
+    .from('billing_pending_checkouts')
+    .upsert(row, { onConflict: 'checkout_session_id' });
+  if (error) {
+    persistentPendingCheckouts.set(`${uid}:${row.plan_type}:${interval}`, {
+      sessionId: session,
+      checkoutUrl: checkoutUrl || null,
+      createdAt: Date.now(),
+    });
+  }
+}
+
+async function markPendingCheckoutCompleted(checkoutSessionId) {
+  const session = String(checkoutSessionId || '').trim();
+  if (!session) return;
+  const now = new Date().toISOString();
+  const { error } = await supabaseAdmin
+    .from('billing_pending_checkouts')
+    .update({ status: 'completed', updated_at: now })
+    .eq('checkout_session_id', session);
+  if (error) {
+    for (const [key, value] of persistentPendingCheckouts.entries()) {
+      if (value?.sessionId === session) persistentPendingCheckouts.delete(key);
+    }
+  }
+}
+
+async function returnActivatePlanSuccess(res, checkoutSessionId, payload) {
+  await markPendingCheckoutCompleted(checkoutSessionId);
+  return res.json(payload);
+}
+
+async function findResumablePendingCheckout(userId, planType, billingInterval) {
+  const uid = String(userId || '').trim();
+  const plan = String(planType || '').trim();
+  const interval = normalizeBillingInterval(billingInterval);
+  if (!uid || !plan) return null;
+  const maxAgeMs = PENDING_CHECKOUT_MAX_AGE_MS;
+  let sessionId = '';
+  let checkoutUrl = '';
+  let createdAt = 0;
+  try {
+    const { data: rows } = await supabaseAdmin
+      .from('billing_pending_checkouts')
+      .select('checkout_session_id, checkout_url, created_at, status')
+      .eq('user_id', uid)
+      .eq('plan_type', plan)
+      .eq('billing_interval', interval)
+      .eq('status', 'open')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const row = rows && rows.length ? rows[0] : null;
+    if (row) {
+      sessionId = String(row.checkout_session_id || '').trim();
+      checkoutUrl = String(row.checkout_url || '').trim();
+      createdAt = row.created_at ? new Date(row.created_at).getTime() : 0;
+    }
+  } catch {
+    /* table may not exist yet */
+  }
+  if (!sessionId) {
+    const mem = persistentPendingCheckouts.get(`${uid}:${plan}:${interval}`);
+    if (mem) {
+      sessionId = String(mem.sessionId || '').trim();
+      checkoutUrl = String(mem.checkoutUrl || '').trim();
+      createdAt = Number(mem.createdAt || 0);
+    }
+  }
+  if (!sessionId || !createdAt || Date.now() - createdAt > maxAgeMs) return null;
+  const unpaid = await isDodoCheckoutSessionUnpaid(sessionId);
+  if (!unpaid) {
+    await markPendingCheckoutCompleted(sessionId);
+    return null;
+  }
+  return { sessionId, checkoutUrl: checkoutUrl || null };
 }
 
 /**
@@ -7957,9 +8163,41 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     }
     const billingInterval = normalizeBillingInterval(rawBillingInterval);
 
+    const authedEmail = normalizeEmail(req.user?.email);
+    if (authedEmail) {
+      const consolidated = await tryConsolidateDuplicateEmailSubscription(req.user.id, authedEmail);
+      if (consolidated.ok) {
+        console.log('create-checkout-session: consolidated duplicate-email subscription', {
+          userId: req.user.id,
+          fromUserId: consolidated.otherUserId,
+        });
+      }
+    }
+
     const ownActive = await getLatestPayingSubscriptionRow(req.user.id);
-    if (ownActive?.status === 'active') {
-      const ownDodoId = String(ownActive.dodo_subscription_id || '').trim();
+    let reactivatedPastDue = false;
+    if (ownActive?.status === 'past_due') {
+      const pastDodoId = String(ownActive.dodo_subscription_id || '').trim();
+      if (pastDodoId) {
+        const dodoGet = await fetchDodoSubscriptionJson(pastDodoId);
+        const dodoStatus = String(dodoGet.json?.status || dodoGet.json?.subscription_status || '').trim();
+        if (dodoGet.ok && dodoSubscriptionStatusAllowsPlanChange(dodoStatus)) {
+          await reactivatePastDueSubscriptionRow(req.user.id, ownActive);
+          reactivatedPastDue = true;
+        }
+      }
+      if (!reactivatedPastDue) {
+        await closePastDueSubscriptionRow(req.user.id, ownActive);
+      }
+    }
+
+    const ownActiveAfterPastDue = reactivatedPastDue
+      ? await getLatestPayingSubscriptionRow(req.user.id)
+      : ownActive?.status === 'past_due'
+        ? null
+        : ownActive;
+    if (ownActiveAfterPastDue?.status === 'active') {
+      const ownDodoId = String(ownActiveAfterPastDue.dodo_subscription_id || '').trim();
       if (ownDodoId) {
         const dodoGet = await fetchDodoSubscriptionJson(ownDodoId);
         const dodoStatus = String(dodoGet.json?.status || dodoGet.json?.subscription_status || '').trim();
@@ -7972,7 +8210,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
           });
         }
         if (dodoGet.ok && dodoSubscriptionIsInactiveStatus(dodoStatus)) {
-          await syncLocalSubscriptionWithDodo(req.user.id, ownActive, dodoGet.json);
+          await syncLocalSubscriptionWithDodo(req.user.id, ownActiveAfterPastDue, dodoGet.json);
         }
       } else {
         return res.status(409).json({
@@ -7984,9 +8222,17 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       }
     }
 
+    const resumable = await findResumablePendingCheckout(req.user.id, planType, billingInterval);
+    if (resumable?.checkoutUrl) {
+      markPendingDodoActivationWithInterval(req.user.id, planType, billingInterval, resumable.sessionId || null);
+      return res.json({
+        checkoutUrl: resumable.checkoutUrl,
+        sessionId: resumable.sessionId,
+        resumed: true,
+      });
+    }
+
     // Safety: prevent duplicate active subscriptions across multiple Supabase accounts for the same email.
-    // Policy: BLOCK (no auto-cancel) and instruct user to contact support.
-    const authedEmail = normalizeEmail(req.user?.email);
     if (authedEmail) {
       try {
         const { data: otherProfiles } = await supabaseAdmin
@@ -8006,12 +8252,15 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
             .limit(1);
 
           if (otherActiveSubs && otherActiveSubs.length > 0) {
-            return res.status(409).json({
-              error: 'duplicate_account_detected',
-              code: 'duplicate_account_detected',
-              message:
-                'We detected another account with an active subscription for this email. To prevent double billing, checkout is blocked. Please contact support and we will merge/fix your account.',
-            });
+            const consolidatedAgain = await tryConsolidateDuplicateEmailSubscription(req.user.id, authedEmail);
+            if (!consolidatedAgain.ok) {
+              return res.status(409).json({
+                error: 'duplicate_account_detected',
+                code: 'duplicate_account_detected',
+                message:
+                  'We found another account with an active subscription for this email. Sign in to that account, or contact us through the Contact page on URL2Pin and we will merge your accounts.',
+              });
+            }
           }
         }
       } catch (e) {
@@ -8115,6 +8364,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
     const sessionId = json.session_id || json.id || null;
 
     markPendingDodoActivationWithInterval(req.user.id, planType, billingInterval, sessionId || null);
+    await savePendingCheckoutRecord(req.user.id, planType, billingInterval, sessionId, checkoutUrl);
     console.log('🧾 Dodo checkout created', {
       userId: req.user.id,
       planType,
@@ -8260,7 +8510,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
 
     if (activeRow && activeRow.plan_type === planType) {
       if (activeRow.dodo_subscription_id) {
-        return res.json({
+        return returnActivatePlanSuccess(res, checkoutId, {
           ok: true,
           planType,
           pinsLimit: PLAN_PIN_LIMITS[planType],
@@ -8282,7 +8532,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
           planType,
           subscriptionId: dodoSubId,
         });
-        return res.json({
+        return returnActivatePlanSuccess(res, checkoutId, {
           ok: true,
           planType,
           pinsLimit: PLAN_PIN_LIMITS[planType],
@@ -8294,7 +8544,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
         planType,
         checkoutId: checkoutId || null,
       });
-      return res.json({
+      return returnActivatePlanSuccess(res, checkoutId, {
         ok: true,
         planType,
         pinsLimit: PLAN_PIN_LIMITS[planType],
@@ -8335,7 +8585,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
       dodo_subscription_id: dodoSubId || null,
       via: 'payment-success',
     });
-    return res.json({ ok: true, planType: result.planType, pinsLimit: result.pinsLimit });
+    return returnActivatePlanSuccess(res, checkoutId, { ok: true, planType: result.planType, pinsLimit: result.pinsLimit });
   } catch (err) {
     console.error('activate-plan error:', err);
     return res.status(500).json({
@@ -8428,11 +8678,26 @@ app.post('/api/account/billing-action', requireUser, async (req, res) => {
       return res.status(400).json({ error: 'Invalid planType' });
     }
     const targetInterval = normalizeBillingInterval(rawBillingInterval);
+    const authedEmail = normalizeEmail(req.user?.email);
+    let consolidated = null;
+    if (authedEmail) {
+      consolidated = await tryConsolidateDuplicateEmailSubscription(req.user.id, authedEmail);
+      if (consolidated.ok) {
+        console.log('billing-action: consolidated duplicate-email subscription', {
+          userId: req.user.id,
+          fromUserId: consolidated.otherUserId,
+        });
+      }
+    }
     const decision = await resolveBillingUpgradeAction(req.user.id, targetPlanType, targetInterval);
     if (decision.action === 'invalid_plan') {
       return res.status(400).json({ error: decision.error || 'Invalid planType' });
     }
-    return res.json({ ok: true, ...decision });
+    return res.json({
+      ok: true,
+      ...(consolidated?.ok ? { consolidated: true, consolidatedPlanType: consolidated.subscription?.plan_type || null } : {}),
+      ...decision,
+    });
   } catch (err) {
     console.error('account/billing-action error:', err);
     return res.status(500).json({ error: 'Failed to resolve billing action', details: err.message || String(err) });
