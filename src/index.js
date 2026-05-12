@@ -249,7 +249,7 @@ function consumePendingDodoActivation(userId, requestedPlanType, requestedInterv
   const key = String(userId || '');
   const row = pendingDodoActivations.get(key);
   if (!row) return { ok: false, reason: 'missing_pending_checkout' };
-  const maxAgeMs = 2 * 60 * 60 * 1000;
+  const maxAgeMs = 24 * 60 * 60 * 1000;
   if (Date.now() - row.createdAt > maxAgeMs) {
     pendingDodoActivations.delete(key);
     return { ok: false, reason: 'pending_checkout_expired' };
@@ -493,6 +493,261 @@ function formatDodoChangePlanUserError(status, details) {
     return `We could not change your plan with the billing provider (${providerMessage}). Please contact us through the Contact page on URL2Pin if this continues.`;
   }
   return 'We could not change your plan with the billing provider. Please contact us through the Contact page on URL2Pin and we will help you finish the upgrade.';
+}
+
+async function fetchDodoSubscriptionJson(dodoSubId) {
+  const subId = String(dodoSubId || '').trim();
+  if (!subId || !DODO_API_KEY) return { ok: false, status: 0, json: null };
+  try {
+    const resp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(subId)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+    });
+    const json = await resp.json().catch(() => ({}));
+    return { ok: resp.ok, status: resp.status, json };
+  } catch (e) {
+    console.warn('fetchDodoSubscriptionJson error:', e.message || e);
+    return { ok: false, status: 0, json: null };
+  }
+}
+
+function dodoSubscriptionIsInactiveStatus(statusRaw) {
+  const st = String(statusRaw || '').trim().toLowerCase();
+  if (!st) return false;
+  return ['cancelled', 'canceled', 'ended', 'expired', 'inactive', 'on_hold', 'failed', 'past_due'].includes(st);
+}
+
+async function markLocalSubscriptionRowCancelled(rowId, userId, { clearCancelFlags = true } = {}) {
+  if (!rowId || !userId) return;
+  const patch = {
+    status: 'cancelled',
+    updated_at: new Date().toISOString(),
+  };
+  if (clearCancelFlags) {
+    patch.cancel_at_period_end = false;
+    patch.cancelled_at = null;
+  }
+  await supabaseAdmin
+    .from('billing_subscriptions')
+    .update(patch)
+    .eq('id', rowId)
+    .eq('user_id', userId);
+}
+
+async function syncLocalSubscriptionWithDodo(userId, localSub, dodoJson) {
+  if (!localSub?.id || !userId) return localSub;
+  const dodoStatus = String(dodoJson?.status || dodoJson?.subscription_status || '').trim().toLowerCase();
+  if (!dodoSubscriptionIsInactiveStatus(dodoStatus)) return localSub;
+  await markLocalSubscriptionRowCancelled(localSub.id, userId);
+  const { data: stillActive } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(1);
+  if (!stillActive || stillActive.length === 0) {
+    await supabaseAdmin
+      .from('profiles')
+      .update({ plan_type: 'free', is_pro: false, updated_at: new Date().toISOString() })
+      .eq('id', userId);
+  }
+  return null;
+}
+
+async function cancelScheduledDodoPlanChange(dodoSubId) {
+  const subId = String(dodoSubId || '').trim();
+  if (!subId || !DODO_API_KEY) return { ok: false, status: 0 };
+  try {
+    const resp = await fetch(
+      `${DODO_BASE_URL}/subscriptions/${encodeURIComponent(subId)}/change-plan/scheduled`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+      }
+    );
+    return { ok: resp.ok || resp.status === 404, status: resp.status };
+  } catch (e) {
+    console.warn('cancelScheduledDodoPlanChange error:', e.message || e);
+    return { ok: false, status: 0 };
+  }
+}
+
+async function resumeDodoSubscriptionIfScheduledCancel(dodoSubId) {
+  const subId = String(dodoSubId || '').trim();
+  if (!subId || !DODO_API_KEY) return { ok: false, status: 0, json: null };
+  try {
+    const resp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(subId)}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DODO_API_KEY}`,
+      },
+      body: JSON.stringify({ cancel_at_next_billing_date: false }),
+    });
+    const json = await resp.json().catch(() => ({}));
+    return { ok: resp.ok, status: resp.status, json };
+  } catch (e) {
+    console.warn('resumeDodoSubscriptionIfScheduledCancel error:', e.message || e);
+    return { ok: false, status: 0, json: null };
+  }
+}
+
+async function clearLocalCancelAtPeriodEnd(localSubId, userId) {
+  if (!localSubId || !userId) return;
+  await supabaseAdmin
+    .from('billing_subscriptions')
+    .update({
+      cancel_at_period_end: false,
+      cancelled_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', localSubId)
+    .eq('user_id', userId)
+    .eq('status', 'active');
+}
+
+async function ensureDodoSubscriptionReadyForPlanChange(dodoSubId, userId, localSub) {
+  const subId = String(dodoSubId || '').trim();
+  if (!subId || !DODO_API_KEY) {
+    return { ok: false, code: 'missing_dodo_subscription', message: 'No active Dodo subscription found for this account.' };
+  }
+
+  await cancelScheduledDodoPlanChange(subId);
+
+  const dodoGet = await fetchDodoSubscriptionJson(subId);
+  if (!dodoGet.ok) {
+    return {
+      ok: false,
+      code: 'dodo_subscription_lookup_failed',
+      message: 'Failed to load subscription from billing provider.',
+    };
+  }
+
+  let dodoJson = dodoGet.json || {};
+  const cancelScheduled =
+    dodoJson?.cancel_at_next_billing_date === true || dodoJson?.cancel_at_period_end === true;
+  if (cancelScheduled || localSub?.cancel_at_period_end) {
+    const resume = await resumeDodoSubscriptionIfScheduledCancel(subId);
+    if (resume.ok) {
+      await clearLocalCancelAtPeriodEnd(localSub?.id, userId);
+      const refreshed = await fetchDodoSubscriptionJson(subId);
+      if (refreshed.ok) dodoJson = refreshed.json || dodoJson;
+    }
+  }
+
+  const dodoStatus = String(dodoJson?.status || dodoJson?.subscription_status || '').trim();
+  if (!dodoSubscriptionStatusAllowsPlanChange(dodoStatus)) {
+    if (localSub?.id) {
+      await syncLocalSubscriptionWithDodo(userId, localSub, dodoJson);
+    }
+    return {
+      ok: false,
+      code: 'inactive_subscription',
+      message: formatDodoChangePlanUserError(409, {
+        code: 'INACTIVE_SUBSCRIPTION_PLAN_CHANGE_NOT_SUPPORTED',
+        message: dodoStatus ? `Subscription status is ${dodoStatus}` : 'Subscription is inactive',
+      }),
+      provider_status: dodoStatus || null,
+    };
+  }
+
+  return { ok: true, dodoJson };
+}
+
+async function getLatestPayingSubscriptionRow(userId) {
+  const { data, error } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .select(
+      'id, plan_type, status, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, billing_interval'
+    )
+    .eq('user_id', userId)
+    .in('status', ['active', 'past_due'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    console.warn('getLatestPayingSubscriptionRow error:', error.message || error);
+    return null;
+  }
+  return data || null;
+}
+
+async function resolveBillingUpgradeAction(userId, targetPlanType, targetInterval) {
+  const targetPlan = String(targetPlanType || '').trim();
+  const targetInt = normalizeBillingInterval(targetInterval);
+  if (!targetPlan || !PLAN_PIN_LIMITS[targetPlan]) {
+    return { action: 'invalid_plan', error: 'Invalid planType' };
+  }
+
+  const localSub = await getLatestPayingSubscriptionRow(userId);
+  if (!localSub) {
+    return { action: 'checkout', reason: 'no_local_subscription' };
+  }
+
+  if (localSub.status === 'past_due') {
+    return {
+      action: 'contact_support',
+      code: 'past_due',
+      message:
+        'Your subscription has a past-due payment. Please contact us through the Contact page on URL2Pin so we can help you restore billing before changing plans.',
+      subscription: localSub,
+    };
+  }
+
+  const dodoSubId = String(localSub.dodo_subscription_id || '').trim();
+  if (!dodoSubId) {
+    return {
+      action: 'contact_support',
+      code: 'active_without_dodo_id',
+      message:
+        'Your account shows an active plan but is not linked to billing yet. Please contact us through the Contact page on URL2Pin so we can fix this without double billing.',
+      subscription: localSub,
+    };
+  }
+
+  const dodoGet = await fetchDodoSubscriptionJson(dodoSubId);
+  if (!dodoGet.ok) {
+    return {
+      action: 'contact_support',
+      code: 'dodo_subscription_lookup_failed',
+      message: 'We could not verify your billing subscription right now. Please try again in a moment or contact support.',
+      subscription: localSub,
+    };
+  }
+
+  const dodoJson = dodoGet.json || {};
+  const dodoStatus = String(dodoJson?.status || dodoJson?.subscription_status || '').trim();
+  if (!dodoSubscriptionStatusAllowsPlanChange(dodoStatus)) {
+    await syncLocalSubscriptionWithDodo(userId, localSub, dodoJson);
+    return {
+      action: 'checkout',
+      reason: 'dodo_subscription_inactive',
+      provider_status: dodoStatus || null,
+    };
+  }
+
+  const currentProductId = String(dodoJson?.product_id || dodoJson?.productId || '').trim();
+  const currentInterval = inferBillingIntervalFromDodoProductId(currentProductId);
+  const currentPlanType = String(localSub.plan_type || '').trim();
+  const curRank = planRank(currentPlanType);
+  const tgtRank = planRank(targetPlan);
+  if (currentInterval === targetInt && tgtRank === curRank) {
+    return { action: 'noop', message: 'Already on this plan.', subscription: localSub };
+  }
+
+  return {
+    action: 'change_plan',
+    subscription: localSub,
+    current: { planType: currentPlanType, interval: currentInterval, provider_status: dodoStatus || null },
+    target: { planType: targetPlan, interval: targetInt },
+  };
+}
+
+function formatBillingClientMessage(payload) {
+  if (!payload) return 'Something went wrong. Please try again or contact support.';
+  if (typeof payload.message === 'string' && payload.message.trim()) return payload.message.trim();
+  if (typeof payload.error === 'string' && payload.error.trim()) return payload.error.trim();
+  return 'Something went wrong. Please try again or contact support.';
 }
 
 /**
@@ -7680,6 +7935,16 @@ async function fetchDodoSubscriptionIdFromCheckoutSession(checkoutSessionId) {
   }
 }
 
+async function fetchDodoSubscriptionIdFromCheckoutSessionWithRetry(checkoutSessionId, maxWaitMs = 20000) {
+  const started = Date.now();
+  while (Date.now() - started < maxWaitMs) {
+    const id = await fetchDodoSubscriptionIdFromCheckoutSession(checkoutSessionId);
+    if (id) return id;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  return null;
+}
+
 app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
   try {
     if (!DODO_API_KEY) {
@@ -7691,6 +7956,33 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       return res.status(400).json({ error: 'Missing planType' });
     }
     const billingInterval = normalizeBillingInterval(rawBillingInterval);
+
+    const ownActive = await getLatestPayingSubscriptionRow(req.user.id);
+    if (ownActive?.status === 'active') {
+      const ownDodoId = String(ownActive.dodo_subscription_id || '').trim();
+      if (ownDodoId) {
+        const dodoGet = await fetchDodoSubscriptionJson(ownDodoId);
+        const dodoStatus = String(dodoGet.json?.status || dodoGet.json?.subscription_status || '').trim();
+        if (dodoGet.ok && dodoSubscriptionStatusAllowsPlanChange(dodoStatus)) {
+          return res.status(409).json({
+            error: 'active_subscription_requires_change_plan',
+            code: 'active_subscription_requires_change_plan',
+            message:
+              'You already have an active subscription. Use plan change instead of starting a new checkout to avoid double billing.',
+          });
+        }
+        if (dodoGet.ok && dodoSubscriptionIsInactiveStatus(dodoStatus)) {
+          await syncLocalSubscriptionWithDodo(req.user.id, ownActive, dodoGet.json);
+        }
+      } else {
+        return res.status(409).json({
+          error: 'active_subscription_unlinked',
+          code: 'active_subscription_unlinked',
+          message:
+            'Your account already has an active plan on file but it is not linked to billing. Please contact us through the Contact page on URL2Pin before starting a new checkout.',
+        });
+      }
+    }
 
     // Safety: prevent duplicate active subscriptions across multiple Supabase accounts for the same email.
     // Policy: BLOCK (no auto-cancel) and instruct user to contact support.
@@ -7881,7 +8173,7 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
 
     let dodoSubId = null;
     if (checkoutId && DODO_API_KEY) {
-      dodoSubId = await fetchDodoSubscriptionIdFromCheckoutSession(checkoutId);
+      dodoSubId = await fetchDodoSubscriptionIdFromCheckoutSessionWithRetry(checkoutId, 20000);
     }
     const canVerifyViaCheckout = Boolean(checkoutId && dodoSubId);
 
@@ -8128,6 +8420,65 @@ app.post('/api/account/cancel', requireUser, async (req, res) => {
   }
 });
 
+app.post('/api/account/billing-action', requireUser, async (req, res) => {
+  try {
+    const { planType: rawPlanType, billingInterval: rawBillingInterval } = req.body || {};
+    const targetPlanType = String(rawPlanType || '').trim();
+    if (!targetPlanType || !PLAN_PIN_LIMITS[targetPlanType]) {
+      return res.status(400).json({ error: 'Invalid planType' });
+    }
+    const targetInterval = normalizeBillingInterval(rawBillingInterval);
+    const decision = await resolveBillingUpgradeAction(req.user.id, targetPlanType, targetInterval);
+    if (decision.action === 'invalid_plan') {
+      return res.status(400).json({ error: decision.error || 'Invalid planType' });
+    }
+    return res.json({ ok: true, ...decision });
+  } catch (err) {
+    console.error('account/billing-action error:', err);
+    return res.status(500).json({ error: 'Failed to resolve billing action', details: err.message || String(err) });
+  }
+});
+
+app.post('/api/account/resume-subscription', requireUser, async (req, res) => {
+  try {
+    const { data: activeSub, error } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, plan_type, status, dodo_subscription_id, cancel_at_period_end')
+      .eq('user_id', req.user.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: 'Failed to load active subscription' });
+    }
+    if (!activeSub) {
+      return res.status(400).json({ error: 'No active subscription to resume.' });
+    }
+    const dodoSubId = String(activeSub.dodo_subscription_id || '').trim();
+    if (!dodoSubId || !DODO_API_KEY) {
+      return res.status(400).json({ error: 'No linked billing subscription found for this account.' });
+    }
+
+    await cancelScheduledDodoPlanChange(dodoSubId);
+    const resume = await resumeDodoSubscriptionIfScheduledCancel(dodoSubId);
+    if (!resume.ok) {
+      return res.status(502).json({
+        error: 'Could not resume subscription with the billing provider. Please contact support.',
+        details: resume.json || null,
+      });
+    }
+    await clearLocalCancelAtPeriodEnd(activeSub.id, req.user.id);
+    return res.json({
+      ok: true,
+      message: 'Your subscription cancellation has been removed. You can change plans again from Pricing.',
+    });
+  } catch (err) {
+    console.error('account/resume-subscription error:', err);
+    return res.status(500).json({ error: 'Failed to resume subscription', details: err.message || String(err) });
+  }
+});
+
 // Change subscription plan in-place (Dodo Change Plan API). Used for upgrades/downgrades on existing subscriptions.
 app.post('/api/account/change-plan', requireUser, async (req, res) => {
   try {
@@ -8141,7 +8492,7 @@ app.post('/api/account/change-plan', requireUser, async (req, res) => {
 
     const { data: activeSub, error: fetchErr } = await supabaseAdmin
       .from('billing_subscriptions')
-      .select('id, plan_type, status, current_period_end, dodo_subscription_id')
+      .select('id, plan_type, status, current_period_end, cancel_at_period_end, dodo_subscription_id')
       .eq('user_id', req.user.id)
       .eq('status', 'active')
       .order('created_at', { ascending: false })
@@ -8160,35 +8511,19 @@ app.post('/api/account/change-plan', requireUser, async (req, res) => {
 
     // Retrieve current subscription details from Dodo so we can infer current interval from product_id.
     const dodoSubId = String(activeSub.dodo_subscription_id).trim();
-    const getResp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(dodoSubId)}`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${DODO_API_KEY}` },
-    });
-    const getJson = await getResp.json().catch(() => ({}));
-    if (!getResp.ok) {
-      console.warn('account/change-plan: Dodo GET subscription failed', {
-        status: getResp.status,
-        subId: dodoSubId,
-        details: getJson,
+    const ready = await ensureDodoSubscriptionReadyForPlanChange(dodoSubId, req.user.id, activeSub);
+    if (!ready.ok) {
+      const clientStatus = ready.code === 'inactive_subscription' ? 409 : ready.code === 'missing_dodo_subscription' ? 400 : 502;
+      return res.status(clientStatus).json({
+        error: ready.message,
+        code: ready.code || null,
+        provider_status: ready.provider_status || null,
       });
-      return res.status(502).json({ error: 'Failed to load subscription from billing provider.' });
     }
+    const getJson = ready.dodoJson || {};
     const currentProductId = String(getJson?.product_id || getJson?.productId || '').trim();
     const currentInterval = inferBillingIntervalFromDodoProductId(currentProductId);
     const currentPlanType = String(activeSub.plan_type || '').trim();
-    const dodoSubscriptionStatus = String(getJson?.status || getJson?.subscription_status || '').trim();
-    if (!dodoSubscriptionStatusAllowsPlanChange(dodoSubscriptionStatus)) {
-      return res.status(409).json({
-        error: formatDodoChangePlanUserError(409, {
-          code: 'INACTIVE_SUBSCRIPTION_PLAN_CHANGE_NOT_SUPPORTED',
-          message: dodoSubscriptionStatus
-            ? `Subscription status is ${dodoSubscriptionStatus}`
-            : 'Subscription is inactive',
-        }),
-        code: 'inactive_subscription',
-        provider_status: dodoSubscriptionStatus || null,
-      });
-    }
 
     // Determine upgrade/downgrade and apply your policy.
     const curRank = planRank(currentPlanType);
@@ -8466,6 +8801,27 @@ app.post('/api/dodo/webhook', async (req, res) => {
         if (uid && dodoSubId) {
           await markBillingSubscriptionPastDueAndDowngradeProfile(uid, dodoSubId, `subscription.updated:status=${st}`);
           return res.json({ ok: true, action: 'marked_past_due_status', userId: uid });
+        }
+      }
+      if (dataObj?.cancel_at_next_billing_date === false || dataObj?.cancel_at_period_end === false) {
+        let uid = userId;
+        if (!uid && dodoSubId) {
+          uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
+        }
+        if (uid) {
+          const { error: clearErr } = await updateBillingSubscriptionsByTarget(
+            { cancel_at_period_end: false, cancelled_at: null },
+            { dodoSubId, userId: uid, activeOnly: true }
+          );
+          if (clearErr) {
+            console.warn('dodo webhook cancel_cleared update error', {
+              eventType,
+              userId: uid,
+              dodoSubId,
+              error: clearErr.message || clearErr,
+            });
+          }
+          return res.json({ ok: true, action: 'cancel_cleared', userId: uid });
         }
       }
       if (dataObj?.cancel_at_next_billing_date === true || dataObj?.cancel_at_period_end === true) {
