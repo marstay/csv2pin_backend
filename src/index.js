@@ -453,6 +453,48 @@ async function lookupUserIdByDodoSubscriptionId(dodoSubId) {
   }
 }
 
+async function updateBillingSubscriptionsByTarget(patch, { dodoSubId, userId, activeOnly = true } = {}) {
+  const subId = String(dodoSubId || '').trim();
+  const uid = String(userId || '').trim();
+  if (!subId && !uid) {
+    return { data: null, error: new Error('missing_subscription_target') };
+  }
+  let q = supabaseAdmin.from('billing_subscriptions').update({
+    ...patch,
+    updated_at: patch?.updated_at || new Date().toISOString(),
+  });
+  if (subId) {
+    q = q.eq('dodo_subscription_id', subId);
+  } else {
+    q = q.eq('user_id', uid);
+  }
+  if (activeOnly) {
+    q = q.eq('status', 'active');
+  }
+  return q;
+}
+
+function dodoSubscriptionStatusAllowsPlanChange(statusRaw) {
+  const st = String(statusRaw || '').trim().toLowerCase();
+  if (!st) return true;
+  return st === 'active' || st === 'trialing';
+}
+
+function formatDodoChangePlanUserError(status, details) {
+  const code = String(details?.code || details?.error?.code || '').trim();
+  const providerMessage = String(details?.message || details?.error?.message || '').trim();
+  if (code === 'INACTIVE_SUBSCRIPTION_PLAN_CHANGE_NOT_SUPPORTED') {
+    return 'Your subscription is inactive with the billing provider, so we cannot upgrade it in place. Please contact us through the Contact page on URL2Pin and we will help you restore billing or start a new subscription.';
+  }
+  if (status === 409) {
+    return 'A plan change or cancellation is already pending on your subscription, so we cannot apply another upgrade right now. This often happens if cancel-at-period-end was scheduled earlier. Please contact us through the Contact page on URL2Pin and we will help you finish the upgrade.';
+  }
+  if (providerMessage) {
+    return `We could not change your plan with the billing provider (${providerMessage}). Please contact us through the Contact page on URL2Pin if this continues.`;
+  }
+  return 'We could not change your plan with the billing provider. Please contact us through the Contact page on URL2Pin and we will help you finish the upgrade.';
+}
+
 /**
  * Renewal / payment failure: Dodo marks subscription on hold or failed charge.
  * Mark our row past_due and revoke paid access (profile free) if no other active sub.
@@ -8134,6 +8176,19 @@ app.post('/api/account/change-plan', requireUser, async (req, res) => {
     const currentProductId = String(getJson?.product_id || getJson?.productId || '').trim();
     const currentInterval = inferBillingIntervalFromDodoProductId(currentProductId);
     const currentPlanType = String(activeSub.plan_type || '').trim();
+    const dodoSubscriptionStatus = String(getJson?.status || getJson?.subscription_status || '').trim();
+    if (!dodoSubscriptionStatusAllowsPlanChange(dodoSubscriptionStatus)) {
+      return res.status(409).json({
+        error: formatDodoChangePlanUserError(409, {
+          code: 'INACTIVE_SUBSCRIPTION_PLAN_CHANGE_NOT_SUPPORTED',
+          message: dodoSubscriptionStatus
+            ? `Subscription status is ${dodoSubscriptionStatus}`
+            : 'Subscription is inactive',
+        }),
+        code: 'inactive_subscription',
+        provider_status: dodoSubscriptionStatus || null,
+      });
+    }
 
     // Determine upgrade/downgrade and apply your policy.
     const curRank = planRank(currentPlanType);
@@ -8208,13 +8263,13 @@ app.post('/api/account/change-plan', requireUser, async (req, res) => {
         body: changeBody,
         details: changeJson,
       });
-      if (status === 409) {
-        return res.status(409).json({
-          error:
-            'A plan change or cancellation is already pending on your subscription, so we cannot apply another upgrade right now. This often happens if cancel-at-period-end was scheduled earlier. Please contact us through the Contact page on URL2Pin and we will help you finish the upgrade.',
-        });
-      }
-      return res.status(502).json({ error: 'Failed to change plan with billing provider.', details: changeJson });
+      const userError = formatDodoChangePlanUserError(status, changeJson);
+      const clientStatus = status === 409 || changeJson?.code === 'INACTIVE_SUBSCRIPTION_PLAN_CHANGE_NOT_SUPPORTED' ? 409 : 502;
+      return res.status(clientStatus).json({
+        error: userError,
+        code: changeJson?.code || null,
+        details: changeJson,
+      });
     }
 
     return res.json({
@@ -8276,16 +8331,6 @@ app.post('/api/dodo/webhook', async (req, res) => {
       'subscription.updated',
       'subscription.update',
     ];
-
-    const updateTarget = (() => {
-      // Safety: Always target by specific Dodo subscription id when we have it.
-      // Fallback to user_id only when Dodo didn't include an id (older/odd events).
-      const q = supabaseAdmin.from('billing_subscriptions');
-      if (dodoSubId) {
-        return q.eq('dodo_subscription_id', dodoSubId);
-      }
-      return q.eq('user_id', userId);
-    })();
 
     if (activateSignals.some((sig) => eventType.includes(sig))) {
       if (!dodoWebhookEventConfirmsPaidSubscription(eventType, dataObj)) {
@@ -8428,23 +8473,42 @@ app.post('/api/dodo/webhook', async (req, res) => {
           console.warn('dodo webhook cancel_scheduled ignored: missing supabase_user_id metadata', { eventType });
           return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
         }
-        await updateTarget
-          .update({
+        const { error: cancelScheduledErr } = await updateBillingSubscriptionsByTarget(
+          {
             cancel_at_period_end: true,
             cancelled_at: new Date().toISOString(),
             ...(dodoSubId ? { dodo_subscription_id: dodoSubId } : {}),
             ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
-            updated_at: new Date().toISOString(),
-          })
-          .eq('status', 'active');
+          },
+          { dodoSubId, userId, activeOnly: true }
+        );
+        if (cancelScheduledErr) {
+          console.warn('dodo webhook cancel_scheduled update error', {
+            eventType,
+            userId,
+            dodoSubId,
+            error: cancelScheduledErr.message || cancelScheduledErr,
+          });
+          return res.status(500).json({ error: 'Failed to record scheduled cancellation' });
+        }
         return res.json({ ok: true, action: 'cancel_scheduled', userId });
       }
     }
 
     if (cancelSignals.some((sig) => eventType.includes(sig))) {
-      await updateTarget
-        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
-        .eq('status', 'active');
+      const { error: cancelErr } = await updateBillingSubscriptionsByTarget(
+        { status: 'cancelled' },
+        { dodoSubId, userId, activeOnly: true }
+      );
+      if (cancelErr) {
+        console.warn('dodo webhook cancel update error', {
+          eventType,
+          userId,
+          dodoSubId,
+          error: cancelErr.message || cancelErr,
+        });
+        return res.status(500).json({ error: 'Failed to record subscription cancellation' });
+      }
       let uidForProfile = userId;
       if (!uidForProfile && dodoSubId) {
         uidForProfile = await lookupUserIdByDodoSubscriptionId(dodoSubId);
