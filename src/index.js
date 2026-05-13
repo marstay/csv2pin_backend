@@ -6087,7 +6087,7 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
       return res.status(400).json({ error: 'Missing url' });
     }
     const requestedCount = Number.parseInt(rawPinsPerUrl ?? rawCount ?? 10, 10);
-    const count = [3, 5, 10].includes(requestedCount) ? requestedCount : 10;
+    const count = [2, 3, 5, 10].includes(requestedCount) ? requestedCount : 10;
     const outputLanguage = String(rawOutputLanguage || '').trim().toLowerCase();
     const { base } = await fetchArticleBaseAndSummary(url, articleData || null, { outputLanguage });
     const contentProfile = await enrichContentProfile(base, openai);
@@ -9678,6 +9678,34 @@ async function getPinterestAccessTokenForUser(userId, accountId) {
   return accessToken || null;
 }
 
+/** Pinterest GET /v5/boards is paginated; first page alone misses boards when user has > page_size. */
+async function fetchAllPinterestBoardPages(accessToken) {
+  const collected = [];
+  let bookmark = null;
+  const maxPages = 40;
+  for (let page = 0; page < maxPages; page++) {
+    const url = new URL('https://api.pinterest.com/v5/boards');
+    url.searchParams.set('page_size', '250');
+    if (bookmark) url.searchParams.set('bookmark', String(bookmark));
+    const pinterestRes = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    const json = await pinterestRes.json().catch(() => ({}));
+    if (!pinterestRes.ok) {
+      console.warn('Pinterest GET /boards page failed', { status: pinterestRes.status, page, details: json });
+      break;
+    }
+    const items = json.items || json.data || [];
+    collected.push(...items);
+    bookmark = json.bookmark ?? json.next_bookmark ?? null;
+    if (!bookmark || items.length === 0) break;
+  }
+  return collected;
+}
+
 app.get('/api/pinterest/boards', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
@@ -9692,15 +9720,8 @@ app.get('/api/pinterest/boards', async (req, res) => {
     return res.status(400).json({ error: 'No Pinterest access token found for user.' });
   }
 
-  // Fetch boards from Pinterest API
-  const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
-  const boards = await pinterestRes.json();
-  res.json({ boards: boards.items || boards.data || [] });
+  const boards = await fetchAllPinterestBoardPages(accessToken);
+  res.json({ boards });
 });
 
 // Create a Pinterest board (name required; optional description, privacy PUBLIC/SECRET)
@@ -10650,32 +10671,6 @@ app.post('/api/pinterest-boards-result', express.json(), (req, res) => {
 app.get('/api/pinterest-boards', (req, res) => {
   res.json({ boards: latestBoards['default'] || [] });
 });
-
-app.get('/api/pinterest/boards', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
-  const token = authHeader.split(' ')[1];
-  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
-  const user = respondSupabaseAuth(res, authUser, userError);
-  if (!user) return;
-
-  const accountId = extractAccountId(req);
-  const accessToken = await getPinterestAccessTokenForUser(user.id, accountId);
-  if (!accessToken) {
-    return res.status(400).json({ error: 'No Pinterest access token found for user.' });
-  }
-
-  // Fetch boards from Pinterest API
-  const pinterestRes = await fetch('https://api.pinterest.com/v5/boards', {
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
-  const boards = await pinterestRes.json();
-  res.json({ boards: boards.items || boards.data || [] });
-});
-
 
 app.get('/api/trends', async (req, res) => {
   try {
