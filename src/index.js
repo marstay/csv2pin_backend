@@ -5069,6 +5069,8 @@ const NICHE_VISUAL_HINTS = {
   travel: 'Use locations, landscapes, maps, luggage, and travel scenes that clearly signal destinations or journeys, not generic interiors.',
   self_improvement: 'Show people in everyday life improving habits, routines, or mindset (journals, checklists, calm home scenes) rather than random tech imagery.',
   product_review: 'Show the product or category clearly (packaging, close-ups, comparison layouts) so it is obvious what is being reviewed.',
+  amazon_affiliate:
+    'Amazon / shopping pins: hero the real product (shape, packaging, context of use); honest worth-it vibe; no fake prices, star ratings, or Amazon UI chrome as invented text.',
 };
 
 function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand, stepCount, niche }) {
@@ -6090,7 +6092,16 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
     const count = [2, 3, 5, 10].includes(requestedCount) ? requestedCount : 10;
     const outputLanguage = String(rawOutputLanguage || '').trim().toLowerCase();
     const { base } = await fetchArticleBaseAndSummary(url, articleData || null, { outputLanguage });
-    const contentProfile = await enrichContentProfile(base, openai);
+    let contentProfile = await enrichContentProfile(base, openai);
+    try {
+      const rawU = String(url || '').trim();
+      const abs = /^https?:\/\//i.test(rawU) ? rawU : `https://${rawU}`;
+      if (isAmazonRelatedHost(new URL(abs).hostname)) {
+        contentProfile = { ...contentProfile, amazonLanding: true };
+      }
+    } catch {
+      /* ignore invalid url */
+    }
     const plan = planStrategies(contentProfile, count);
     const strategyCounts = {};
     plan.forEach((p) => { strategyCounts[p.strategy] = (strategyCounts[p.strategy] || 0) + 1; });
@@ -6173,7 +6184,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         outputLanguage,
       });
       const { base } = fetched;
-      const contentProfile = await enrichContentProfile(base, openai);
+      let contentProfile = await enrichContentProfile(base, openai);
+      try {
+        const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
+        if (isAmazonRelatedHost(new URL(abs).hostname)) {
+          contentProfile = { ...contentProfile, amazonLanding: true };
+        }
+      } catch {
+        /* ignore */
+      }
       const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
       effectiveStyles = plan.map((p) => p.layoutId);
       req._strategicPlan = plan;
@@ -6450,10 +6469,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         'Show people in everyday life improving habits, routines, or mindset (journals, checklists, calm home scenes) rather than random tech imagery.',
       product_review:
         'Show the product or category clearly (packaging, close-ups, comparison layouts) so it is obvious what is being reviewed.',
+      amazon_affiliate:
+        'Amazon / shopping: clear product hero, honest worth-it vibe; no fake prices, ratings, or Amazon UI as invented text.',
     };
 
     const contentProfile = req._contentProfile || null;
     const niche = contentProfile?.niche || null;
+    const nicheForVisualHints =
+      contentProfile?.amazonLanding === true ? 'amazon_affiliate' : niche;
     const stylePrompts = [];
     let strategicMetadataByIndex = [];
     let keyIdeas = [];
@@ -6511,7 +6534,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const strategicMeta = strategicMetadataByIndex[i];
       if (useUserComposite) {
         const baseStyleDescription = styleMeta[id] || 'High quality, scroll-stopping Pinterest pin background.';
-        const nicheHint = niche && nicheVisualHints[niche] ? ` Niche-specific visual guidance: ${nicheVisualHints[niche]}` : '';
+        const nicheHint =
+          nicheForVisualHints && nicheVisualHints[nicheForVisualHints]
+            ? ` Niche-specific visual guidance: ${nicheVisualHints[nicheForVisualHints]}`
+            : '';
         const strategyHint = strategicMeta?.image_prompt_hint ? ` Strategy visual (must respect this): ${strategicMeta.image_prompt_hint}.` : '';
         const styleDescription = baseStyleDescription + nicheHint + strategyHint;
         stylePrompts.push({
@@ -6672,7 +6698,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         overlayText: overlayTextForPrompt,
         brand: brandForPrompt,
         stepCount: meta.step_count ?? null,
-        niche: contentProfile?.niche || null,
+        niche:
+          contentProfile?.amazonLanding === true
+            ? 'amazon_affiliate'
+            : contentProfile?.niche || null,
       });
       if (useTextBased) {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
@@ -7443,6 +7472,14 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       regenNanoReferenceInputs.length > 0
     );
 
+    let regenNicheHint = null;
+    try {
+      const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
+      if (isAmazonRelatedHost(new URL(abs).hostname)) regenNicheHint = 'amazon_affiliate';
+    } catch {
+      /* ignore */
+    }
+
     let imagePrompt = buildOverlayImagePrompt({
       styleId: nanoStyleId,
       topic,
@@ -7451,6 +7488,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       year,
       overlayText: overlayForRender,
       brand,
+      niche: regenNicheHint,
     });
     imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
 

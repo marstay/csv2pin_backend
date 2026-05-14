@@ -9,6 +9,8 @@ const STRATEGY_LAYOUT_MAP = {
   list_value: ['timeline_infographic', 'step_cards_3', 'grid_3_images', 'grid_4_images', 'stacked_strips'],
   lifestyle: ['cozy_baking', 'minimal_elegant', 'stacked_strips'],
   clean_authority: ['clean_appetizing', 'minimal_typography'],
+  /** Value / shopping-friendly (used heavily for Amazon landing URLs). */
+  value_save: ['money_saving', 'clumpy_fix'],
   mistake_warning: ['curiosity_shock', 'clumpy_fix'],
   transformation: ['before_after', 'offset_collage_3', 'grid_4_images'],
   wildcard: ['circle_cluster_4', 'offset_collage_3', 'grid_3_images', 'stacked_strips'],
@@ -17,6 +19,14 @@ const STRATEGY_LAYOUT_MAP = {
 // Niche-specific strategy mixes (from design doc Section 13)
 const NICHE_MIXES = {
   default: { curiosity_hook: 3, list_value: 2, lifestyle: 2, clean_authority: 1, wildcard: 1, transformation: 1 },
+  /** Pinterest → Amazon: prioritize saves, trust, value, and in-context product — not curiosity-only. */
+  amazon_affiliate: {
+    list_value: 3,
+    clean_authority: 2,
+    value_save: 2,
+    lifestyle: 2,
+    transformation: 1,
+  },
   recipe: { curiosity_hook: 2, list_value: 3, lifestyle: 3, transformation: 1, clean_authority: 1 },
   finance: { curiosity_hook: 3, list_value: 2, mistake_warning: 2, clean_authority: 1, wildcard: 1, transformation: 1 },
   travel: { curiosity_hook: 2, list_value: 3, lifestyle: 3, wildcard: 1, transformation: 1 },
@@ -92,6 +102,14 @@ Image prompt: Split composition or contrast, clearly show difference`,
 - Avoid typical phrasing
 Overlay text: Bold or unusual
 Image prompt: Visually distinct from other pins, creative composition`,
+  },
+  value_save: {
+    goal: 'saves',
+    rules: `Goal: Shopping-friendly value on Pinterest without deceptive claims.
+- Emphasize usefulness, time saved, fit-for-purpose, or "why people like it" — never invent discounts, prices, or ratings.
+- Stay consistent with what the listing plausibly offers.
+Overlay text: short concrete benefit line (max 8 words); practical tone.
+Image prompt: clear product or simple value motif (icons sparingly); must read on mobile.`,
   },
 };
 
@@ -183,6 +201,7 @@ const STRATEGY_SCORES = {
   list_value: { ctr: 60, save: 90 },
   lifestyle: { ctr: 65, save: 70 },
   clean_authority: { ctr: 45, save: 75 },
+  value_save: { ctr: 52, save: 92 },
   wildcard: { ctr: 70, save: 55 },
 };
 
@@ -204,7 +223,10 @@ const MULTI_IMAGE_LAYOUTS = new Set([
  * @returns {Object} strategy mix { curiosity_hook: n, list_value: n, ... }
  */
 function getWeightedMix(contentProfile) {
-  const base = NICHE_MIXES[contentProfile.niche] || NICHE_MIXES.default;
+  const base =
+    contentProfile?.amazonLanding === true
+      ? NICHE_MIXES.amazon_affiliate
+      : NICHE_MIXES[contentProfile.niche] || NICHE_MIXES.default;
   const mix = { ...base };
   const ct = contentProfile.content_type || 'informational';
   const emotional = contentProfile.emotional_intensity || 'medium';
@@ -267,7 +289,10 @@ function planStrategies(contentProfile, count = 10) {
 
   // If we're short, fill with default mix
   while (plan.length < count) {
-    const defaultPlan = planStrategies({ ...contentProfile, niche: 'default' }, count - plan.length);
+    const defaultPlan = planStrategies(
+      { ...contentProfile, niche: 'default', amazonLanding: false },
+      count - plan.length
+    );
     for (const p of defaultPlan) {
       if (plan.length >= count) break;
       plan.push(p);
@@ -431,6 +456,7 @@ const STRATEGY_REASONS = {
   list_value: 'Numbers and clear value drive saves',
   lifestyle: 'Emotional, relatable content boosts engagement',
   clean_authority: 'Trust and clarity encourage action',
+  value_save: 'Clear value and worth-it framing help saves on shopping pins',
   mistake_warning: 'Urgency and risk trigger clicks',
   transformation: 'Before/after framing drives interest',
   wildcard: 'Unexpected angles stand out in the feed',
@@ -480,6 +506,7 @@ function pickAngle(strategy, contentProfile, usedAngles = []) {
     mistake_warning: ['mistake', 'warning', 'secret'],
     transformation: ['benefit', 'advanced', 'time-saving'],
     wildcard: ['secret', 'emotional', 'warning'],
+    value_save: ['benefit', 'time-saving', 'beginner'],
   };
 
   let pool = basePoolByStrategy[strategy] || ANGLE_OPTIONS;
