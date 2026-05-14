@@ -127,7 +127,15 @@ async function main() {
   const postAt = body?.generatedAt;
   const getAt = verifyBody?.generatedAt;
   console.log('');
-  console.log('GET /api/trends check:', { generatedAt: getAt, trendCount: Array.isArray(verifyBody?.trends) ? verifyBody.trends.length : 0 });
+  console.log(
+    'GET /api/trends check:',
+    {
+      generatedAt: getAt,
+      trendCount: Array.isArray(verifyBody?.trends) ? verifyBody.trends.length : 0,
+      source: verifyBody?.source ?? null,
+      dataProviders: verifyBody?.dataProviders ?? [],
+    }
+  );
   if (postAt && getAt && postAt !== getAt) {
     console.log('');
     console.warn(

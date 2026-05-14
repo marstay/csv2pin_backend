@@ -10771,6 +10771,9 @@ app.post('/api/trends/refresh', async (req, res) => {
       ok: true,
       generatedAt: catalog?.generatedAt || null,
       count: Array.isArray(catalog?.trends) ? catalog.trends.length : 0,
+      source: catalog?.source || null,
+      dataProviders: Array.isArray(catalog?.dataProviders) ? catalog.dataProviders : [],
+      stale: Boolean(catalog?.stale),
     });
   } catch (e) {
     console.error('POST /api/trends/refresh failed:', e?.message || e);
