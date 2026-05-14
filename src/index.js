@@ -23,9 +23,6 @@ import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
 dotenv.config();
 
-console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
-console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY);
-
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -1474,6 +1471,17 @@ const PORT = process.env.PORT || 4000;
 
 app.use(cors());
 app.use(express.json());
+
+/** One-line access log for /api/trends* (local dev by default; set TRENDS_HTTP_LOG=0 to disable when NODE_ENV is unset). */
+if (process.env.TRENDS_HTTP_LOG === '1' || (process.env.TRENDS_HTTP_LOG !== '0' && process.env.NODE_ENV !== 'production')) {
+  app.use((req, res, next) => {
+    const p = req.path || '';
+    if (p.startsWith('/api/trends')) {
+      console.log(`[trends-http] ${req.method} ${req.originalUrl || p}`);
+    }
+    next();
+  });
+}
 
 /** Hostnames commonly used for URL shortening / tracking — path is required for identity, not just hostname. */
 const URL_SHORTENER_HOSTNAMES = new Set([
@@ -10712,10 +10720,20 @@ app.get('/api/pinterest-boards', (req, res) => {
 
 app.get('/api/trends', async (req, res) => {
   try {
-    const catalog = await getTrendsCatalog();
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
+    const syncDisk = String(req.query.sync || '').trim() === '1';
+    const catalog = await getTrendsCatalog({ rereadDisk: syncDisk });
     const category = String(req.query.category || '').trim();
     const trends = Array.isArray(catalog?.trends) ? catalog.trends : [];
     const filtered = category ? trends.filter((t) => t.category === category) : trends;
+    if (process.env.TRENDS_HTTP_LOG === '1' || (process.env.TRENDS_HTTP_LOG !== '0' && process.env.NODE_ENV !== 'production')) {
+      console.log(
+        '[trends-catalog]',
+        catalog?.generatedAt || '(no ts)',
+        `n=${filtered.length}`,
+        syncDisk ? 'sync' : 'mem/disk'
+      );
+    }
     res.json({
       generatedAt: catalog?.generatedAt || null,
       season: catalog?.season || null,
@@ -10732,6 +10750,7 @@ app.get('/api/trends', async (req, res) => {
 
 app.get('/api/trends/:slug', async (req, res) => {
   try {
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
     const trend = await getTrendBySlug(req.params.slug);
     if (!trend) return res.status(404).json({ error: 'trend_not_found' });
     res.json({ trend });

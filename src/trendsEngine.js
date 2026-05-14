@@ -21,6 +21,27 @@ function readIntEnv(name, fallback, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * Run async work on items with bounded concurrency (faster than sequential awaits).
+ */
+async function mapPool(items, concurrency, fn) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const pool = Math.max(1, Math.min(concurrency, items.length));
+  const results = new Array(items.length);
+  let next = 0;
+
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i], i);
+    }
+  };
+
+  await Promise.all(Array.from({ length: pool }, () => worker()));
+  return results;
+}
+
 function getTrendCategoryLimits() {
   return {
     amazon: readIntEnv('TRENDS_AMAZON_COUNT', 8, 2, 16),
@@ -132,7 +153,7 @@ async function buildTrendsFromAiIdeas(ideas) {
   const BADGES = new Set(['trending', 'rising', 'high_conversion', 'seasonal']);
   const CATEGORIES = new Set(['amazon', 'etsy', 'blogging']);
   const usedSlugs = new Set();
-  const trends = [];
+  const skeletons = [];
 
   for (const idea of ideas) {
     const category = String(idea?.category || '').trim();
@@ -167,11 +188,16 @@ async function buildTrendsFromAiIdeas(ideas) {
       },
     };
 
-    trend.suggestions = await resolveSuggestionsForTrend(trend);
-    trends.push(trend);
+    skeletons.push(trend);
   }
 
-  return trends;
+  const suggestionConcurrency = readIntEnv('TRENDS_SUGGESTION_CONCURRENCY', 6, 1, 12);
+  await mapPool(skeletons, suggestionConcurrency, async (trend) => {
+    trend.suggestions = await resolveSuggestionsForTrend(trend);
+    return trend;
+  });
+
+  return skeletons;
 }
 
 async function buildTrendsFromPinterestSignals() {
@@ -191,12 +217,14 @@ async function buildTrendsFromPinterestSignals() {
   const seeds = pinterestSignalsToTrendSeeds(signals);
   const limits = getTrendCategoryLimits();
   const maxTrends = readIntEnv('TRENDS_MAX_ITEMS', 36, 6, 60);
-  const trends = [];
-  for (const seed of selectTrendSeedsByCategory(seeds, limits, maxTrends)) {
+  const selectedSeeds = selectTrendSeedsByCategory(seeds, limits, maxTrends);
+  const suggestionConcurrency = readIntEnv('TRENDS_SUGGESTION_CONCURRENCY', 6, 1, 12);
+  const trendBodies = await mapPool(selectedSeeds, suggestionConcurrency, async (seed) => {
     const trend = { ...seed, suggestions: [], source: 'pinterest_trends' };
     trend.suggestions = await resolveSuggestionsForTrend(trend);
-    trends.push(trend);
-  }
+    return trend;
+  });
+  const trends = trendBodies.filter(Boolean);
   if (!trends.length) throw new Error('trends_build_empty');
   return {
     generatedAt: new Date().toISOString(),
@@ -249,15 +277,40 @@ function cacheIsFresh(payload) {
   return Number.isFinite(ageMs) && ageMs < ttlHours * 60 * 60 * 1000;
 }
 
+function generatedAtMs(payload) {
+  if (!payload?.generatedAt) return 0;
+  const t = new Date(payload.generatedAt).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+
 export function initTrendsEngine(openai, deps = {}) {
   openaiClient = openai;
   getPinterestAccessToken = deps.getPinterestAccessToken || null;
 }
 
-export async function getTrendsCatalog({ force = false } = {}) {
-  if (!force && memoryCache && cacheIsFresh(memoryCache)) {
+/**
+ * @param {{ force?: boolean, rereadDisk?: boolean }} [opts]
+ * - force: full rebuild (Pinterest + enrichment); use POST /api/trends/refresh.
+ * - rereadDisk: skip the in-memory fast path, compare disk file to memory; if disk is newer, replace memory (cheap sync).
+ */
+export async function getTrendsCatalog({ force = false, rereadDisk = false } = {}) {
+  if (!force && !rereadDisk && memoryCache && cacheIsFresh(memoryCache)) {
     return memoryCache;
   }
+
+  if (!force && rereadDisk) {
+    const diskPeek = await readCacheFromDisk();
+    if (diskPeek?.trends?.length) {
+      if (generatedAtMs(diskPeek) > generatedAtMs(memoryCache)) {
+        memoryCache = diskPeek;
+        return memoryCache;
+      }
+    }
+    if (memoryCache && cacheIsFresh(memoryCache)) {
+      return memoryCache;
+    }
+  }
+
   if (!force) {
     const disk = await readCacheFromDisk();
     if (disk && cacheIsFresh(disk)) {
