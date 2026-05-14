@@ -1,5 +1,7 @@
 const PINTEREST_TREND_TYPES = ['growing', 'seasonal', 'monthly'];
 
+let warnedRapidApiKeyMissing = false;
+
 function readIntEnv(name, fallback, min, max) {
   const n = Number(process.env[name] ?? fallback);
   const value = Number.isFinite(n) ? n : fallback;
@@ -253,7 +255,15 @@ export async function fetchAmazonSearchProducts(query, limit = 3) {
   const host =
     String(process.env.RAPIDAPI_AMAZON_HOST || '').trim() ||
     'real-time-amazon-data-the-most-complete.p.rapidapi.com';
-  if (!key || !query) return [];
+  if (!key || !query) {
+    if (!key && !warnedRapidApiKeyMissing) {
+      warnedRapidApiKeyMissing = true;
+      console.warn(
+        'trendsSignals: RAPIDAPI_KEY is unset — product images and rich listings need RapidAPI on the server; rebuild trends after setting it.'
+      );
+    }
+    return [];
+  }
 
   const paths = [
     `/search?query=${encodeURIComponent(query)}&page=1&country=US`,
@@ -311,7 +321,15 @@ export async function fetchAmazonSearchProducts(query, limit = 3) {
 export async function fetchEtsySearchProducts(query, limit = 3) {
   const key = String(process.env.RAPIDAPI_KEY || '').trim();
   const host = String(process.env.RAPIDAPI_ETSY_HOST || '').trim() || 'etsy-api2.p.rapidapi.com';
-  if (!key || !query) return [];
+  if (!key || !query) {
+    if (!key && !warnedRapidApiKeyMissing) {
+      warnedRapidApiKeyMissing = true;
+      console.warn(
+        'trendsSignals: RAPIDAPI_KEY is unset — product images and rich listings need RapidAPI on the server; rebuild trends after setting it.'
+      );
+    }
+    return [];
+  }
 
   const paths = [
     `/search?query=${encodeURIComponent(query)}`,
@@ -377,7 +395,17 @@ export async function resolveSuggestionsForTrend(trend) {
       suggestions.push(...rows);
       if (suggestions.length >= maxProducts) break;
     }
-    return suggestions.slice(0, maxProducts);
+    if (suggestions.length) return suggestions.slice(0, maxProducts);
+    if (queries.length) {
+      return queries.map((q, i) => ({
+        id: `amazon-search-${i}`,
+        title: q,
+        url: `https://www.amazon.com/s?k=${encodeURIComponent(q)}`,
+        note:
+          'No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin.',
+      }));
+    }
+    return [];
   }
 
   if (cat === 'etsy') {
