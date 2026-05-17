@@ -21,6 +21,7 @@ import {
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
+import { applyAmazonProductTagsToHeroPin } from './pinterestProductTags.js';
 dotenv.config();
 
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -3892,6 +3893,29 @@ async function processScheduledPin(pin) {
       }
 
       console.log(`✅ Successfully posted pin: ${pin.id} -> Pinterest ID: ${pinData.id}`);
+
+      try {
+        const tagResult = await applyAmazonProductTagsToHeroPin({
+          accessToken,
+          scheduledPin: { ...pin, pinterest_pin_id: pinData.id },
+        });
+        const tagPatch = {
+          original_pin_data: {
+            ...(pin.original_pin_data || {}),
+            amazon_product_tags_result: tagResult,
+          },
+        };
+        if (tagResult?.ok) {
+          tagPatch.error_message = null;
+        } else if (tagResult && !tagResult.skipped) {
+          const tagErr = tagResult.error || 'Amazon product tags failed';
+          tagPatch.error_message = `Posted to Pinterest. Product tags: ${tagErr}`;
+          console.warn(`⚠️ Amazon product tags failed for pin ${pin.id}:`, tagErr, tagResult.details || '');
+        }
+        await supabaseAdmin.from('scheduled_pins').update(tagPatch).eq('id', pin.id);
+      } catch (tagEx) {
+        console.warn(`⚠️ Amazon product tags exception for pin ${pin.id}:`, tagEx.message || tagEx);
+      }
       
     } else {
       // Handle Pinterest API error
@@ -9917,7 +9941,8 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
     scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern,
     force_duplicate = false,
     bake,
-    alt_text: rawAltText
+    alt_text: rawAltText,
+    amazon_product_tags: rawAmazonProductTags,
   } = req.body;
 
   // Validate required fields
@@ -10040,9 +10065,25 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
       ));
 
     // Store original pin data for reference
+    const amazonProductTags =
+      rawAmazonProductTags &&
+      typeof rawAmazonProductTags === 'object' &&
+      rawAmazonProductTags.enabled
+        ? {
+            enabled: true,
+            source: rawAmazonProductTags.source === 'custom' ? 'custom' : 'pin_link',
+            custom_url: String(rawAmazonProductTags.custom_url || '').trim(),
+            associate_tag: String(rawAmazonProductTags.associate_tag || '')
+              .replace(/^tag=/i, '')
+              .trim()
+              .slice(0, 64),
+          }
+        : null;
+
     const originalPinData = {
       image_url: finalImageUrl, title, description, board_id, link, account_id,
       ...(alt_text ? { alt_text } : {}),
+      ...(amazonProductTags ? { amazon_product_tags: amazonProductTags } : {}),
       user_id: user.id, created_at: new Date().toISOString()
     };
 

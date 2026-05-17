@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-05-14T09:35:42.383Z",
+  "generatedAt": "2026-05-17T14:23:45.539Z",
   "season": "Spring",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -87,7 +87,32 @@
           "2026-05-08": 100
         }
       },
-      "suggestions": [],
+      "suggestions": [
+        {
+          "id": "amazon-search-0",
+          "title": "may nails",
+          "url": "https://www.amazon.com/s?k=may%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-1",
+          "title": "may nails gifts",
+          "url": "https://www.amazon.com/s?k=may%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-2",
+          "title": "best may nails",
+          "url": "https://www.amazon.com/s?k=best%20may%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-3",
+          "title": "may nails ideas",
+          "url": "https://www.amazon.com/s?k=may%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        }
+      ],
       "source": "pinterest_trends"
     },
     {
@@ -169,7 +194,32 @@
           "2026-05-08": 87
         }
       },
-      "suggestions": [],
+      "suggestions": [
+        {
+          "id": "amazon-search-0",
+          "title": "graduation nails",
+          "url": "https://www.amazon.com/s?k=graduation%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-1",
+          "title": "graduation nails gifts",
+          "url": "https://www.amazon.com/s?k=graduation%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-2",
+          "title": "best graduation nails",
+          "url": "https://www.amazon.com/s?k=best%20graduation%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-3",
+          "title": "graduation nails ideas",
+          "url": "https://www.amazon.com/s?k=graduation%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        }
+      ],
       "source": "pinterest_trends"
     },
     {
@@ -251,7 +301,38 @@
           "2026-05-08": 100
         }
       },
-      "suggestions": [],
+      "suggestions": [
+        {
+          "id": "B0GVYMK7MT",
+          "title": "30Pcs Summer Beach Short Almond Press On Nails Pink Floral Starfish French Tips Fake Nails with 3D Flower & Pearl Decor ",
+          "url": "https://www.amazon.com/dp/B0GVYMK7MT",
+          "imageUrl": "https://m.media-amazon.com/images/I/81ETwWKlO8L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0DXF92JTW",
+          "title": "Short Almond Press on Nails Blue Yellow Fake Nails Spring Summer Nails Press ons with Fruit Blueberries, Lemons, Bows De",
+          "url": "https://www.amazon.com/dp/B0DXF92JTW",
+          "imageUrl": "https://m.media-amazon.com/images/I/61L4jO3yj-L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GSY23GVT",
+          "title": "24Pcs Summer Press on Nails Medium Almond Fake Nails 3D Cute Fish Lemon False Nails Reusable Bohemia Designs French Tip ",
+          "url": "https://www.amazon.com/dp/B0GSY23GVT",
+          "imageUrl": "https://m.media-amazon.com/images/I/71SOqj84xML._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G9LGJ19X",
+          "title": "Spring Summer Press On Nails Medium Almond Fake Nails French False Nails With Flower Starfish Designs Acrylic Nail Press",
+          "url": "https://www.amazon.com/dp/B0G9LGJ19X",
+          "imageUrl": "https://m.media-amazon.com/images/I/61MGUiFFY8L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F8HL6JR3",
+          "title": "24Pcs Almond Press on Nails Flower Summer Fake Nails with 3D Floral Designs French Tip Pink Acrylic False Nail Cute Glue",
+          "url": "https://www.amazon.com/dp/B0F8HL6JR3",
+          "imageUrl": "https://m.media-amazon.com/images/I/51IcoJSStNL._AC_UL320_.jpg"
+        }
+      ],
       "source": "pinterest_trends"
     },
     {
@@ -281,7 +362,7 @@
         "timeSeries": {
           "2025-05-16": 86,
           "2025-05-23": 91,
-          "2025-05-30": 87,
+          "2025-05-30": 88,
           "2025-06-06": 84,
           "2025-06-13": 82,
           "2025-06-20": 80,
@@ -313,7 +394,7 @@
           "2025-12-19": 68,
           "2025-12-26": 76,
           "2026-01-02": 84,
-          "2026-01-09": 83,
+          "2026-01-09": 82,
           "2026-01-16": 84,
           "2026-01-23": 83,
           "2026-01-30": 73,
@@ -326,14 +407,39 @@
           "2026-03-20": 89,
           "2026-03-27": 84,
           "2026-04-03": 84,
-          "2026-04-10": 84,
+          "2026-04-10": 83,
           "2026-04-17": 86,
-          "2026-04-24": 90,
+          "2026-04-24": 89,
           "2026-05-01": 90,
           "2026-05-08": 91
         }
       },
-      "suggestions": [],
+      "suggestions": [
+        {
+          "id": "amazon-search-0",
+          "title": "nails",
+          "url": "https://www.amazon.com/s?k=nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-1",
+          "title": "nails gifts",
+          "url": "https://www.amazon.com/s?k=nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-2",
+          "title": "best nails",
+          "url": "https://www.amazon.com/s?k=best%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        },
+        {
+          "id": "amazon-search-3",
+          "title": "nails ideas",
+          "url": "https://www.amazon.com/s?k=nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+        }
+      ],
       "source": "pinterest_trends"
     },
     {
@@ -415,7 +521,68 @@
           "2026-05-08": 28
         }
       },
-      "suggestions": [],
+      "suggestions": [
+        {
+          "id": "B0DZP88G4L",
+          "title": "Yellow French Tip Press on Nails Almond Fake Nails with Ladybug Green Leaves Design Short False Nail Press ons Reusable ",
+          "url": "https://www.amazon.com/dp/B0DZP88G4L",
+          "imageUrl": "https://m.media-amazon.com/images/I/61+rtMeYRGL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0D6XY6QPV",
+          "title": "Short Press On Almond Fake Nails - Flower Acrylic Fall Nails Press Ons Full Cover Glue On Cute False Floral Stick On Nai",
+          "url": "https://www.amazon.com/dp/B0D6XY6QPV",
+          "imageUrl": "https://m.media-amazon.com/images/I/71IRKK7k9fL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GF7SK3G4",
+          "title": "Flower Press on Nails French Tip Nails Press Ons Medium Almond Fake Nails with Yellow Flower Designs Acrylic Nail Glossy",
+          "url": "https://www.amazon.com/dp/B0GF7SK3G4",
+          "imageUrl": "https://m.media-amazon.com/images/I/61E7q7tcnJL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F13D3LLQ",
+          "title": "Pink Spring Press on Nails Almond Shape Fake Nails with Small Flower Designs Daisy Floral Artificial Nails Medium Length",
+          "url": "https://www.amazon.com/dp/B0F13D3LLQ",
+          "imageUrl": "https://m.media-amazon.com/images/I/71NQQVvWg6L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GGYF41Y7",
+          "title": "30Pcs Spring Press on Nails Medium Almond Fake Nails With Butterfly Pearl Rhinestones Designs 3D Flower False Nails Cute",
+          "url": "https://www.amazon.com/dp/B0GGYF41Y7",
+          "imageUrl": "https://m.media-amazon.com/images/I/714-79eNb-L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GRMQX45F",
+          "title": "30Pcs Spring Summer 3D Flower Press on Nails Pink Ombre Short Almond Fake Nails with Pearl & Gold Beads Design Glossy Re",
+          "url": "https://www.amazon.com/dp/B0GRMQX45F",
+          "imageUrl": "https://m.media-amazon.com/images/I/61jHmRpNwCL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F8TW436N",
+          "title": "24Pcs Flower Press On Nails Medium Almond Fake Nails Spring Nails Press Ons With Floral Daisy Designs Artificial Acrylic",
+          "url": "https://www.amazon.com/dp/B0F8TW436N",
+          "imageUrl": "https://m.media-amazon.com/images/I/71XEv8A1A8L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GR8MG7H7",
+          "title": "24Pcs Spring Press on Nails Medium Almond Fake Nails White French Tip False Nails with 3D Colorful Flower Rhinestones De",
+          "url": "https://www.amazon.com/dp/B0GR8MG7H7",
+          "imageUrl": "https://m.media-amazon.com/images/I/61MWHtjB2dL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GGYF41Y7",
+          "title": "30Pcs Spring Press on Nails Medium Almond Fake Nails With Butterfly Pearl Rhinestones Designs 3D Flower False Nails Cute",
+          "url": "https://www.amazon.com/dp/B0GGYF41Y7",
+          "imageUrl": "https://m.media-amazon.com/images/I/714-79eNb-L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0FCFGXLWQ",
+          "title": "24Pcs Pink Press on Nails Short Almond Fake Nails with 3D Flower Rhinestone Pearl Bow Design Rose Tulip Gold Gilding Fal",
+          "url": "https://www.amazon.com/dp/B0FCFGXLWQ",
+          "imageUrl": "https://m.media-amazon.com/images/I/612pXld+PsL._AC_UL320_.jpg"
+        }
+      ],
       "source": "pinterest_trends"
     },
     {
@@ -447,7 +614,7 @@
           "2025-05-23": 54,
           "2025-05-30": 51,
           "2025-06-06": 50,
-          "2025-06-13": 44,
+          "2025-06-13": 45,
           "2025-06-20": 45,
           "2025-06-27": 43,
           "2025-07-04": 43,
@@ -470,7 +637,7 @@
           "2025-10-31": 25,
           "2025-11-07": 30,
           "2025-11-14": 33,
-          "2025-11-21": 35,
+          "2025-11-21": 36,
           "2025-11-28": 33,
           "2025-12-05": 25,
           "2025-12-12": 38,
@@ -499,64 +666,28 @@
       },
       "suggestions": [
         {
-          "id": "B0CM6FJX1X",
-          "title": "Beetles French Tips Press On Nails: 150 Pcs Pink Short Square Press On Nails Fake Nail Tips, Soft Gel Nail False Nails A",
-          "url": "https://www.amazon.com/dp/B0CM6FJX1X",
-          "imageUrl": "https://m.media-amazon.com/images/I/71rA+9BD8yL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "french tip nails",
+          "url": "https://www.amazon.com/s?k=french%20tip%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0F32DYFC8",
-          "title": "300Pcs Sharp Square French Tip Press On Nails-Anyos Gel Nail Tips Short,No File Need Tips Pre-Designed,Fake Nails for Na",
-          "url": "https://www.amazon.com/dp/B0F32DYFC8",
-          "imageUrl": "https://m.media-amazon.com/images/I/71f+oor0Z-L._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "french tip nails gifts",
+          "url": "https://www.amazon.com/s?k=french%20tip%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0FJFVM2ST",
-          "title": "NOVO OVO Short Sharp Square White French Tip Nail Tips Press on BERRY PINK, Need Builder Gel Top Coat Nail Glue,Soft Gel",
-          "url": "https://www.amazon.com/dp/B0FJFVM2ST",
-          "imageUrl": "https://m.media-amazon.com/images/I/611cbxnhVqL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best french tip nails",
+          "url": "https://www.amazon.com/s?k=best%20french%20tip%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0DBVVF5NL",
-          "title": "White French Tip Press on Nails Coffin Medium With Heart Design Glue on Glossy Full Cover Cute Acrylic for Women Manicur",
-          "url": "https://www.amazon.com/dp/B0DBVVF5NL",
-          "imageUrl": "https://m.media-amazon.com/images/I/61HZMwJxBwL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0DF2Q4CT3",
-          "title": "Modelones French Tip Press on Nails Almond, Summer Short Almond Fake Nails for Women, Reusable Nail Kit with Nail Glue A",
-          "url": "https://www.amazon.com/dp/B0DF2Q4CT3",
-          "imageUrl": "https://m.media-amazon.com/images/I/71huiDJmFML._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GSVG5DZN",
-          "title": "French Tips Press On Nails, 150 Pcs 15 Sizes Pink Short Square French Matte Soft Gel Full Cover Acrylic False Nails Exte",
-          "url": "https://www.amazon.com/dp/B0GSVG5DZN",
-          "imageUrl": "https://m.media-amazon.com/images/I/71-SdGOzqxL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GK5X53FW",
-          "title": "Toe Nails Press On French Tips for Women, 15 Sizes 150 Pcs Sharp Square Pre-applied Primer & Base Coat Toenail Press Ons",
-          "url": "https://www.amazon.com/dp/B0GK5X53FW",
-          "imageUrl": "https://m.media-amazon.com/images/I/71iCj2aH04L._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GL646M33",
-          "title": "60Pcs Deep Pink French Tip Press on Nails & Press on Toenails Set, Square Fake Nails Kit with Nail Glue, 15 Sizes Acryli",
-          "url": "https://www.amazon.com/dp/B0GL646M33",
-          "imageUrl": "https://m.media-amazon.com/images/I/71iRYuv5+NL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0BP6FS3Q9",
-          "title": "modelones French Tip Tool- 6 Pcs Nail Stamp French Manicure Kit Suitable for DIY Together with Gel Nail Polish Art Tips ",
-          "url": "https://www.amazon.com/dp/B0BP6FS3Q9",
-          "imageUrl": "https://m.media-amazon.com/images/I/61ZtUNYatIL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B09WYG16XZ",
-          "title": "Saviland French Tip Nail Stamp: 4PCS Nail Art Stamper Kit Clear Silicone Nails Stamping Long & Short Jelly Stamper with ",
-          "url": "https://www.amazon.com/dp/B09WYG16XZ",
-          "imageUrl": "https://m.media-amazon.com/images/I/61km2Bga9vL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "french tip nails ideas",
+          "url": "https://www.amazon.com/s?k=french%20tip%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -1606,7 +1737,7 @@
           "2026-04-10": 53,
           "2026-04-17": 60,
           "2026-04-24": 68,
-          "2026-05-01": 73,
+          "2026-05-01": 72,
           "2026-05-08": 80
         }
       },
@@ -1801,7 +1932,7 @@
           "2025-05-16": 83,
           "2025-05-23": 90,
           "2025-05-30": 69,
-          "2025-06-06": 64,
+          "2025-06-06": 65,
           "2025-06-13": 42,
           "2025-06-20": 26,
           "2025-06-27": 18,
@@ -2527,7 +2658,7 @@
           "2025-05-16": 40,
           "2025-05-23": 26,
           "2025-05-30": 11,
-          "2025-06-06": 8,
+          "2025-06-06": 9,
           "2025-06-13": 4,
           "2025-06-20": 2,
           "2025-06-27": 1,
@@ -2697,7 +2828,7 @@
           "2026-04-17": 2,
           "2026-04-24": 4,
           "2026-05-01": 9,
-          "2026-05-08": 51
+          "2026-05-08": 50
         }
       },
       "suggestions": [
@@ -3782,7 +3913,7 @@
           "2026-01-16": 1,
           "2026-01-23": 1,
           "2026-01-30": 1,
-          "2026-02-06": 0,
+          "2026-02-06": 1,
           "2026-02-13": 1,
           "2026-02-20": 1,
           "2026-02-27": 1,
@@ -4110,7 +4241,7 @@
         "pctGrowthMom": 2500,
         "pctGrowthYoy": -20,
         "timeSeries": {
-          "2025-05-16": 32,
+          "2025-05-16": 33,
           "2025-05-23": 15,
           "2025-05-30": 6,
           "2025-06-06": 3,
