@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-05-17T16:18:37.302Z",
+  "generatedAt": "2026-05-21T06:21:44.904Z",
   "season": "Spring",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -89,28 +89,64 @@
       },
       "suggestions": [
         {
-          "id": "amazon-search-0",
-          "title": "may nails",
-          "url": "https://www.amazon.com/s?k=may%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GL1H59KW",
+          "title": "Bee Daisy Press on Nails Short Square Design Soft Nude Base with Cute Daisy Flower Patterns Glossy Finish Reusable Sprin",
+          "url": "https://www.amazon.com/dp/B0GL1H59KW",
+          "imageUrl": "https://m.media-amazon.com/images/I/71bTvRp49HL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-1",
-          "title": "may nails gifts",
-          "url": "https://www.amazon.com/s?k=may%20nails%20gifts",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GL81S16M",
+          "title": "Polka Dot Press on Nails Short -Almond Fake Nails White & Pink - French Tip False Nails with Black Polka Dot Designs Cut",
+          "url": "https://www.amazon.com/dp/B0GL81S16M",
+          "imageUrl": "https://m.media-amazon.com/images/I/51uLmZWfD2L._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-2",
-          "title": "best may nails",
-          "url": "https://www.amazon.com/s?k=best%20may%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0F12P8VYY",
+          "title": "Flower Coffin Nails 24 Pcs Yellow Glossy False Nails with Cute Bees Designs Flowers Acrylic Nails for Women Girls",
+          "url": "https://www.amazon.com/dp/B0F12P8VYY",
+          "imageUrl": "https://m.media-amazon.com/images/I/71lr-TzDM1L._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-3",
-          "title": "may nails ideas",
-          "url": "https://www.amazon.com/s?k=may%20nails%20ideas",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0FY147T71",
+          "title": "Flower French Tip Press on Nails Medium Almond Fake Nails Spring Summer Nails Press ons with Tulip Floral Design,Reusabl",
+          "url": "https://www.amazon.com/dp/B0FY147T71",
+          "imageUrl": "https://m.media-amazon.com/images/I/61mgBPS3i6L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G2G393VS",
+          "title": "Almond Press on Nails - Short Pink Nails Spring False Nails Press ons with Flower & Gold Beads Design, Glossy Acrylic Fu",
+          "url": "https://www.amazon.com/dp/B0G2G393VS",
+          "imageUrl": "https://m.media-amazon.com/images/I/61kqnCS5+9L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0FXWGSW75",
+          "title": "Shinylin 3 Pcs Nail Tech Gifts Set for Women 1 Glass Tumbler with Lids and Straw 1 Travel Makeup Bag 1 Novelty Keychain ",
+          "url": "https://www.amazon.com/dp/B0FXWGSW75",
+          "imageUrl": "https://m.media-amazon.com/images/I/71nM8bTwbXL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GC5L6T63",
+          "title": "GSPY Scented Candle - Nail Tech Gifts for Women, Men - Nail Technician Gifts, Salon Decor - Funny Birthday, Appreciation",
+          "url": "https://www.amazon.com/dp/B0GC5L6T63",
+          "imageUrl": "https://m.media-amazon.com/images/I/71deW872UoL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0754MHLJP",
+          "title": "MiDenso Premium Glass Nail File with Case, Crystal Diamond Salon Nail Buffer for Natural and Acrylic Nails, Apricot Colo",
+          "url": "https://www.amazon.com/dp/B0754MHLJP",
+          "imageUrl": "https://m.media-amazon.com/images/I/61njTmMqmDL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G4C6JRB5",
+          "title": "Miracu Candle, Nail Tech Gifts for Women, Men, Nail Technician Gifts, Funny Birthday, Mothers Day, Appreciation, Graduat",
+          "url": "https://www.amazon.com/dp/B0G4C6JRB5",
+          "imageUrl": "https://m.media-amazon.com/images/I/71IfaM5BegL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0CHYDL3TS",
+          "title": "48 Sets Disposable Manicure Kit, Individually Package Nail Kit,Manicure Set with Mini Nail File,Mini Nail Buffer,Nail St",
+          "url": "https://www.amazon.com/dp/B0CHYDL3TS",
+          "imageUrl": "https://m.media-amazon.com/images/I/71gP9I4wApL._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"
@@ -183,7 +219,7 @@
           "2026-02-20": 3,
           "2026-02-27": 7,
           "2026-03-06": 5,
-          "2026-03-13": 7,
+          "2026-03-13": 6,
           "2026-03-20": 10,
           "2026-03-27": 16,
           "2026-04-03": 14,
@@ -191,69 +227,33 @@
           "2026-04-17": 30,
           "2026-04-24": 43,
           "2026-05-01": 64,
-          "2026-05-08": 87
+          "2026-05-08": 86
         }
       },
       "suggestions": [
         {
-          "id": "B0GJDGZTB6",
-          "title": "24Pcs 3D Bow Press on Nails Medium Almond French Tip Fake Nails with Gilding Line Design Gold Cute Bow Rhinestones False",
-          "url": "https://www.amazon.com/dp/B0GJDGZTB6",
-          "imageUrl": "https://m.media-amazon.com/images/I/61XduiJTd9L._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "graduation nails",
+          "url": "https://www.amazon.com/s?k=graduation%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0FMF7W9D9",
-          "title": "Handmade Press On Nails – Short Almond False Nails for Women, Reusable Acrylic White French Tip with Pearl & 3D Flowers ",
-          "url": "https://www.amazon.com/dp/B0FMF7W9D9",
-          "imageUrl": "https://m.media-amazon.com/images/I/71kKDDXU+NL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "graduation nails gifts",
+          "url": "https://www.amazon.com/s?k=graduation%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0DL32WBG5",
-          "title": "Almond Press on Nails Medium Pink With 3D Gold Stripes Designs White French Tips Fall Winter False Acrylic Glue on Gloss",
-          "url": "https://www.amazon.com/dp/B0DL32WBG5",
-          "imageUrl": "https://m.media-amazon.com/images/I/71ta31hsiWL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best graduation nails",
+          "url": "https://www.amazon.com/s?k=best%20graduation%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GSZCGS9Q",
-          "title": "24Pcs White Flowers Press on Nails Medium Almond Fake Nails with 3D Gold Rhinestones Pearls Designs French Tip False Nai",
-          "url": "https://www.amazon.com/dp/B0GSZCGS9Q",
-          "imageUrl": "https://m.media-amazon.com/images/I/71BTup5gacL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0FZ95Z2KT",
-          "title": "Polka Dot Press on Nails Black White Almond French Tip Fake Nails with Designs Bow, FlexFly Cute Acrylic Nails Glossy Fu",
-          "url": "https://www.amazon.com/dp/B0FZ95Z2KT",
-          "imageUrl": "https://m.media-amazon.com/images/I/71+73jVZsCL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0FXWGSW75",
-          "title": "Shinylin 3 Pcs Nail Tech Gifts Set for Women 1 Glass Tumbler with Lids and Straw 1 Travel Makeup Bag 1 Novelty Keychain ",
-          "url": "https://www.amazon.com/dp/B0FXWGSW75",
-          "imageUrl": "https://m.media-amazon.com/images/I/71nM8bTwbXL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0G4C6JRB5",
-          "title": "Miracu Candle, Nail Tech Gifts for Women, Men, Nail Technician Gifts, Funny Birthday, Mothers Day, Appreciation, Graduat",
-          "url": "https://www.amazon.com/dp/B0G4C6JRB5",
-          "imageUrl": "https://m.media-amazon.com/images/I/71IfaM5BegL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0FCG69B6W",
-          "title": "Nail Tech Gifts for Women Nail Tech Decor Manicurist Keychain for Women Nails Technician Gifts Birthday Gift for Beautic",
-          "url": "https://www.amazon.com/dp/B0FCG69B6W",
-          "imageUrl": "https://m.media-amazon.com/images/I/61jDfryhFHL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GC5L6T63",
-          "title": "GSPY Scented Candle - Nail Tech Gifts for Women, Men - Nail Technician Gifts, Salon Decor - Funny Birthday, Appreciation",
-          "url": "https://www.amazon.com/dp/B0GC5L6T63",
-          "imageUrl": "https://m.media-amazon.com/images/I/71deW872UoL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F99GWSCS",
-          "title": "Nail Technician Appreciation Gift, Acrylic Desk Sign with Floral Design and Thank You Message, Rustic Wood Base Decor fo",
-          "url": "https://www.amazon.com/dp/B0F99GWSCS",
-          "imageUrl": "https://m.media-amazon.com/images/I/71PaODwJqNL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "graduation nails ideas",
+          "url": "https://www.amazon.com/s?k=graduation%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -420,7 +420,7 @@
           "2025-11-21": 71,
           "2025-11-28": 70,
           "2025-12-05": 57,
-          "2025-12-12": 60,
+          "2025-12-12": 59,
           "2025-12-19": 68,
           "2025-12-26": 76,
           "2026-01-02": 84,
@@ -438,7 +438,7 @@
           "2026-03-27": 84,
           "2026-04-03": 84,
           "2026-04-10": 83,
-          "2026-04-17": 86,
+          "2026-04-17": 85,
           "2026-04-24": 89,
           "2026-05-01": 90,
           "2026-05-08": 91
@@ -531,7 +531,7 @@
           "2025-12-19": 1,
           "2025-12-26": 1,
           "2026-01-02": 1,
-          "2026-01-09": 2,
+          "2026-01-09": 3,
           "2026-01-16": 3,
           "2026-01-23": 3,
           "2026-01-30": 3,
@@ -553,34 +553,28 @@
       },
       "suggestions": [
         {
-          "id": "B0F13D3LLQ",
-          "title": "Pink Spring Press on Nails Almond Shape Fake Nails with Small Flower Designs Daisy Floral Artificial Nails Medium Length",
-          "url": "https://www.amazon.com/dp/B0F13D3LLQ",
-          "imageUrl": "https://m.media-amazon.com/images/I/71NQQVvWg6L._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "spring nails",
+          "url": "https://www.amazon.com/s?k=spring%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0D6XY6QPV",
-          "title": "Short Press On Almond Fake Nails - Flower Acrylic Fall Nails Press Ons Full Cover Glue On Cute False Floral Stick On Nai",
-          "url": "https://www.amazon.com/dp/B0D6XY6QPV",
-          "imageUrl": "https://m.media-amazon.com/images/I/71IRKK7k9fL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "spring nails gifts",
+          "url": "https://www.amazon.com/s?k=spring%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0DZP88G4L",
-          "title": "Yellow French Tip Press on Nails Almond Fake Nails with Ladybug Green Leaves Design Short False Nail Press ons Reusable ",
-          "url": "https://www.amazon.com/dp/B0DZP88G4L",
-          "imageUrl": "https://m.media-amazon.com/images/I/61+rtMeYRGL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best spring nails",
+          "url": "https://www.amazon.com/s?k=best%20spring%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GGYF41Y7",
-          "title": "30Pcs Spring Press on Nails Medium Almond Fake Nails With Butterfly Pearl Rhinestones Designs 3D Flower False Nails Cute",
-          "url": "https://www.amazon.com/dp/B0GGYF41Y7",
-          "imageUrl": "https://m.media-amazon.com/images/I/714-79eNb-L._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F4RD7FXY",
-          "title": "French Tip Press On Nails Spring Summer Acrylic Nails for Women - Yellow Flower Designer Fake Nails Medium Almond 24Pcs,",
-          "url": "https://www.amazon.com/dp/B0F4RD7FXY",
-          "imageUrl": "https://m.media-amazon.com/images/I/71TvCqQjr0L._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "spring nails ideas",
+          "url": "https://www.amazon.com/s?k=spring%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -610,7 +604,7 @@
         "pctGrowthMom": 20,
         "pctGrowthYoy": 100,
         "timeSeries": {
-          "2025-05-16": 55,
+          "2025-05-16": 56,
           "2025-05-23": 54,
           "2025-05-30": 51,
           "2025-06-06": 50,
@@ -1329,7 +1323,7 @@
           "2025-05-30": 7,
           "2025-06-06": 7,
           "2025-06-13": 7,
-          "2025-06-20": 7,
+          "2025-06-20": 8,
           "2025-06-27": 10,
           "2025-07-04": 7,
           "2025-07-11": 7,
@@ -1338,7 +1332,7 @@
           "2025-08-01": 8,
           "2025-08-08": 8,
           "2025-08-15": 7,
-          "2025-08-22": 6,
+          "2025-08-22": 7,
           "2025-08-29": 9,
           "2025-09-05": 7,
           "2025-09-12": 7,
@@ -1447,7 +1441,7 @@
         "timeSeries": {
           "2025-05-16": 62,
           "2025-05-23": 58,
-          "2025-05-30": 37,
+          "2025-05-30": 38,
           "2025-06-06": 25,
           "2025-06-13": 16,
           "2025-06-20": 9,
@@ -1687,7 +1681,7 @@
         "pctGrowthMom": 60,
         "pctGrowthYoy": -9,
         "timeSeries": {
-          "2025-05-16": 99,
+          "2025-05-16": 100,
           "2025-05-23": 100,
           "2025-05-30": 77,
           "2025-06-06": 60,
@@ -1725,7 +1719,7 @@
           "2026-01-16": 18,
           "2026-01-23": 19,
           "2026-01-30": 21,
-          "2026-02-06": 22,
+          "2026-02-06": 21,
           "2026-02-13": 21,
           "2026-02-20": 25,
           "2026-02-27": 32,
@@ -2301,7 +2295,7 @@
           "2025-06-27": 3,
           "2025-07-04": 2,
           "2025-07-11": 3,
-          "2025-07-18": 2,
+          "2025-07-18": 3,
           "2025-07-25": 1,
           "2025-08-01": 3,
           "2025-08-08": 2,
@@ -2999,7 +2993,7 @@
       "title": "Mothers Day",
       "badge": "seasonal",
       "season": "Seasonal",
-      "overview": "Pinterest US searches for “mothers day” are up (200% week-over-week, 600% month-over-month, -4% year-over-year) in Pinterest’s seasonal trends feed.",
+      "overview": "Pinterest US searches for “mothers day” are up (200% week-over-week, 600% month-over-month, -5% year-over-year) in Pinterest’s seasonal trends feed.",
       "pinterestAngle": "Search demand is rising on Pinterest now — pins that match “mothers day” can ride current discovery.",
       "audience": "Bloggers and publishers who can publish or refresh content around this Pinterest search theme.",
       "productSearchQueries": [],
@@ -3019,7 +3013,7 @@
         "keyword": "mothers day",
         "pctGrowthWow": 200,
         "pctGrowthMom": 600,
-        "pctGrowthYoy": -4,
+        "pctGrowthYoy": -5,
         "timeSeries": {
           "2025-05-16": 100,
           "2025-05-23": 1,

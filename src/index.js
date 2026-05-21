@@ -10088,6 +10088,60 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   }
 });
 
+// Aggregate counts for scheduled-pins dashboard summary bar
+app.get('/api/pinterest/scheduled-pins/summary', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
+
+  const { account_id } = req.query;
+
+  const countForStatus = async (status, extraFilter) => {
+    let q = supabaseAdmin
+      .from('scheduled_pins')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', user.id)
+      .is('deleted_at', null)
+      .eq('status', status);
+    if (account_id && status !== 'generated') {
+      q = q.eq('pinterest_account_id', account_id);
+    }
+    if (typeof extraFilter === 'function') {
+      q = extraFilter(q);
+    }
+    const { count, error } = await q;
+    if (error) throw error;
+    return count ?? 0;
+  };
+
+  try {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const [scheduled, posting, failed, generated, postedToday] = await Promise.all([
+      countForStatus('scheduled'),
+      countForStatus('posting'),
+      countForStatus('failed'),
+      countForStatus('generated'),
+      countForStatus('posted', (q) => q.gte('posted_at', startOfToday.toISOString())),
+    ]);
+
+    return res.json({
+      scheduled,
+      posting,
+      failed,
+      posted_today: postedToday,
+      generated,
+    });
+  } catch (error) {
+    console.error('Error fetching scheduled pins summary:', error);
+    return res.status(500).json({ error: 'Failed to fetch summary' });
+  }
+});
+
 // Get user's scheduled pins
 app.get('/api/pinterest/scheduled-pins', async (req, res) => {
   const authHeader = req.headers.authorization;
