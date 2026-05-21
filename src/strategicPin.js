@@ -119,20 +119,30 @@ Image prompt: clear product or simple value motif (icons sparingly); must read o
  * @param {Object} openai - OpenAI client
  * @returns {Promise<Object>} contentProfile: { topic, content_type, audience, core_value, possible_angles }
  */
-async function enrichContentProfile(articleData, openai) {
+async function enrichContentProfile(articleData, openai, winnerContext = null) {
   const title = articleData?.title || '';
   const description = articleData?.description || '';
   const keyword = articleData?.keyword || '';
+  const wc = normalizeWinnerContext(winnerContext);
+  const winnerHint = wc
+    ? `\n\nA Pinterest pin already performed well for this page:
+- Winning pin title: ${wc.title.slice(0, 120)}
+- Winning on-image headline: ${wc.overlayHeadline.slice(0, 80)}
+Suggest possible_angles that are semantically similar (same intent/keywords) but would work as NEW pin tests — not paraphrases of the winner headline.`
+    : '';
 
   if (!title && !description) {
-    return {
-      topic: keyword || 'General topic',
+    const emptyProfile = {
+      topic: keyword || wc?.overlayHeadline || 'General topic',
       content_type: 'informational',
       audience: 'general readers',
-      core_value: title || 'Key insights',
+      core_value: wc?.title || 'Key insights',
       possible_angles: [],
       niche: 'default',
+      emotional_intensity: 'medium',
+      visual_potential: 'low',
     };
+    return wc ? applyWinnerToContentProfile(emptyProfile, wc) : emptyProfile;
   }
 
   const prompt = `Analyze this article metadata and return JSON only (no markdown).
@@ -151,7 +161,7 @@ Return a JSON object with these exact keys:
 - emotional_intensity: one of "low", "medium", "high" (how emotionally charged or urgent the content feels)
 - visual_potential: one of "low", "high" (e.g. recipe/travel = high; finance/tips = low)
 
-Examples: listicle → default; recipe/food → recipe; money/SEO/business → finance; travel/destinations → travel; productivity/mindset → self_improvement; product review → product_review.`;
+Examples: listicle → default; recipe/food → recipe; money/SEO/business → finance; travel/destinations → travel; productivity/mindset → self_improvement; product review → product_review.${winnerHint}`;
 
   try {
     const completion = await openai.chat.completions.create({
@@ -164,7 +174,7 @@ Examples: listicle → default; recipe/food → recipe; money/SEO/business → f
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      return {
+      const profile = {
         topic: parsed.topic || title || keyword || 'General topic',
         content_type: parsed.content_type || 'informational',
         audience: parsed.audience || 'general readers',
@@ -174,12 +184,13 @@ Examples: listicle → default; recipe/food → recipe; money/SEO/business → f
         emotional_intensity: ['low', 'medium', 'high'].includes(parsed.emotional_intensity) ? parsed.emotional_intensity : 'medium',
         visual_potential: ['low', 'high'].includes(parsed.visual_potential) ? parsed.visual_potential : 'low',
       };
+      return wc ? applyWinnerToContentProfile(profile, wc) : profile;
     }
   } catch (e) {
     console.warn('enrichContentProfile error:', e.message || e);
   }
 
-  return {
+  const fallback = {
     topic: title || keyword || 'General topic',
     content_type: 'informational',
     audience: 'general readers',
@@ -189,6 +200,7 @@ Examples: listicle → default; recipe/food → recipe; money/SEO/business → f
     emotional_intensity: 'medium',
     visual_potential: 'low',
   };
+  return wc ? applyWinnerToContentProfile(fallback, wc) : fallback;
 }
 
 /**
@@ -216,6 +228,39 @@ const MULTI_IMAGE_LAYOUTS = new Set([
   'timeline_infographic',
   'before_after',
 ]);
+
+/** Clone-winner remix: no list pins, timelines, step cards, or multi-panel grids. */
+const CLONE_EXCLUDED_STRATEGIES = new Set(['list_value']);
+
+const CLONE_EXCLUDED_LAYOUTS = new Set([
+  'timeline_infographic',
+  'step_cards_3',
+  'grid_3_images',
+  'grid_4_images',
+  'stacked_strips',
+  'offset_collage_3',
+  'circle_cluster_4',
+]);
+
+/** Strategy counts when remixing a winner (single-hero / hook layouts only). */
+const CLONE_WINNER_MIX = {
+  amazon: {
+    value_save: 2,
+    clean_authority: 2,
+    lifestyle: 2,
+    curiosity_hook: 2,
+    mistake_warning: 1,
+    transformation: 1,
+  },
+  default: {
+    value_save: 2,
+    clean_authority: 2,
+    lifestyle: 2,
+    curiosity_hook: 2,
+    mistake_warning: 1,
+    wildcard: 1,
+  },
+};
 
 /**
  * Build strategy mix with dynamic weighting based on content profile.
@@ -267,24 +312,178 @@ function getWeightedMix(contentProfile) {
   return mix;
 }
 
+/** Map Pinterest hook type → strategies to boost when cloning a winner. */
+const HOOK_TYPE_STRATEGY_BOOST = {
+  list: ['list_value', 'value_save'],
+  question: ['curiosity_hook'],
+  warning: ['mistake_warning'],
+  transformation: ['transformation'],
+  statement: ['clean_authority', 'lifestyle'],
+};
+
+/**
+ * Normalize winner payload from Analytics / URL→Pin clone flow.
+ * @returns {Object|null}
+ */
+function normalizeWinnerContext(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const title = String(raw.title || '').trim();
+  const overlayHeadline = String(
+    raw.overlayHeadline || raw.overlay_headline || raw.overlayHeadline || ''
+  ).trim();
+  if (!title && !overlayHeadline) return null;
+  return {
+    title: title || overlayHeadline,
+    description: String(raw.description || '').trim(),
+    overlayHeadline: overlayHeadline || title,
+    overlaySubheadline: String(raw.overlaySubheadline || raw.overlay_subheadline || '').trim(),
+    saves: Number(raw.saves) || 0,
+    outboundClicks: Number(raw.outboundClicks ?? raw.outbound_clicks) || 0,
+    impressions: Number(raw.impressions) || 0,
+    engagementRate: Number(raw.engagementRate ?? raw.engagement_rate) || 0,
+    link: String(raw.link || '').trim(),
+  };
+}
+
+function layoutsForStrategy(strategy, cloneMode = false) {
+  const layouts = STRATEGY_LAYOUT_MAP[strategy] || [];
+  if (!cloneMode) return layouts;
+  return layouts.filter((id) => !CLONE_EXCLUDED_LAYOUTS.has(id));
+}
+
+/**
+ * Strategy mix for clone-winner flow: no list_value; boost hooks that match the winner.
+ */
+function getCloneWinnerMix(contentProfile, winnerContext) {
+  const base =
+    contentProfile?.amazonLanding === true
+      ? { ...CLONE_WINNER_MIX.amazon }
+      : { ...CLONE_WINNER_MIX.default };
+  const mix = { ...base };
+  const wc = normalizeWinnerContext(winnerContext);
+  if (!wc) return mix;
+
+  const hookType = getHookType(wc.overlayHeadline || wc.title);
+  const preferred =
+    hookType === 'list'
+      ? ['value_save', 'clean_authority', 'lifestyle']
+      : (HOOK_TYPE_STRATEGY_BOOST[hookType] || ['value_save', 'clean_authority']).filter(
+          (s) => !CLONE_EXCLUDED_STRATEGIES.has(s)
+        );
+
+  if ((wc.outboundClicks || 0) >= (wc.saves || 0) && wc.outboundClicks > 0) {
+    mix.curiosity_hook = Math.min(4, (mix.curiosity_hook || 0) + 1);
+    mix.mistake_warning = Math.min(2, (mix.mistake_warning || 0) + 1);
+  } else if (wc.saves > 0) {
+    mix.value_save = Math.min(4, (mix.value_save || 0) + 2);
+    mix.lifestyle = Math.min(4, (mix.lifestyle || 0) + 1);
+  }
+
+  for (const strat of preferred) {
+    if (CLONE_EXCLUDED_STRATEGIES.has(strat)) continue;
+    if (layoutsForStrategy(strat, true).length === 0) continue;
+    mix[strat] = Math.min(4, (mix[strat] || 0) + 2);
+  }
+  if (layoutsForStrategy('wildcard', true).length === 0) {
+    mix.wildcard = 0;
+  }
+
+  return mix;
+}
+
+/**
+ * Merge winner hook stems into content profile angles after enrichment.
+ */
+function applyWinnerToContentProfile(contentProfile, winnerContext) {
+  const wc = normalizeWinnerContext(winnerContext);
+  if (!wc || !contentProfile) return contentProfile;
+
+  const stems = [];
+  const headline = wc.overlayHeadline || wc.title;
+  if (headline) stems.push(`Similar to top pin: ${headline.slice(0, 80)}`);
+  if (wc.description) stems.push(wc.description.slice(0, 100));
+
+  const existing = Array.isArray(contentProfile.possible_angles)
+    ? [...contentProfile.possible_angles]
+    : [];
+  const merged = [...stems, ...existing].filter(Boolean).slice(0, 8);
+
+  return {
+    ...contentProfile,
+    possible_angles: merged,
+    cloneWinnerHeadline: headline,
+  };
+}
+
+function buildWinnerAnchorBlock(winnerContext) {
+  const wc = normalizeWinnerContext(winnerContext);
+  if (!wc) return '';
+
+  const metrics = [];
+  if (wc.saves > 0) metrics.push(`${wc.saves} saves`);
+  if (wc.outboundClicks > 0) metrics.push(`${wc.outboundClicks} outbound clicks`);
+  if (wc.impressions > 0) metrics.push(`${wc.impressions} impressions`);
+
+  return `
+
+WINNING PIN ON PINTEREST (match INTENT and keyword theme — do NOT copy phrases verbatim):
+- Pin title: "${wc.title.slice(0, 120)}"
+- On-image headline: "${wc.overlayHeadline.slice(0, 80)}"${wc.overlaySubheadline ? `\n- On-image subheadline: "${wc.overlaySubheadline.slice(0, 80)}"` : ''}
+${metrics.length ? `- Performance: ${metrics.join(', ')}` : ''}
+- Required: Same topic and search intent as the winner; reuse important keyword stems in fresh wording.
+- Required: New title and overlay_headline must NOT repeat or lightly tweak the winner lines above.
+- Required: Each variant should feel like a sibling test (same money page angle), not a unrelated pin.
+`;
+}
+
 /**
  * Build strategy plan from content profile.
  * @param {Object} contentProfile - from enrichContentProfile
  * @param {number} count - desired number of pins (default 10)
+ * @param {Object} [winnerContext] - optional top pin from analytics clone flow
  * @returns {Array<{ strategy, goal, layoutId }>}
  */
-function planStrategies(contentProfile, count = 10) {
-  const mix = getWeightedMix(contentProfile);
+function planStrategies(contentProfile, count = 10, winnerContext = null) {
+  const isClone = !!normalizeWinnerContext(winnerContext);
+  const mix = isClone
+    ? getCloneWinnerMix(contentProfile, winnerContext)
+    : getWeightedMix(contentProfile);
   const plan = [];
 
   for (const [strategy, num] of Object.entries(mix)) {
-    const layouts = STRATEGY_LAYOUT_MAP[strategy];
-    if (!layouts) continue;
+    if (isClone && CLONE_EXCLUDED_STRATEGIES.has(strategy)) continue;
+    const layouts = layoutsForStrategy(strategy, isClone);
+    if (!layouts.length) continue;
     const goal = STRATEGY_COPY_RULES[strategy]?.goal || 'clicks';
     for (let i = 0; i < num && plan.length < count; i++) {
       const layoutId = layouts[i % layouts.length];
       plan.push({ strategy, goal, layoutId });
     }
+  }
+
+  if (isClone) {
+    const fillStrategies = [
+      'value_save',
+      'clean_authority',
+      'lifestyle',
+      'curiosity_hook',
+      'mistake_warning',
+      'transformation',
+    ];
+    let fi = 0;
+    while (plan.length < count && fi < fillStrategies.length * 4) {
+      const strategy = fillStrategies[fi % fillStrategies.length];
+      fi += 1;
+      if (CLONE_EXCLUDED_STRATEGIES.has(strategy)) continue;
+      const layouts = layoutsForStrategy(strategy, true);
+      if (!layouts.length) continue;
+      const goal = STRATEGY_COPY_RULES[strategy]?.goal || 'clicks';
+      const layoutId = layouts[plan.length % layouts.length];
+      const dup = plan.some((p) => p.strategy === strategy && p.layoutId === layoutId);
+      if (dup) continue;
+      plan.push({ strategy, goal, layoutId });
+    }
+    return plan.slice(0, count);
   }
 
   // If we're short, fill with default mix
@@ -644,6 +843,7 @@ async function generateStrategicPinMetadata(
     priorPinCopy,
     layoutOverlayGuidance,
     outputLanguage,
+    winnerContext,
   },
   openai
 ) {
@@ -694,6 +894,7 @@ async function generateStrategicPinMetadata(
     + priorBlock
     + layoutGuidanceBlock
     + `\n\nSTRATEGY RULES:\n${rulesToUse}\n`
+    + buildWinnerAnchorBlock(winnerContext)
     + (outputLanguage && String(outputLanguage).trim().toLowerCase() !== 'auto'
       ? `\nLANGUAGE REQUIREMENT: All fields (title, overlay_headline, overlay_subheadline, description, hashtags) must be written in ${String(outputLanguage).trim().toUpperCase()}.\nDo not use English.\n`
       : '')
@@ -753,6 +954,9 @@ async function generateStrategicPinMetadata(
 export {
   enrichContentProfile,
   planStrategies,
+  normalizeWinnerContext,
+  applyWinnerToContentProfile,
+  buildWinnerAnchorBlock,
   getStrategyCopyGuidance,
   getStrategyReason,
   checkDiversity,
@@ -760,6 +964,7 @@ export {
   generateStrategicPinMetadata,
   extractArticleKeyIdeas,
   pickAngle,
+  getHookType,
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
   NICHE_MIXES,

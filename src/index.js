@@ -10,6 +10,7 @@ import JSZip from 'jszip';
 import {
   enrichContentProfile,
   planStrategies,
+  normalizeWinnerContext,
   generateStrategicPinMetadata,
   extractArticleKeyIdeas,
   pickAngle,
@@ -6092,15 +6093,17 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
       count: rawCount,
       pinsPerUrl: rawPinsPerUrl,
       outputLanguage: rawOutputLanguage,
+      winnerContext: rawWinnerContext,
     } = req.body || {};
     if (!url) {
       return res.status(400).json({ error: 'Missing url' });
     }
+    const winnerContext = normalizeWinnerContext(rawWinnerContext);
     const requestedCount = Number.parseInt(rawPinsPerUrl ?? rawCount ?? 10, 10);
     const count = [2, 3, 5, 10].includes(requestedCount) ? requestedCount : 10;
     const outputLanguage = String(rawOutputLanguage || '').trim().toLowerCase();
     const { base } = await fetchArticleBaseAndSummary(url, articleData || null, { outputLanguage });
-    let contentProfile = await enrichContentProfile(base, openai);
+    let contentProfile = await enrichContentProfile(base, openai, winnerContext);
     try {
       const rawU = String(url || '').trim();
       const abs = /^https?:\/\//i.test(rawU) ? rawU : `https://${rawU}`;
@@ -6110,14 +6113,19 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
     } catch {
       /* ignore invalid url */
     }
-    const plan = planStrategies(contentProfile, count);
+    const plan = planStrategies(contentProfile, count, winnerContext);
     const strategyCounts = {};
     plan.forEach((p) => { strategyCounts[p.strategy] = (strategyCounts[p.strategy] || 0) + 1; });
     const topStrategies = Object.entries(strategyCounts)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3)
       .map(([s]) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()));
-    return res.json({ plan, contentProfile, top_strategies: topStrategies });
+    return res.json({
+      plan,
+      contentProfile,
+      top_strategies: topStrategies,
+      ...(winnerContext ? { clone_mode: true } : {}),
+    });
   } catch (err) {
     console.error('urltopin plan-strategic error:', err);
     return res.status(500).json({ error: err.message });
@@ -6141,7 +6149,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       userImageUrls: rawUserImageUrls,
       usePageReferenceImages: rawUsePageReferenceImages,
       metadataOnly: rawMetadataOnly,
+      winnerContext: rawWinnerContext,
     } = req.body || {};
+    const winnerContext = normalizeWinnerContext(rawWinnerContext);
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
@@ -6192,7 +6202,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         outputLanguage,
       });
       const { base } = fetched;
-      let contentProfile = await enrichContentProfile(base, openai);
+      let contentProfile = await enrichContentProfile(base, openai, winnerContext);
       try {
         const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
         if (isAmazonRelatedHost(new URL(abs).hostname)) {
@@ -6201,7 +6211,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       } catch {
         /* ignore */
       }
-      const plan = planStrategies(contentProfile, Math.min(count || 10, 10));
+      const plan = planStrategies(contentProfile, Math.min(count || 10, 10), winnerContext);
       effectiveStyles = plan.map((p) => p.layoutId);
       req._strategicPlan = plan;
       req._contentProfile = contentProfile;
@@ -6495,6 +6505,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const usedOverlayByLayout = new Map(); // layoutId -> [{ headline, subheadline }, ...]
       const metaResults = [];
       const priorPinCopy = [];
+      if (winnerContext) {
+        priorPinCopy.push({
+          title: winnerContext.title,
+          overlay_headline: winnerContext.overlayHeadline,
+          overlay_subheadline: winnerContext.overlaySubheadline || '',
+        });
+      }
+      const winnerCtxForMeta =
+        req.body?.winnerContext != null ? winnerContext : null;
       for (let i = 0; i < plan.length; i++) {
         const p = plan[i];
         const angle = pickAngle(p.strategy, contentProfile, usedAngles);
@@ -6514,6 +6533,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             layoutOverlayGuidance,
             outputLanguage,
             strictLanguage,
+            winnerContext: winnerCtxForMeta,
           },
           openai
         );
