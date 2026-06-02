@@ -165,6 +165,25 @@ async function getActiveSubscriptionForUser(userId) {
   }
 }
 
+async function getLatestPastDueSubscriptionForUser(userId) {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select(
+        'id, plan_type, pins_limit_per_month, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
+      )
+      .eq('user_id', userId)
+      .eq('status', 'past_due')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (error) return null;
+    if (!data || data.length === 0) return null;
+    return data[0];
+  } catch {
+    return null;
+  }
+}
+
 function markPendingDodoActivation(userId, planType, sessionId = null) {
   if (!userId || !planType) return;
   pendingDodoActivations.set(String(userId), {
@@ -448,6 +467,23 @@ async function lookupUserIdByDodoSubscriptionId(dodoSubId) {
     return row?.user_id ? String(row.user_id) : '';
   } catch {
     return '';
+  }
+}
+
+async function lookupLocalSubscriptionByDodoSubscriptionId(dodoSubId) {
+  const id = String(dodoSubId || '').trim();
+  if (!id) return null;
+  try {
+    const { data: row } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, user_id, status, plan_type, dodo_subscription_id, billing_interval, current_period_start, current_period_end')
+      .eq('dodo_subscription_id', id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    return row || null;
+  } catch {
+    return null;
   }
 }
 
@@ -1278,9 +1314,9 @@ async function recordMetadataUsage(userId, calls = 1) {
 async function getCurrentUsageSnapshot(userId) {
   const yearMonth = currentYearMonthDate();
 
-  // Active subscription row (if any)
-  const subscription = await getActiveSubscriptionForUser(userId);
-  const planType = subscription?.plan_type || 'free';
+  // Subscription row for UI context (active preferred; else past_due for recovery banner)
+  const subscription = (await getActiveSubscriptionForUser(userId)) || (await getLatestPastDueSubscriptionForUser(userId));
+  const planType = subscription?.status === 'active' && subscription?.plan_type ? subscription.plan_type : 'free';
   const pinUsageBucket = pinUsageBucketForPlan(planType);
   const planPinsLimit = planAiPinsLimit(subscription);
   const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(subscription);
@@ -9025,9 +9061,9 @@ app.post('/api/dodo/webhook', async (req, res) => {
     const eventType = String(event.type || event.event_type || event.name || '').toLowerCase();
     const dataObj = event?.data?.object || event?.data || event?.payload || {};
     const metadata = dataObj?.metadata || event?.metadata || {};
-    const userId = String(metadata?.supabase_user_id || '').trim();
-    const planType = String(metadata?.app_plan_type || metadata?.plan_type || '').trim();
-    const billingInterval = normalizeBillingInterval(metadata?.app_billing_interval || metadata?.billing_interval || 'month');
+    const userIdFromMeta = String(metadata?.supabase_user_id || '').trim();
+    const planTypeFromMeta = String(metadata?.app_plan_type || metadata?.plan_type || '').trim();
+    const billingIntervalFromMeta = normalizeBillingInterval(metadata?.app_billing_interval || metadata?.billing_interval || 'month');
     const dodoSubId = extractDodoSubscriptionIdForWebhook(eventType, dataObj);
     const periodStartRaw =
       dataObj?.current_period_start ||
@@ -9070,18 +9106,36 @@ app.post('/api/dodo/webhook', async (req, res) => {
         });
         return res.json({ ok: true, ignored: true, reason: 'not_paid_or_not_active', eventType });
       }
+      let userId = userIdFromMeta;
+      if (!userId && dodoSubId) {
+        userId = await lookupUserIdByDodoSubscriptionId(dodoSubId);
+      }
       if (!userId) {
-        console.warn('dodo webhook activation ignored: missing supabase_user_id metadata', { eventType });
+        console.warn('dodo webhook activation ignored: missing user id (metadata + lookup failed)', { eventType, dodoSubId });
         return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
       }
+
+      let planType = planTypeFromMeta;
+      let billingInterval = billingIntervalFromMeta;
       if (!planType || !PLAN_PIN_LIMITS[planType]) {
-        console.warn('dodo webhook activation ignored: missing/invalid plan metadata', {
+        const local = dodoSubId ? await lookupLocalSubscriptionByDodoSubscriptionId(dodoSubId) : null;
+        const localPlan = String(local?.plan_type || '').trim();
+        if (localPlan && PLAN_PIN_LIMITS[localPlan]) {
+          planType = localPlan;
+        }
+        const localInterval = normalizeBillingInterval(local?.billing_interval || '');
+        if (localInterval) billingInterval = localInterval;
+      }
+      if (!planType || !PLAN_PIN_LIMITS[planType]) {
+        console.warn('dodo webhook activation ignored: missing/invalid plan (metadata + local lookup failed)', {
           eventType,
           userId,
-          planType,
+          dodoSubId,
+          planTypeFromMeta,
         });
         return res.json({ ok: true, ignored: true, reason: 'missing_plan_metadata' });
       }
+
       // Idempotency: if this exact Dodo subscription is already active for this user+plan, just backfill fields.
       if (dodoSubId) {
         const { data: existing } = await supabaseAdmin
