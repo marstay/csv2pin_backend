@@ -8466,6 +8466,70 @@ app.get('/api/account/usage', requireUser, async (req, res) => {
   }
 });
 
+// Hosted billing recovery flow (update payment method) for failed renewals.
+// Uses Dodo "update payment method" which returns a payment_link to redirect the customer.
+app.post('/api/account/update-payment-method', requireUser, async (req, res) => {
+  try {
+    if (!DODO_API_KEY) {
+      return res.status(400).json({ error: 'Billing provider is not configured.' });
+    }
+
+    const { data: sub, error } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id, status, dodo_subscription_id')
+      .eq('user_id', req.user.id)
+      .in('status', ['active', 'past_due'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to load subscription.' });
+    }
+
+    const dodoSubId = String(sub?.dodo_subscription_id || '').trim();
+    if (!dodoSubId) {
+      return res.status(400).json({ error: 'No billing subscription found for this account.' });
+    }
+
+    // Compute frontend base (strip any /app or deeper path)
+    let frontendBase = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
+    try {
+      const u = new URL(frontendBase);
+      frontendBase = `${u.protocol}//${u.host}`;
+    } catch {
+      frontendBase = frontendBase.replace(/\/app\/?$/, '');
+    }
+
+    const returnUrl = `${frontendBase.replace(/\/$/, '')}/my-account`;
+
+    const resp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(dodoSubId)}/update-payment-method`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DODO_API_KEY}`,
+      },
+      body: JSON.stringify({ type: 'new', return_url: returnUrl }),
+    });
+
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      console.error('Dodo update payment method error:', resp.status, json);
+      return res.status(502).json({ error: 'Failed to start payment method update.', details: json });
+    }
+
+    const url = json.payment_link || json.link || json.url || null;
+    if (!url) {
+      return res.status(502).json({ error: 'Billing provider did not return a redirect link.', details: json });
+    }
+
+    return res.json({ ok: true, url });
+  } catch (err) {
+    console.error('account/update-payment-method error:', err);
+    return res.status(500).json({ error: 'Failed to start payment method update.', details: err.message || String(err) });
+  }
+});
+
 app.get('/api/account/plan', requireUser, async (req, res) => {
   try {
     const planType = await resolvePlanTypeForUser(req.user.id);

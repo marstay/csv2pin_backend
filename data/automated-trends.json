@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-05-21T12:55:20.192Z",
+  "generatedAt": "2026-05-22T08:46:51.366Z",
   "season": "Spring",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -196,28 +196,64 @@
       },
       "suggestions": [
         {
-          "id": "amazon-search-0",
-          "title": "graduation nails",
-          "url": "https://www.amazon.com/s?k=graduation%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GT8XM7KK",
+          "title": "White Embossed Flower Press On Nails Almond Medium Fake Nails With Rhinestone Chain Design French Nail Press Ons Pink Gl",
+          "url": "https://www.amazon.com/dp/B0GT8XM7KK",
+          "imageUrl": "https://m.media-amazon.com/images/I/61HMvQP3weL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-1",
-          "title": "graduation nails gifts",
-          "url": "https://www.amazon.com/s?k=graduation%20nails%20gifts",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0G51DJB5R",
+          "title": "BTArtbox Press On Nails Short - Dew-Kissed Bud, Easy-to-Apply 3D Flower Pink Almond Press On Nails with Glue and Adhesiv",
+          "url": "https://www.amazon.com/dp/B0G51DJB5R",
+          "imageUrl": "https://m.media-amazon.com/images/I/71wZg0Pf-jL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-2",
-          "title": "best graduation nails",
-          "url": "https://www.amazon.com/s?k=best%20graduation%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0FMF7W9D9",
+          "title": "Handmade Press On Nails – Short Almond False Nails for Women, Reusable Acrylic White French Tip with Pearl & 3D Flowers ",
+          "url": "https://www.amazon.com/dp/B0FMF7W9D9",
+          "imageUrl": "https://m.media-amazon.com/images/I/71kKDDXU+NL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-3",
-          "title": "graduation nails ideas",
-          "url": "https://www.amazon.com/s?k=graduation%20nails%20ideas",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GJDGZTB6",
+          "title": "24Pcs 3D Bow Press on Nails Medium Almond French Tip Fake Nails with Gilding Line Design Gold Cute Bow Rhinestones False",
+          "url": "https://www.amazon.com/dp/B0GJDGZTB6",
+          "imageUrl": "https://m.media-amazon.com/images/I/61XduiJTd9L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0D6VDZM58",
+          "title": "24pcs Short Square Press on Nails French Tip Fake Nails White Flower with Star Design Glitter False Nails Luxury Nail Ch",
+          "url": "https://www.amazon.com/dp/B0D6VDZM58",
+          "imageUrl": "https://m.media-amazon.com/images/I/71ywIiVFpYL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F99GWSCS",
+          "title": "Nail Technician Appreciation Gift, Acrylic Desk Sign with Floral Design and Thank You Message, Rustic Wood Base Decor fo",
+          "url": "https://www.amazon.com/dp/B0F99GWSCS",
+          "imageUrl": "https://m.media-amazon.com/images/I/71PaODwJqNL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0FCG69B6W",
+          "title": "Nail Tech Gifts for Women Nail Tech Decor Manicurist Keychain for Women Nails Technician Gifts Birthday Gift for Beautic",
+          "url": "https://www.amazon.com/dp/B0FCG69B6W",
+          "imageUrl": "https://m.media-amazon.com/images/I/61jDfryhFHL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GC5L6T63",
+          "title": "GSPY Scented Candle - Nail Tech Gifts for Women, Men - Nail Technician Gifts, Salon Decor - Funny Birthday, Appreciation",
+          "url": "https://www.amazon.com/dp/B0GC5L6T63",
+          "imageUrl": "https://m.media-amazon.com/images/I/71deW872UoL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0CXXDFCB3",
+          "title": "Nail Technician Gift Nail Artist Appreciation Gift for Women Makeup Bag Manicurist Gifts Graduation Gifts Cosmetic Bag N",
+          "url": "https://www.amazon.com/dp/B0CXXDFCB3",
+          "imageUrl": "https://m.media-amazon.com/images/I/71pp1X3DxtL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F3WWFT9W",
+          "title": "10Pcs Manicure Keychain Alloy Nail Polish Manicure Tool Hands and Feet Charm Keyrings for Manicurist Nail Stylist Nail T",
+          "url": "https://www.amazon.com/dp/B0F3WWFT9W",
+          "imageUrl": "https://m.media-amazon.com/images/I/71vHdNQjukL._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"
@@ -303,64 +339,28 @@
       },
       "suggestions": [
         {
-          "id": "B0FX1WK6SG",
-          "title": "Summer Press on Nails - 3D French Tip with Flowers & Shell Design on Medium Almond Glossy Nails, Full Cover 24PCS",
-          "url": "https://www.amazon.com/dp/B0FX1WK6SG",
-          "imageUrl": "https://m.media-amazon.com/images/I/61aJO05QmHL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "summer nails 2026",
+          "url": "https://www.amazon.com/s?k=summer%20nails%202026",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GVYMK7MT",
-          "title": "30Pcs Summer Beach Short Almond Press On Nails Pink Floral Starfish French Tips Fake Nails with 3D Flower & Pearl Decor ",
-          "url": "https://www.amazon.com/dp/B0GVYMK7MT",
-          "imageUrl": "https://m.media-amazon.com/images/I/81ETwWKlO8L._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "summer nails 2026 gifts",
+          "url": "https://www.amazon.com/s?k=summer%20nails%202026%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0F8HL6JR3",
-          "title": "24Pcs Almond Press on Nails Flower Summer Fake Nails with 3D Floral Designs French Tip Pink Acrylic False Nail Cute Glue",
-          "url": "https://www.amazon.com/dp/B0F8HL6JR3",
-          "imageUrl": "https://m.media-amazon.com/images/I/51IcoJSStNL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best summer nails 2026",
+          "url": "https://www.amazon.com/s?k=best%20summer%20nails%202026",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GSY23GVT",
-          "title": "24Pcs Summer Press on Nails Medium Almond Fake Nails 3D Cute Fish Lemon False Nails Reusable Bohemia Designs French Tip ",
-          "url": "https://www.amazon.com/dp/B0GSY23GVT",
-          "imageUrl": "https://m.media-amazon.com/images/I/71SOqj84xML._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0FJKYN5RX",
-          "title": "Cute Press on Nails Medium Almond Press Ons Nude with Whale Shark Desgins 3d Gel French Tips Summer Vacation Nail for Wo",
-          "url": "https://www.amazon.com/dp/B0FJKYN5RX",
-          "imageUrl": "https://m.media-amazon.com/images/I/71qDTqIgnmL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GDCX4JKD",
-          "title": "Modelones Gel Nail Polish Set, 6 Colors 2026 Summer Clear Blue Blooming Gel Polish Creamy White Pastel Yellow Pink Orang",
-          "url": "https://www.amazon.com/dp/B0GDCX4JKD",
-          "imageUrl": "https://m.media-amazon.com/images/I/712XXuh4OBL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F834HFCB",
-          "title": "30Pcs Summer Press on Nails Medium Almond Fake Nails with 3D Starfish Designs, 30pcs Beach Press on Nails, 1pc Nail File",
-          "url": "https://www.amazon.com/dp/B0F834HFCB",
-          "imageUrl": "https://m.media-amazon.com/images/I/71-hSr4gfyL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0FLDLFVDP",
-          "title": "HOSAILY Pink Press on Nails Short Almond Milky Butter Yellow French Tip Pink Ombre 3D Flower Gold Starfish Rhinestone Go",
-          "url": "https://www.amazon.com/dp/B0FLDLFVDP",
-          "imageUrl": "https://m.media-amazon.com/images/I/71m4KbLo0oL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0G1397Q5B",
-          "title": "CTTHNBD Medium Press on Nails Almond - French Tip Fake Nails with Shell Star Design - Summer, Flower False Nails Press o",
-          "url": "https://www.amazon.com/dp/B0G1397Q5B",
-          "imageUrl": "https://m.media-amazon.com/images/I/61RxBYfNoUL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GHJLPMFJ",
-          "title": "30Pcs Summer Press on Nails Medium Almond French Tip Fake Nails with 3D Ocean Seashell Starfish Designs Yellow Flower Fa",
-          "url": "https://www.amazon.com/dp/B0GHJLPMFJ",
-          "imageUrl": "https://m.media-amazon.com/images/I/71cN664CJtL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "summer nails 2026 ideas",
+          "url": "https://www.amazon.com/s?k=summer%20nails%202026%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -615,7 +615,7 @@
           "2025-07-18": 45,
           "2025-07-25": 46,
           "2025-08-01": 46,
-          "2025-08-08": 42,
+          "2025-08-08": 43,
           "2025-08-15": 41,
           "2025-08-22": 43,
           "2025-08-29": 41,
@@ -2093,7 +2093,7 @@
           "2026-04-10": 55,
           "2026-04-17": 72,
           "2026-04-24": 87,
-          "2026-05-01": 98,
+          "2026-05-01": 99,
           "2026-05-08": 97,
           "2026-05-15": 100
         }
@@ -2337,7 +2337,7 @@
           "2026-04-24": 85,
           "2026-05-01": 98,
           "2026-05-08": 100,
-          "2026-05-15": 97
+          "2026-05-15": 96
         }
       },
       "suggestions": [
