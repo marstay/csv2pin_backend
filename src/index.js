@@ -75,6 +75,277 @@ function resolvePartnerDiscountCode(referralKey) {
   }
 }
 
+const DEFAULT_AFFILIATE_COMMISSION_RATE = Math.min(
+  1,
+  Math.max(0, Number(process.env.AFFILIATE_COMMISSION_RATE || '0.30') || 0.3)
+);
+
+/** Default recurring commission window per referred customer (months). 0 = first payment only. */
+const DEFAULT_AFFILIATE_RECURRING_MONTHS = Math.max(
+  0,
+  Math.floor(Number(process.env.AFFILIATE_RECURRING_MONTHS || '12') || 12)
+);
+
+function getRecurringMonthsForAffiliate(affiliate) {
+  const raw = affiliate?.recurring_months;
+  if (raw !== null && raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
+  }
+  return DEFAULT_AFFILIATE_RECURRING_MONTHS;
+}
+
+function parseAffiliateAdminEmails() {
+  return String(process.env.AFFILIATE_ADMIN_EMAILS || process.env.ADMIN_EMAIL || '')
+    .split(',')
+    .map((e) => normalizeEmail(e))
+    .filter(Boolean);
+}
+
+function isAffiliateAdminUser(user) {
+  const email = normalizeEmail(user?.email);
+  if (!email) return false;
+  const admins = parseAffiliateAdminEmails();
+  return admins.length > 0 && admins.includes(email);
+}
+
+function requireAffiliateAdmin(req, res, next) {
+  if (!isAffiliateAdminUser(req.user)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  return next();
+}
+
+function normalizeAffiliateSlug(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s || !/^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(s)) return null;
+  return s;
+}
+
+async function getActiveAffiliateBySlug(slug) {
+  const s = normalizeAffiliateSlug(slug);
+  if (!s) return null;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('affiliates')
+      .select('id, slug, email, user_id, commission_rate, status, payout_email, display_name, recurring_months')
+      .eq('slug', s)
+      .eq('status', 'active')
+      .maybeSingle();
+    if (error) {
+      console.warn('getActiveAffiliateBySlug error:', error.message || error);
+      return null;
+    }
+    return data || null;
+  } catch (e) {
+    console.warn('getActiveAffiliateBySlug unexpected:', e?.message || e);
+    return null;
+  }
+}
+
+async function resolveAffiliateSlugForUser(userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return null;
+  try {
+    const { data } = await supabaseAdmin
+      .from('profiles')
+      .select('referred_by_affiliate_slug')
+      .eq('id', uid)
+      .maybeSingle();
+    return normalizeAffiliateSlug(data?.referred_by_affiliate_slug);
+  } catch {
+    return null;
+  }
+}
+
+async function attachAffiliateReferralToUser(userId, slug) {
+  const uid = String(userId || '').trim();
+  const affiliate = await getActiveAffiliateBySlug(slug);
+  if (!uid || !affiliate) return { ok: false, reason: 'invalid_slug' };
+  if (affiliate.user_id && String(affiliate.user_id) === uid) {
+    return { ok: false, reason: 'self_referral' };
+  }
+  try {
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('referred_by_affiliate_slug')
+      .eq('id', uid)
+      .maybeSingle();
+    if (profile?.referred_by_affiliate_slug) {
+      return { ok: true, alreadySet: true, slug: profile.referred_by_affiliate_slug };
+    }
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({
+        referred_by_affiliate_slug: affiliate.slug,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', uid);
+    if (error) return { ok: false, reason: 'update_failed', details: error.message };
+    return { ok: true, slug: affiliate.slug };
+  } catch (e) {
+    return { ok: false, reason: 'unexpected', details: e?.message || String(e) };
+  }
+}
+
+function extractDodoPaymentAmountCents(dataObj) {
+  const o = dataObj || {};
+  const candidates = [
+    o.amount_cents,
+    o.total_amount_cents,
+    o.amount,
+    o.total_amount,
+    o.payment_amount,
+    o.payment_amount_cents,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (n < 1000 && !String(c).includes('cent')) return Math.round(n * 100);
+    return Math.round(n);
+  }
+  return 0;
+}
+
+function extractDodoPaymentId(dataObj) {
+  const o = dataObj || {};
+  return String(o.payment_id || o.id || o.paymentId || '').trim() || null;
+}
+
+async function affiliateCommissionWindowAllows(affiliate, referredUserId) {
+  const months = getRecurringMonthsForAffiliate(affiliate);
+  const { data: rows } = await supabaseAdmin
+    .from('affiliate_commissions')
+    .select('id, created_at')
+    .eq('affiliate_id', affiliate.id)
+    .eq('referred_user_id', referredUserId)
+    .order('created_at', { ascending: true })
+    .limit(1);
+  if (!rows?.length) return { ok: true, recurringMonths: months };
+  if (months <= 0) return { ok: false, reason: 'first_payment_only' };
+  const firstAt = new Date(rows[0].created_at);
+  if (!Number.isFinite(firstAt.getTime())) return { ok: true, recurringMonths: months };
+  const windowEnd = new Date(firstAt);
+  windowEnd.setMonth(windowEnd.getMonth() + months);
+  if (Date.now() > windowEnd.getTime()) {
+    return { ok: false, reason: 'recurring_window_expired', recurringMonths: months };
+  }
+  return { ok: true, recurringMonths: months };
+}
+
+async function resolveBillingIntervalForAffiliateCommission(userId, opts = {}) {
+  let interval = normalizeBillingInterval(opts.billingInterval || '');
+  if (interval) return interval;
+  const dodoSubId = String(opts.dodoSubscriptionId || '').trim();
+  if (dodoSubId) {
+    const local = await lookupLocalSubscriptionByDodoSubscriptionId(dodoSubId);
+    interval = normalizeBillingInterval(local?.billing_interval || '');
+    if (interval) return interval;
+    if (DODO_API_KEY) {
+      const dodoGet = await fetchDodoSubscriptionJson(dodoSubId);
+      const productId = String(dodoGet.json?.product_id || dodoGet.json?.productId || '').trim();
+      if (productId) {
+        interval = inferBillingIntervalFromDodoProductId(productId);
+        if (interval) return interval;
+      }
+    }
+  }
+  const uid = String(userId || '').trim();
+  if (uid) {
+    try {
+      const { data: sub } = await supabaseAdmin
+        .from('billing_subscriptions')
+        .select('billing_interval')
+        .eq('user_id', uid)
+        .in('status', ['active', 'past_due'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      interval = normalizeBillingInterval(sub?.billing_interval || '');
+    } catch {
+      /* ignore */
+    }
+  }
+  return interval || '';
+}
+
+/**
+ * Record affiliate commission on paid subscription (first payment + renewals within window).
+ * Commissions apply to monthly billing only (not annual plans).
+ */
+async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opts = {}) {
+  const uid = String(userId || '').trim();
+  if (!uid || !planType || planType === 'free') return { ok: false, reason: 'invalid_input' };
+
+  const billingInterval = await resolveBillingIntervalForAffiliateCommission(uid, opts);
+  if (billingInterval !== 'month') {
+    return { ok: false, reason: 'commission_monthly_plans_only', billingInterval: billingInterval || 'unknown' };
+  }
+
+  const slug =
+    normalizeAffiliateSlug(opts.referralSlugFromMetadata) || (await resolveAffiliateSlugForUser(uid));
+  if (!slug) return { ok: false, reason: 'no_referral' };
+
+  const affiliate = await getActiveAffiliateBySlug(slug);
+  if (!affiliate) return { ok: false, reason: 'inactive_affiliate' };
+  if (affiliate.user_id && String(affiliate.user_id) === uid) {
+    return { ok: false, reason: 'self_referral' };
+  }
+
+  const paymentId = opts.paymentId || null;
+
+  try {
+    if (paymentId) {
+      const { data: dupPay } = await supabaseAdmin
+        .from('affiliate_commissions')
+        .select('id')
+        .eq('payment_id', paymentId)
+        .maybeSingle();
+      if (dupPay?.id) return { ok: true, duplicate: true };
+    }
+
+    const windowCheck = await affiliateCommissionWindowAllows(affiliate, uid);
+    if (!windowCheck.ok) return { ok: false, reason: windowCheck.reason };
+
+    const rate = Math.min(
+      1,
+      Math.max(0, Number(affiliate.commission_rate) || DEFAULT_AFFILIATE_COMMISSION_RATE)
+    );
+    const amountCents = Math.max(0, Number(opts.amountCents || 0) || 0);
+    const commissionCents = amountCents > 0 ? Math.round(amountCents * rate) : 0;
+
+    const { error: insErr } = await supabaseAdmin.from('affiliate_commissions').insert({
+      affiliate_id: affiliate.id,
+      referred_user_id: uid,
+      plan_type: planType,
+      payment_id: paymentId,
+      dodo_subscription_id: opts.dodoSubscriptionId || null,
+      amount_cents: amountCents,
+      commission_cents: commissionCents,
+      currency: String(opts.currency || 'usd').toLowerCase(),
+      status: 'pending',
+      commission_kind: opts.commissionKind || 'subscription',
+    });
+    if (insErr) {
+      if (insErr.code === '23505') return { ok: true, duplicate: true };
+      console.warn('recordAffiliateCommission insert error:', insErr.message || insErr);
+      return { ok: false, reason: 'insert_failed' };
+    }
+    console.log('affiliate: commission recorded', {
+      affiliateSlug: affiliate.slug,
+      userId: uid,
+      planType,
+      amountCents,
+      commissionCents,
+      recurringMonths: windowCheck.recurringMonths,
+    });
+    return { ok: true, affiliateSlug: affiliate.slug, commissionCents };
+  } catch (e) {
+    console.warn('recordAffiliateCommission unexpected:', e?.message || e);
+    return { ok: false, reason: 'unexpected' };
+  }
+}
+
 // --- Plan & usage helpers (pin_usage / metadata_usage) ---
 
 const PLAN_PIN_LIMITS = {
@@ -8259,7 +8530,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       return res.status(500).json({ error: 'Dodo Payments API key not configured' });
     }
 
-    const { planType, billingInterval: rawBillingInterval, discountCode, couponCode, referralKey, affonsoReferral } = req.body || {};
+    const { planType, billingInterval: rawBillingInterval, discountCode, couponCode, referralKey } = req.body || {};
     if (!planType) {
       return res.status(400).json({ error: 'Missing planType' });
     }
@@ -8370,13 +8641,11 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       }
     }
 
-    const referralSlug = String(referralKey || '')
-      .trim()
-      .toLowerCase();
+    const referralSlug = normalizeAffiliateSlug(referralKey) || '';
 
-    const affonso_referral = String(affonsoReferral || '')
-      .trim()
-      .slice(0, 256);
+    if (referralSlug && req.user?.id) {
+      await attachAffiliateReferralToUser(req.user.id, referralSlug);
+    }
 
     // Dodo checkout expects the human-readable discount *code* (e.g. LAUNCH20), not the dashboard id (dsc_...).
     // Priority: typed coupon → partner ?ref= slug map → global env default.
@@ -8428,7 +8697,6 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
         app_plan_type: planType,
         app_billing_interval: billingInterval,
         ...(referralSlug ? { referral_key: referralSlug } : {}),
-        ...(affonso_referral ? { affonso_referral } : {}),
       },
     // Redirect back to app after success/failure
     return_url: `${frontendBase.replace(/\/$/, '')}/payment-success?plan=${encodeURIComponent(planType)}&interval=${encodeURIComponent(billingInterval)}`,
@@ -8499,6 +8767,280 @@ app.get('/api/account/usage', requireUser, async (req, res) => {
   } catch (err) {
     console.error('account/usage error:', err);
     return res.status(500).json({ error: 'Failed to load account usage' });
+  }
+});
+
+app.post('/api/referral/attach', requireUser, async (req, res) => {
+  try {
+    const slug = normalizeAffiliateSlug(req.body?.slug);
+    if (!slug) return res.status(400).json({ error: 'Invalid referral slug' });
+    const result = await attachAffiliateReferralToUser(req.user.id, slug);
+    if (!result.ok && result.reason === 'self_referral') {
+      return res.status(400).json({ error: 'You cannot use your own referral link.' });
+    }
+    if (!result.ok) return res.status(400).json({ error: 'Invalid or inactive referral link.' });
+    return res.json({ ok: true, slug: result.slug, alreadySet: Boolean(result.alreadySet) });
+  } catch (err) {
+    console.error('referral/attach error:', err);
+    return res.status(500).json({ error: 'Failed to attach referral' });
+  }
+});
+
+async function findAffiliateRowForUser(userId, email) {
+  const { data: byUser } = await supabaseAdmin
+    .from('affiliates')
+    .select('id, slug, email, display_name, commission_rate, status, payout_email, user_id, recurring_months')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (byUser) return byUser;
+  if (!email) return null;
+  const { data: byEmail } = await supabaseAdmin
+    .from('affiliates')
+    .select('id, slug, email, display_name, commission_rate, status, payout_email, user_id, recurring_months')
+    .ilike('email', email)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (byEmail && !byEmail.user_id) {
+    await supabaseAdmin
+      .from('affiliates')
+      .update({ user_id: userId, updated_at: new Date().toISOString() })
+      .eq('id', byEmail.id);
+    byEmail.user_id = userId;
+  }
+  return byEmail || null;
+}
+
+app.post('/api/affiliate/apply', requireUser, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.user?.email);
+    if (!email) {
+      return res.status(400).json({ error: 'Your account must have an email address to apply.' });
+    }
+    const slug = normalizeAffiliateSlug(req.body?.slug);
+    const displayName = String(req.body?.displayName || req.body?.display_name || '').trim().slice(0, 120);
+    const payoutEmail = normalizeEmail(req.body?.payoutEmail || req.body?.payout_email) || email;
+    if (!slug) {
+      return res.status(400).json({
+        error: 'Invalid referral slug. Use 3–32 characters: lowercase letters, numbers, and hyphens (e.g. jane-pins).',
+      });
+    }
+
+    const existing = await findAffiliateRowForUser(req.user.id, email);
+    if (existing?.status === 'active') {
+      return res.status(400).json({ error: 'You already have an active partner account.' });
+    }
+    if (existing?.status === 'pending') {
+      return res.json({ ok: true, status: 'pending', message: 'Your application is already pending review.' });
+    }
+
+    const { data: slugTaken } = await supabaseAdmin
+      .from('affiliates')
+      .select('id, status')
+      .eq('slug', slug)
+      .maybeSingle();
+    if (slugTaken) {
+      return res.status(409).json({ error: 'This referral slug is already taken. Choose another.' });
+    }
+
+    const now = new Date().toISOString();
+    if (existing?.id && existing.status === 'disabled') {
+      const { error: updErr } = await supabaseAdmin
+        .from('affiliates')
+        .update({
+          slug,
+          email,
+          display_name: displayName || slug,
+          payout_email: payoutEmail,
+          status: 'pending',
+          user_id: req.user.id,
+          updated_at: now,
+        })
+        .eq('id', existing.id);
+      if (updErr) {
+        return res.status(500).json({ error: 'Failed to submit application' });
+      }
+      return res.json({ ok: true, status: 'pending', message: 'Application resubmitted. We will review it shortly.' });
+    }
+
+    const { error: insErr } = await supabaseAdmin.from('affiliates').insert({
+      slug,
+      email,
+      display_name: displayName || slug,
+      payout_email: payoutEmail,
+      user_id: req.user.id,
+      status: 'pending',
+      commission_rate: DEFAULT_AFFILIATE_COMMISSION_RATE,
+      recurring_months: null,
+      created_at: now,
+      updated_at: now,
+    });
+    if (insErr) {
+      if (insErr.code === '23505') {
+        return res.status(409).json({ error: 'This referral slug or email is already registered.' });
+      }
+      return res.status(500).json({ error: 'Failed to submit application' });
+    }
+    return res.json({
+      ok: true,
+      status: 'pending',
+      message: 'Application received. We will email you when your partner account is approved.',
+    });
+  } catch (err) {
+    console.error('affiliate/apply error:', err);
+    return res.status(500).json({ error: 'Failed to submit application' });
+  }
+});
+
+app.get('/api/affiliate/me', requireUser, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.user?.email);
+    const affiliate = await findAffiliateRowForUser(req.user.id, email);
+    const recurringMonthsDefault = DEFAULT_AFFILIATE_RECURRING_MONTHS;
+
+    if (!affiliate) {
+      return res.json({
+        ok: true,
+        isAffiliate: false,
+        isAdmin: isAffiliateAdminUser(req.user),
+        recurringMonthsDefault,
+      });
+    }
+
+    const status = String(affiliate.status || 'pending');
+    if (status === 'pending') {
+      return res.json({
+        ok: true,
+        isAffiliate: false,
+        applicationStatus: 'pending',
+        isAdmin: isAffiliateAdminUser(req.user),
+        recurringMonthsDefault,
+        message: 'Your partner application is pending approval.',
+      });
+    }
+    if (status === 'disabled') {
+      return res.json({
+        ok: true,
+        isAffiliate: false,
+        applicationStatus: 'disabled',
+        isAdmin: isAffiliateAdminUser(req.user),
+        recurringMonthsDefault,
+        message: 'Your partner application was not approved or was deactivated.',
+      });
+    }
+
+    const slug = affiliate.slug;
+    const recurringMonths = getRecurringMonthsForAffiliate(affiliate);
+    const { count: signups } = await supabaseAdmin
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('referred_by_affiliate_slug', slug);
+
+    const { data: commissions } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .select('id, plan_type, amount_cents, commission_cents, status, created_at, commission_kind')
+      .eq('affiliate_id', affiliate.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    const rows = commissions || [];
+    const pendingCents = rows
+      .filter((r) => r.status === 'pending' || r.status === 'approved')
+      .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
+    const paidCents = rows
+      .filter((r) => r.status === 'paid')
+      .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
+
+    let frontendBase = process.env.FRONTEND_BASE_URL || 'https://url2pin.com';
+    try {
+      const u = new URL(frontendBase);
+      frontendBase = `${u.protocol}//${u.host}`;
+    } catch {
+      frontendBase = frontendBase.replace(/\/app\/?$/, '');
+    }
+    const referralLink = `${frontendBase.replace(/\/$/, '')}/?ref=${encodeURIComponent(slug)}`;
+
+    return res.json({
+      ok: true,
+      isAffiliate: true,
+      applicationStatus: 'active',
+      isAdmin: isAffiliateAdminUser(req.user),
+      affiliate: {
+        slug,
+        displayName: affiliate.display_name || slug,
+        commissionRate: Number(affiliate.commission_rate) || DEFAULT_AFFILIATE_COMMISSION_RATE,
+        payoutEmail: affiliate.payout_email || affiliate.email,
+        recurringMonths,
+      },
+      referralLink,
+      stats: {
+        signups: signups || 0,
+        conversions: rows.length,
+        pendingCommissionCents: pendingCents,
+        paidCommissionCents: paidCents,
+      },
+      commissions: rows,
+      recurringMonthsDefault,
+    });
+  } catch (err) {
+    console.error('affiliate/me error:', err);
+    return res.status(500).json({ error: 'Failed to load affiliate dashboard' });
+  }
+});
+
+app.get('/api/admin/affiliates/pending', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('affiliates')
+      .select('id, slug, email, display_name, payout_email, commission_rate, recurring_months, created_at, user_id')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: 'Failed to load applications' });
+    return res.json({ ok: true, applications: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load applications' });
+  }
+});
+
+app.post('/api/admin/affiliates/:id/approve', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    const now = new Date().toISOString();
+    const { data, error } = await supabaseAdmin
+      .from('affiliates')
+      .update({ status: 'active', updated_at: now })
+      .eq('id', id)
+      .eq('status', 'pending')
+      .select('id, slug, email')
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: 'Failed to approve' });
+    if (!data) return res.status(404).json({ error: 'Application not found or already processed' });
+    return res.json({ ok: true, affiliate: data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to approve' });
+  }
+});
+
+app.post('/api/admin/affiliates/:id/reject', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    const now = new Date().toISOString();
+    const { data, error } = await supabaseAdmin
+      .from('affiliates')
+      .update({ status: 'disabled', updated_at: now })
+      .eq('id', id)
+      .eq('status', 'pending')
+      .select('id, slug, email')
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: 'Failed to reject' });
+    if (!data) return res.status(404).json({ error: 'Application not found or already processed' });
+    return res.json({ ok: true, affiliate: data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to reject' });
   }
 });
 
@@ -9136,6 +9678,20 @@ app.post('/api/dodo/webhook', async (req, res) => {
         return res.json({ ok: true, ignored: true, reason: 'missing_plan_metadata' });
       }
 
+      const referralSlugFromMeta = normalizeAffiliateSlug(metadata?.referral_key);
+      if (referralSlugFromMeta) {
+        await attachAffiliateReferralToUser(userId, referralSlugFromMeta);
+      }
+
+      const affiliateCommissionOpts = {
+        referralSlugFromMetadata: referralSlugFromMeta,
+        billingInterval,
+        amountCents: extractDodoPaymentAmountCents(dataObj),
+        paymentId: extractDodoPaymentId(dataObj),
+        dodoSubscriptionId: dodoSubId,
+        currency: dataObj?.currency || metadata?.currency || 'usd',
+      };
+
       // Idempotency: if this exact Dodo subscription is already active for this user+plan, just backfill fields.
       if (dodoSubId) {
         const { data: existing } = await supabaseAdmin
@@ -9165,6 +9721,15 @@ app.post('/api/dodo/webhook', async (req, res) => {
             })
             .eq('id', existing.id)
             .eq('user_id', userId);
+          if (
+            eventType.includes('payment.succeeded') ||
+            eventType.includes('subscription.renewed')
+          ) {
+            await recordAffiliateCommissionOnPaidSubscription(userId, planType, {
+              ...affiliateCommissionOpts,
+              commissionKind: eventType.includes('subscription.renewed') ? 'renewal' : 'subscription',
+            });
+          }
           return res.json({ ok: true, action: 'noop_already_active', userId, planType });
         }
         // Failed renewal (past_due) then successful charge — reactivate same row, do not insert duplicate.
@@ -9206,6 +9771,17 @@ app.post('/api/dodo/webhook', async (req, res) => {
         console.error('dodo webhook activation failed', { eventType, userId, planType, error: activated.error });
         return res.status(500).json({ error: 'Failed to activate plan from webhook' });
       }
+      if (
+        eventType.includes('payment.succeeded') ||
+        eventType.includes('subscription.activated') ||
+        eventType.includes('subscription.active') ||
+        eventType.includes('subscription.renewed')
+      ) {
+        await recordAffiliateCommissionOnPaidSubscription(userId, planType, {
+          ...affiliateCommissionOpts,
+          commissionKind: eventType.includes('subscription.renewed') ? 'renewal' : 'subscription',
+        });
+      }
       return res.json({ ok: true, action: 'activated', userId, planType });
     }
 
@@ -9215,7 +9791,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
       if (!subId) {
         return res.json({ ok: true, ignored: true, reason: 'payment_failed_no_subscription' });
       }
-      let uid = userId;
+      let uid = userIdFromMeta;
       if (!uid) {
         uid = await lookupUserIdByDodoSubscriptionId(subId);
       }
@@ -9227,7 +9803,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
     }
 
     if (eventType.includes('subscription.on_hold') || eventType.includes('subscription.failed')) {
-      let uid = userId;
+      let uid = userIdFromMeta;
       if (!uid && dodoSubId) {
         uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
       }
@@ -9243,7 +9819,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
     if (cancelAtPeriodEndSignals.some((sig) => eventType.includes(sig))) {
       const st = String(dataObj?.status || '').toLowerCase();
       if (st === 'on_hold' || st === 'failed' || st === 'past_due') {
-        let uid = userId;
+        let uid = userIdFromMeta;
         if (!uid && dodoSubId) {
           uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
         }
@@ -9253,7 +9829,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
         }
       }
       if (dataObj?.cancel_at_next_billing_date === false || dataObj?.cancel_at_period_end === false) {
-        let uid = userId;
+        let uid = userIdFromMeta;
         if (!uid && dodoSubId) {
           uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
         }
@@ -9274,8 +9850,10 @@ app.post('/api/dodo/webhook', async (req, res) => {
         }
       }
       if (dataObj?.cancel_at_next_billing_date === true || dataObj?.cancel_at_period_end === true) {
-        if (!userId) {
-          console.warn('dodo webhook cancel_scheduled ignored: missing supabase_user_id metadata', { eventType });
+        let uid = userIdFromMeta;
+        if (!uid && dodoSubId) uid = await lookupUserIdByDodoSubscriptionId(dodoSubId);
+        if (!uid) {
+          console.warn('dodo webhook cancel_scheduled ignored: missing user id', { eventType });
           return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
         }
         const { error: cancelScheduledErr } = await updateBillingSubscriptionsByTarget(
@@ -9285,36 +9863,38 @@ app.post('/api/dodo/webhook', async (req, res) => {
             ...(dodoSubId ? { dodo_subscription_id: dodoSubId } : {}),
             ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
           },
-          { dodoSubId, userId, activeOnly: true }
+          { dodoSubId, userId: uid, activeOnly: true }
         );
         if (cancelScheduledErr) {
           console.warn('dodo webhook cancel_scheduled update error', {
             eventType,
-            userId,
+            userId: uid,
             dodoSubId,
             error: cancelScheduledErr.message || cancelScheduledErr,
           });
           return res.status(500).json({ error: 'Failed to record scheduled cancellation' });
         }
-        return res.json({ ok: true, action: 'cancel_scheduled', userId });
+        return res.json({ ok: true, action: 'cancel_scheduled', userId: uid });
       }
     }
 
     if (cancelSignals.some((sig) => eventType.includes(sig))) {
+      let uidForCancel = userIdFromMeta;
+      if (!uidForCancel && dodoSubId) uidForCancel = await lookupUserIdByDodoSubscriptionId(dodoSubId);
       const { error: cancelErr } = await updateBillingSubscriptionsByTarget(
         { status: 'cancelled' },
-        { dodoSubId, userId, activeOnly: true }
+        { dodoSubId, userId: uidForCancel, activeOnly: true }
       );
       if (cancelErr) {
         console.warn('dodo webhook cancel update error', {
           eventType,
-          userId,
+          userId: uidForCancel,
           dodoSubId,
           error: cancelErr.message || cancelErr,
         });
         return res.status(500).json({ error: 'Failed to record subscription cancellation' });
       }
-      let uidForProfile = userId;
+      let uidForProfile = uidForCancel;
       if (!uidForProfile && dodoSubId) {
         uidForProfile = await lookupUserIdByDodoSubscriptionId(dodoSubId);
       }
