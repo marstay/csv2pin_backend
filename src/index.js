@@ -1787,7 +1787,10 @@ function respondSupabaseAuth(res, user, err) {
     return null;
   }
   if (err || !user) {
-    res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({
+      error: 'Your session expired. Please sign in again.',
+      code: 'session_expired',
+    });
     return null;
   }
   return user;
@@ -1795,7 +1798,9 @@ function respondSupabaseAuth(res, user, err) {
 
 async function requirePro(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Please sign in to continue.', code: 'auth_required' });
+  }
   const token = authHeader.split(' ')[1];
   const { data: { user }, error } = await supabaseAuthGetUser(token);
   const authed = respondSupabaseAuth(res, user, error);
@@ -6856,6 +6861,17 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       } catch (e) {
         console.warn('urltopin Amazon product images for Nano:', e.message || e);
       }
+      if (nanoBananaReferenceInputs.length === 0) {
+        console.warn(
+          '[urltopin] Amazon product page: no reference images attached this run (pins will use AI-only visuals).',
+          {
+            url: String(amazonCtxUrl).slice(0, 120),
+            rapidApi: !!amazonRapid,
+            rapidImageCount: Array.isArray(amazonRapid?.images) ? amazonRapid.images.length : 0,
+            amazonBlocked: !!base?.amazon_blocked,
+          }
+        );
+      }
     } else if (
       !metadataOnly &&
       usePageReferenceImages &&
@@ -8195,7 +8211,9 @@ app.post('/api/urltopin/download-zip', requireUser, async (req, res) => {
 // Requires authenticated user (Bearer token)
 async function requireUser(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Please sign in to continue.', code: 'auth_required' });
+  }
   const token = authHeader.split(' ')[1];
   const { data: { user }, error } = await supabaseAuthGetUser(token);
   const authed = respondSupabaseAuth(res, user, error);
