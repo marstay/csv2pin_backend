@@ -1337,12 +1337,16 @@ async function resolvePlanTypeForUser(userId) {
   }
 }
 
-/** Local dev only: allow schedule/post-now on free plan when request is from localhost. Never in production. */
-function isLocalhostSchedulingBypass(req) {
+/** Display value for usage API when local dev bypass is active (not enforced as a hard cap). */
+const LOCALHOST_DEV_UNLIMITED_PINS = 999_999;
+
+/** Local dev only: relax scheduling + pin quotas when the app/API request is from localhost. Never in production. */
+function isLocalhostDevBypass(req) {
   if (process.env.NODE_ENV === 'production') return false;
   const flag = String(process.env.ALLOW_LOCALHOST_SCHEDULING || '').toLowerCase();
   if (flag === 'false' || flag === '0') return false;
   if (flag === 'true' || flag === '1') return true;
+  if (req?.headers?.['x-url2pin-localhost-dev'] === '1') return true;
   if (!req) return false;
   const candidates = [
     req.headers?.origin,
@@ -1357,8 +1361,12 @@ function isLocalhostSchedulingBypass(req) {
   return false;
 }
 
+function isLocalhostSchedulingBypass(req) {
+  return isLocalhostDevBypass(req);
+}
+
 async function enforcePaidSchedulingOrThrow(res, userId, req) {
-  if (isLocalhostSchedulingBypass(req)) return true;
+  if (isLocalhostDevBypass(req)) return true;
   const planType = await resolvePlanTypeForUser(userId);
   if (planType === 'free') {
     res.status(402).json({
@@ -1411,15 +1419,18 @@ function pickAmazonContextUrl(inputUrl, canonicalUrl) {
  * @param {string} userId
  * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas, positive consume, negative refund
  */
-async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }) {
+async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, req = null) {
   const key = String(userId);
+  const unlimitedPins = isLocalhostDevBypass(req);
   let promise = pinUsageLocks.get(key);
   const run = async () => {
     const sub = await getActiveSubscriptionForUser(userId);
     const planType = sub?.plan_type || 'free';
     const yearMonth = pinUsageBucketForPlan(planType);
-    const planPinsLimit = planAiPinsLimit(sub);
-    const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(sub);
+    const planPinsLimit = unlimitedPins ? LOCALHOST_DEV_UNLIMITED_PINS : planAiPinsLimit(sub);
+    const planUserPhotoPinsLimit = unlimitedPins
+      ? LOCALHOST_DEV_UNLIMITED_PINS
+      : resolveUserPhotoPinLimitForPlan(sub);
     const baselineAi = Math.max(0, Number(sub?.usage_baseline_pins_used ?? 0) || 0);
     const baselineUserPhoto = Math.max(0, Number(sub?.usage_baseline_user_photo_pins_used ?? 0) || 0);
 
@@ -1603,15 +1614,20 @@ async function recordMetadataUsage(userId, calls = 1) {
   }
 }
 
-async function getCurrentUsageSnapshot(userId) {
+async function getCurrentUsageSnapshot(userId, req = null) {
   const yearMonth = currentYearMonthDate();
+  const localhostUnlimitedPins = isLocalhostDevBypass(req);
 
   // Subscription row for UI context (active preferred; else past_due for recovery banner)
   const subscription = (await getActiveSubscriptionForUser(userId)) || (await getLatestPastDueSubscriptionForUser(userId));
   const planType = subscription?.status === 'active' && subscription?.plan_type ? subscription.plan_type : 'free';
   const pinUsageBucket = pinUsageBucketForPlan(planType);
-  const planPinsLimit = planAiPinsLimit(subscription);
-  const planUserPhotoPinsLimit = resolveUserPhotoPinLimitForPlan(subscription);
+  const planPinsLimit = localhostUnlimitedPins
+    ? LOCALHOST_DEV_UNLIMITED_PINS
+    : planAiPinsLimit(subscription);
+  const planUserPhotoPinsLimit = localhostUnlimitedPins
+    ? LOCALHOST_DEV_UNLIMITED_PINS
+    : resolveUserPhotoPinLimitForPlan(subscription);
   const baselineAi = Math.max(0, Number(subscription?.usage_baseline_pins_used ?? 0) || 0);
   const baselineUserPhoto = Math.max(0, Number(subscription?.usage_baseline_user_photo_pins_used ?? 0) || 0);
 
@@ -1669,6 +1685,7 @@ async function getCurrentUsageSnapshot(userId) {
   const effectiveUserPhotoPinsUsed = Math.max(0, userPhotoPinsUsed - baselineUserPhoto);
 
   return {
+    localhost_dev_unlimited_pins: localhostUnlimitedPins,
     user: {
       id: profile?.id || userId,
       email: profile?.email || null,
@@ -6727,10 +6744,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const pinsToGenerate = effectiveStyles.length;
     const aiPins = metadataOnly || useUserComposite || useTextBased ? 0 : pinsToGenerate;
     const userPhotoPins = metadataOnly ? 0 : useUserComposite || useTextBased ? pinsToGenerate : 0;
-    const usageResult = await applyPinQuotaDelta(req.user.id, {
-      aiDelta: aiPins,
-      userPhotoDelta: userPhotoPins,
-    });
+    const usageResult = await applyPinQuotaDelta(
+      req.user.id,
+      {
+        aiDelta: aiPins,
+        userPhotoDelta: userPhotoPins,
+      },
+      req
+    );
     if (!usageResult.allowed) {
       if (usageResult.limitKind === 'user_photo') {
         return res.status(402).json({
@@ -7582,7 +7603,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const refundUserPhoto = Math.max(0, failedUserPhoto + failedTextBased);
       if (refundAi > 0 || refundUserPhoto > 0) {
         try {
-          await applyPinQuotaDelta(req.user.id, { aiDelta: refundAi ? -refundAi : 0, userPhotoDelta: refundUserPhoto ? -refundUserPhoto : 0 });
+          await applyPinQuotaDelta(
+            req.user.id,
+            { aiDelta: refundAi ? -refundAi : 0, userPhotoDelta: refundUserPhoto ? -refundUserPhoto : 0 },
+            req
+          );
         } catch (e) {
           console.warn('urltopin: quota refund failed:', e?.message || e);
         }
@@ -7754,10 +7779,9 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       usePageReferenceImages: rawUsePageReferenceImages,
     } = req.body || {};
     const usePageReferenceImages = rawUsePageReferenceImages === true;
-    if (!url || !styleId || !overlayText) {
-      return res.status(400).json({ error: 'Missing url, styleId, or overlayText' });
+    if (!url || !styleId) {
+      return res.status(400).json({ error: 'Missing url or styleId' });
     }
-
     const rawUrl = String(url || '').trim();
     let effectiveUrl = rawUrl;
     try {
@@ -7774,9 +7798,21 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
 
     const modeNorm = typeof imageGenerationMode === 'string' ? imageGenerationMode.trim().toLowerCase() : '';
     const textBasedNorm = normalizeTextBasedInput(rawTextBased);
+    const trimmedUserImgEarly = userImageUrl && String(userImageUrl).trim();
+    const overlayNorm =
+      overlayText && typeof overlayText === 'object'
+        ? overlayText
+        : { headline: '', subheadline: '', source: '' };
+    if (
+      modeNorm !== 'text_based' &&
+      !String(overlayNorm.headline || '').trim() &&
+      !trimmedUserImgEarly
+    ) {
+      return res.status(400).json({ error: 'Missing on-image headline text for regenerate' });
+    }
 
     if (modeNorm === 'text_based') {
-      const userQuota = await applyPinQuotaDelta(req.user.id, { userPhotoDelta: 1 });
+      const userQuota = await applyPinQuotaDelta(req.user.id, { userPhotoDelta: 1 }, req);
       if (!userQuota.allowed) {
         return res.status(402).json({
           error: 'user_photo_pin_limit_reached',
@@ -7817,7 +7853,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       } catch (e) {
         console.warn('urltopin regenerate text-based error:', e.message || e);
       }
-      await applyPinQuotaDelta(req.user.id, { userPhotoDelta: -1 });
+      await applyPinQuotaDelta(req.user.id, { userPhotoDelta: -1 }, req);
       return res.status(500).json({ error: 'Failed to render text-based pin' });
     }
 
@@ -7961,7 +7997,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
 
     const trimmedUserImg = userImageUrl && String(userImageUrl).trim();
     if (trimmedUserImg && isAllowedUserImageUrl(trimmedUserImg, process.env.SUPABASE_URL)) {
-      const userQuota = await applyPinQuotaDelta(req.user.id, { userPhotoDelta: 1 });
+      const userQuota = await applyPinQuotaDelta(req.user.id, { userPhotoDelta: 1 }, req);
       if (!userQuota.allowed) {
         return res.status(402).json({
           error: 'user_photo_pin_limit_reached',
@@ -7993,10 +8029,10 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       } catch (e) {
         console.warn('urltopin regenerate user composite error:', e.message || e);
       }
-      await applyPinQuotaDelta(req.user.id, { userPhotoDelta: -1 });
+      await applyPinQuotaDelta(req.user.id, { userPhotoDelta: -1 }, req);
     }
 
-    const aiQuota = await applyPinQuotaDelta(req.user.id, { aiDelta: 1 });
+    const aiQuota = await applyPinQuotaDelta(req.user.id, { aiDelta: 1 }, req);
     if (!aiQuota.allowed) {
       return res.status(402).json({
         error: 'pin_limit_reached',
@@ -8057,13 +8093,13 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
         }
       }
     } catch (e) {
-      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 });
+      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 }, req);
       console.error('urltopin regenerate-image-with-text AI error:', e.message || e);
       return res.status(500).json({ error: e.message || 'Failed to generate image' });
     }
 
     if (!imageUrl) {
-      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 });
+      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 }, req);
       return res.status(500).json({ error: 'Failed to generate image with the provided text' });
     }
 
@@ -8894,7 +8930,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
 
 app.get('/api/account/usage', requireUser, async (req, res) => {
   try {
-    const snapshot = await getCurrentUsageSnapshot(req.user.id);
+    const snapshot = await getCurrentUsageSnapshot(req.user.id, req);
     return res.json(snapshot);
   } catch (err) {
     console.error('account/usage error:', err);
