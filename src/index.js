@@ -1337,7 +1337,28 @@ async function resolvePlanTypeForUser(userId) {
   }
 }
 
-async function enforcePaidSchedulingOrThrow(res, userId) {
+/** Local dev only: allow schedule/post-now on free plan when request is from localhost. Never in production. */
+function isLocalhostSchedulingBypass(req) {
+  if (process.env.NODE_ENV === 'production') return false;
+  const flag = String(process.env.ALLOW_LOCALHOST_SCHEDULING || '').toLowerCase();
+  if (flag === 'false' || flag === '0') return false;
+  if (flag === 'true' || flag === '1') return true;
+  if (!req) return false;
+  const candidates = [
+    req.headers?.origin,
+    req.headers?.referer,
+    req.headers?.host,
+    req.headers?.['x-forwarded-host'],
+  ];
+  for (const raw of candidates) {
+    const h = String(raw || '').toLowerCase();
+    if (h.includes('localhost') || h.includes('127.0.0.1') || h.includes('[::1]')) return true;
+  }
+  return false;
+}
+
+async function enforcePaidSchedulingOrThrow(res, userId, req) {
+  if (isLocalhostSchedulingBypass(req)) return true;
   const planType = await resolvePlanTypeForUser(userId);
   if (planType === 'free') {
     res.status(402).json({
@@ -6191,6 +6212,117 @@ async function maybeAiPinterestBoards(niche, audience, offer, openaiClient) {
   }
 }
 
+function normalizeSchedulerBoardPinSamples(rawPins) {
+  if (!Array.isArray(rawPins)) return [];
+  const out = [];
+  for (const item of rawPins.slice(0, 10)) {
+    const p = item && typeof item === 'object' ? item : {};
+    const title = String(p.title || '').trim();
+    const description = String(p.description || p.excerpt || '').trim();
+    const link = String(p.link || p.url || '').trim();
+    if (!title && !description) continue;
+    out.push({
+      title: title.slice(0, 120),
+      description: description.slice(0, 280),
+      link: link.slice(0, 200),
+    });
+  }
+  return out;
+}
+
+function inferTopicFromPinSamples(samples) {
+  const blob = samples
+    .map((s) => `${s.title} ${s.description}`)
+    .join(' ')
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ');
+  const stop = new Set([
+    'the', 'and', 'for', 'with', 'your', 'this', 'that', 'from', 'into', 'about', 'best', 'how', 'what',
+    'why', 'when', 'tips', 'ideas', 'guide', 'easy', 'simple', 'free', 'pin', 'pins',
+  ]);
+  const freq = new Map();
+  for (const w of blob.split(/\s+/)) {
+    if (w.length < 4 || stop.has(w)) continue;
+    freq.set(w, (freq.get(w) || 0) + 1);
+  }
+  const ranked = [...freq.entries()].sort((a, b) => b[1] - a[1]);
+  if (ranked.length >= 2) {
+    return `${ranked[0][0]} ${ranked[1][0]}`.replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  if (ranked.length === 1) {
+    return ranked[0][0].replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  const firstTitle = samples[0]?.title || '';
+  const words = firstTitle.replace(/[^\w\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2);
+  return words.slice(0, 3).join(' ') || 'Inspiration';
+}
+
+function buildSchedulerBoardSuggestionHeuristic(samples, variationSeed = 0) {
+  const topic = inferTopicFromPinSamples(samples);
+  const seed = Number(variationSeed) || 0;
+  const nameTemplates = [
+    `${topic} Ideas`,
+    `Best ${topic}`,
+    `${topic} Tips & Tricks`,
+    `${topic} Inspiration`,
+    `${topic} Saves`,
+    `${topic} for Pinterest`,
+  ];
+  const name = nameTemplates[Math.abs(seed) % nameTemplates.length].slice(0, 50);
+  const descSamples = samples.map((s) => s.description).filter(Boolean);
+  const descTemplates = [
+    `Save the best ${topic.toLowerCase()} ideas, tips, and inspiration — curated from your latest pins.`,
+    `A focused board for ${topic.toLowerCase()} content worth saving and sharing on Pinterest.`,
+    `Hand-picked ${topic.toLowerCase()} pins to help you plan, save, and post with confidence.`,
+    `Everything ${topic.toLowerCase()} in one place: practical ideas you can use in your next pins.`,
+  ];
+  const description = (
+    descSamples[seed % descSamples.length] ||
+    descTemplates[Math.abs(seed) % descTemplates.length]
+  ).slice(0, 250);
+  return { name, description, topic };
+}
+
+async function maybeAiSchedulerBoardCopy(samples, variationSeed, openaiClient) {
+  if (process.env.SCHEDULER_BOARD_SUGGEST_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) {
+    return null;
+  }
+  try {
+    const seed = Number(variationSeed) || 0;
+    const completion = await openaiClient.chat.completions.create({
+      model: process.env.SCHEDULER_BOARD_SUGGEST_MODEL || process.env.PINTEREST_BOARD_TOOL_MODEL || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Create ONE Pinterest board name and description for pins the user is scheduling.\n` +
+            `Pin samples (JSON): ${JSON.stringify(samples)}\n` +
+            `variation_seed: ${seed} (if > 0, pick a noticeably different angle than a generic board)\n` +
+            `Return JSON only: { "name": string, "description": string }\n` +
+            `Rules:\n` +
+            `- name: 2-6 words, clear niche/topic, no emoji, max 50 characters\n` +
+            `- description: 1-2 sentences, helpful for Pinterest search, max 220 characters, no emoji\n` +
+            `- Must match the theme of the pin samples\n` +
+            `- Do not mention "AI" or "generated"\n`,
+        },
+      ],
+      max_tokens: 220,
+      temperature: seed > 0 ? 0.85 : 0.65,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const name = String(parsed?.name || '').trim().slice(0, 50);
+    const description = String(parsed?.description || '').trim().slice(0, 250);
+    if (!name) return null;
+    return { name, description };
+  } catch (e) {
+    console.warn('maybeAiSchedulerBoardCopy:', e.message || e);
+    return null;
+  }
+}
+
 async function maybeAiPinterestHashtags(topic, niche, openaiClient) {
   if (process.env.PINTEREST_HASHTAG_TOOL_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) return null;
   const t = String(topic || '').trim();
@@ -10488,6 +10620,38 @@ app.get('/api/pinterest/boards', async (req, res) => {
   res.json({ boards });
 });
 
+// Suggest board name + description from pins about to be scheduled (scheduler Create Board modal)
+app.post('/api/pinterest/suggest-board-copy', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split(' ')[1];
+  const { data: { user: authUser }, error: userError } = await supabaseAuthGetUser(token);
+  const user = respondSupabaseAuth(res, authUser, userError);
+  if (!user) return;
+
+  const { pins: rawPins, variation_seed: variationSeed } = req.body || {};
+  const samples = normalizeSchedulerBoardPinSamples(rawPins);
+  if (samples.length === 0) {
+    return res.status(400).json({ error: 'Provide at least one pin with a title or description.' });
+  }
+
+  try {
+    const heuristic = buildSchedulerBoardSuggestionHeuristic(samples, variationSeed);
+    const ai = await maybeAiSchedulerBoardCopy(samples, variationSeed, openai);
+    const name = (ai?.name || heuristic.name).trim();
+    const description = (ai?.description || heuristic.description).trim();
+    return res.json({
+      name,
+      description,
+      topic: heuristic.topic || null,
+      source: ai ? 'ai' : 'heuristic',
+    });
+  } catch (e) {
+    console.error('suggest-board-copy error:', e);
+    return res.status(500).json({ error: 'Failed to suggest board copy' });
+  }
+});
+
 // Create a Pinterest board (name required; optional description, privacy PUBLIC/SECRET)
 app.post('/api/pinterest/create-board', async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -10547,7 +10711,7 @@ app.post('/api/pinterest/create-pin', async (req, res) => {
   const user = respondSupabaseAuth(res, authUser, userError);
   if (!user) return;
 
-  if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
+  if (!(await enforcePaidSchedulingOrThrow(res, user.id, req))) return;
 
   const { image_url, title, description, board_id, link, account_id, alt_text: rawAltText } = req.body;
   if (!image_url || !title || !description || !board_id) {
@@ -10628,25 +10792,31 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   const user = respondSupabaseAuth(res, authUser, userError);
   if (!user) return;
 
-  if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
+  if (!(await enforcePaidSchedulingOrThrow(res, user.id, req))) return;
 
   const { 
     image_url, title, description, board_id, link, account_id,
     scheduled_for, timezone = 'UTC', is_recurring = false, recurrence_pattern,
     force_duplicate = false,
     bake,
-    alt_text: rawAltText
+    alt_text: rawAltText,
+    post_immediately = false
   } = req.body;
 
+  const postImmediately = Boolean(post_immediately);
+
   // Validate required fields
-  if ((!image_url && !bake) || !title || !description || !board_id || !scheduled_for) {
-    return res.status(400).json({ error: 'Missing required fields: image_url (or bake), title, description, board_id, scheduled_for' });
+  if ((!image_url && !bake) || !title || !description || !board_id) {
+    return res.status(400).json({ error: 'Missing required fields: image_url (or bake), title, description, board_id' });
+  }
+  if (!postImmediately && !scheduled_for) {
+    return res.status(400).json({ error: 'Missing required field: scheduled_for' });
   }
 
   // Validate scheduling time
-  const scheduleDate = new Date(scheduled_for);
   const now = new Date();
-  if (scheduleDate <= now) {
+  const scheduleDate = postImmediately ? now : new Date(scheduled_for);
+  if (!postImmediately && scheduleDate <= now) {
     return res.status(400).json({ error: 'Scheduled time must be in the future' });
   }
 
@@ -10787,6 +10957,40 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
     if (insertError) {
       console.error('Error inserting scheduled pin:', insertError);
       return res.status(500).json({ error: 'Failed to schedule pin' });
+    }
+
+    if (postImmediately) {
+      try {
+        await processScheduledPin(scheduledPin);
+      } catch (postErr) {
+        console.error('post_immediately process error:', postErr);
+      }
+      const { data: finalPin, error: finalErr } = await supabaseAdmin
+        .from('scheduled_pins')
+        .select('*')
+        .eq('id', scheduledPin.id)
+        .eq('user_id', user.id)
+        .is('deleted_at', null)
+        .single();
+      const row = finalPin || scheduledPin;
+      const posted = row.status === 'posted';
+      const failed = row.status === 'failed' || row.status === 'error';
+      if (finalErr && !posted) {
+        return res.status(500).json({ error: 'Pin was queued but posting failed', scheduled_pin: row });
+      }
+      if (failed) {
+        return res.status(400).json({
+          error: row.last_error || 'Failed to post pin to Pinterest',
+          scheduled_pin: row,
+          posted: false,
+        });
+      }
+      return res.json({
+        success: true,
+        posted,
+        scheduled_pin: row,
+        message: posted ? 'Pin posted to Pinterest' : `Pin queued (status: ${row.status})`,
+      });
     }
 
     return res.json({
@@ -11164,7 +11368,7 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
   try {
     // If a free user attempts to schedule/unschedule via update, block scheduling-related updates.
     if (scheduled_for || status === 'scheduled') {
-      if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
+      if (!(await enforcePaidSchedulingOrThrow(res, user.id, req))) return;
     }
 
     // First check if pin exists and belongs to user (only active pins)
@@ -11254,7 +11458,7 @@ app.post('/api/pinterest/scheduled-pins/:id/post-now', async (req, res) => {
   const user = respondSupabaseAuth(res, authUser, userError);
   if (!user) return;
 
-  if (!(await enforcePaidSchedulingOrThrow(res, user.id))) return;
+  if (!(await enforcePaidSchedulingOrThrow(res, user.id, req))) return;
 
   const { id } = req.params;
 
