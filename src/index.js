@@ -3256,6 +3256,14 @@ function scoreGenericImageCandidate(urlStr, meta) {
     const u = new URL(urlStr);
     const path = (u.pathname || '').toLowerCase();
     if (/(thumb|thumbnail|small|mini|tiny|\b50x50\b|\b100x100\b)/i.test(path)) s -= 35;
+    if (
+      /(product-images?|\/products\/|item-images?|\/uploads\/|\/media\/|featured-image|hero-image)/i.test(
+        path
+      )
+    ) {
+      s += 28;
+    }
+    if (meta.isMainImage) s += 22;
     const w = meta.width || 0;
     const h = meta.height || 0;
     if (w > 0 && h > 0) {
@@ -3379,13 +3387,18 @@ function extractGenericPageImageUrlsFromHtml(html, pageUrl = '') {
     const srcsetM = /\bsrcset\s*=\s*["']([^"']+)["']/i.exec(tag);
     const wM = /\bwidth\s*=\s*["']?(\d+)/i.exec(tag);
     const hM = /\bheight\s*=\s*["']?(\d+)/i.exec(tag);
+    const idM = /\bid\s*=\s*["']([^"']+)["']/i.exec(tag);
+    const classM = /\bclass\s*=\s*["']([^"']+)["']/i.exec(tag);
     const width = wM ? parseInt(wM[1], 10) : 0;
     const height = hM ? parseInt(hM[1], 10) : 0;
+    const isMainImage =
+      (idM && /(main|img|hero|product)/i.test(idM[1])) ||
+      (classM && /(hero|product|featured|main-img|primary)/i.test(classM[1]));
     const fromSet = srcsetM ? parseSrcsetLargestUrl(srcsetM[1], pageUrl) : null;
     if (fromSet) {
-      pushGenericCandidate(bucket, fromSet, pageUrl, { baseScore: 12, width, height });
+      pushGenericCandidate(bucket, fromSet, pageUrl, { baseScore: 12, width, height, isMainImage });
     } else if (srcM) {
-      pushGenericCandidate(bucket, srcM[1], pageUrl, { baseScore: 8, width, height });
+      pushGenericCandidate(bucket, srcM[1], pageUrl, { baseScore: 8, width, height, isMainImage });
     }
   }
 
@@ -3394,12 +3407,19 @@ function extractGenericPageImageUrlsFromHtml(html, pageUrl = '') {
     const prev = byUrl.get(c.url);
     if (!prev || c.score > prev) byUrl.set(c.url, c.score);
   }
-  return [...byUrl.entries()]
+  let ranked = [...byUrl.entries()]
     .map(([url, score]) => ({ url, score }))
     .filter((x) => x.score >= PAGE_REF_MIN_SCORE)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, PAGE_REF_MAX_CANDIDATES)
-    .map((x) => x.url);
+    .sort((a, b) => b.score - a.score);
+  if (ranked.length === 0 && byUrl.size > 0) {
+    const fallback = [...byUrl.entries()]
+      .map(([url, score]) => ({ url, score }))
+      .sort((a, b) => b.score - a.score)[0];
+    if (fallback && fallback.score >= 8) {
+      ranked = [fallback];
+    }
+  }
+  return ranked.slice(0, PAGE_REF_MAX_CANDIDATES).map((x) => x.url);
 }
 
 async function mirrorGenericPageImageUrlsForNanoBanana(sourceUrls, userId) {
