@@ -1142,11 +1142,86 @@ async function reactivatePastDueSubscriptionRow(userId, localSub) {
 
 async function closePastDueSubscriptionRow(userId, localSub) {
   if (!localSub?.id) return;
+  const now = new Date().toISOString();
   await supabaseAdmin
     .from('billing_subscriptions')
-    .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+    .update({
+      status: 'cancelled',
+      cancel_at_period_end: false,
+      updated_at: now,
+    })
     .eq('id', localSub.id)
     .eq('user_id', userId);
+  const { data: stillActive } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .limit(1);
+  if (!stillActive || stillActive.length === 0) {
+    await supabaseAdmin
+      .from('profiles')
+      .update({ plan_type: 'free', is_pro: false, updated_at: now })
+      .eq('id', userId);
+  }
+}
+
+async function clearFailedBillingForUser(userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return { ok: false, error: 'missing_user_id', closed: 0 };
+  const now = new Date().toISOString();
+  const { data: rows, error } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .select('id, status, dodo_subscription_id')
+    .eq('user_id', uid)
+    .in('status', ['past_due', 'active'])
+    .order('created_at', { ascending: false });
+  if (error) {
+    return { ok: false, error: error.message || 'fetch_failed', closed: 0 };
+  }
+  let closed = 0;
+  for (const row of rows || []) {
+    if (row.status === 'past_due') {
+      await closePastDueSubscriptionRow(uid, row);
+      closed += 1;
+      continue;
+    }
+    if (row.status === 'active') {
+      const dodoSubId = String(row.dodo_subscription_id || '').trim();
+      if (!dodoSubId) {
+        await supabaseAdmin
+          .from('billing_subscriptions')
+          .update({ status: 'cancelled', cancel_at_period_end: false, updated_at: now })
+          .eq('id', row.id)
+          .eq('user_id', uid);
+        closed += 1;
+        continue;
+      }
+      const dodoGet = await fetchDodoSubscriptionJson(dodoSubId);
+      const dodoStatus = String(dodoGet.json?.status || dodoGet.json?.subscription_status || '').trim();
+      if (!dodoGet.ok || dodoSubscriptionIsInactiveStatus(dodoStatus)) {
+        await supabaseAdmin
+          .from('billing_subscriptions')
+          .update({ status: 'cancelled', cancel_at_period_end: false, updated_at: now })
+          .eq('id', row.id)
+          .eq('user_id', uid);
+        closed += 1;
+      }
+    }
+  }
+  const { data: stillActive } = await supabaseAdmin
+    .from('billing_subscriptions')
+    .select('id')
+    .eq('user_id', uid)
+    .eq('status', 'active')
+    .limit(1);
+  if (!stillActive || stillActive.length === 0) {
+    await supabaseAdmin
+      .from('profiles')
+      .update({ plan_type: 'free', is_pro: false, updated_at: now })
+      .eq('id', uid);
+  }
+  return { ok: true, closed };
 }
 
 async function isDodoCheckoutSessionUnpaid(checkoutSessionId) {
@@ -1293,7 +1368,7 @@ async function markBillingSubscriptionPastDueAndDowngradeProfile(userId, dodoSub
 
   let q = supabaseAdmin
     .from('billing_subscriptions')
-    .update({ status: 'past_due', updated_at: now })
+    .update({ status: 'past_due', cancel_at_period_end: false, updated_at: now })
     .eq('user_id', uid)
     .eq('status', 'active');
   if (subId) {
@@ -1620,16 +1695,22 @@ async function getCurrentUsageSnapshot(userId, req = null) {
 
   // Subscription row for UI context (active preferred; else past_due for recovery banner)
   const subscription = (await getActiveSubscriptionForUser(userId)) || (await getLatestPastDueSubscriptionForUser(userId));
-  const planType = subscription?.status === 'active' && subscription?.plan_type ? subscription.plan_type : 'free';
+  const subscriptionActive = subscription?.status === 'active';
+  const planType = subscriptionActive && subscription?.plan_type ? subscription.plan_type : 'free';
   const pinUsageBucket = pinUsageBucketForPlan(planType);
+  const effectiveSubForLimits = subscriptionActive ? subscription : { plan_type: planType };
   const planPinsLimit = localhostUnlimitedPins
     ? LOCALHOST_DEV_UNLIMITED_PINS
-    : planAiPinsLimit(subscription);
+    : planAiPinsLimit(effectiveSubForLimits);
   const planUserPhotoPinsLimit = localhostUnlimitedPins
     ? LOCALHOST_DEV_UNLIMITED_PINS
-    : resolveUserPhotoPinLimitForPlan(subscription);
-  const baselineAi = Math.max(0, Number(subscription?.usage_baseline_pins_used ?? 0) || 0);
-  const baselineUserPhoto = Math.max(0, Number(subscription?.usage_baseline_user_photo_pins_used ?? 0) || 0);
+    : resolveUserPhotoPinLimitForPlan(effectiveSubForLimits);
+  const baselineAi = subscriptionActive
+    ? Math.max(0, Number(subscription?.usage_baseline_pins_used ?? 0) || 0)
+    : 0;
+  const baselineUserPhoto = subscriptionActive
+    ? Math.max(0, Number(subscription?.usage_baseline_user_photo_pins_used ?? 0) || 0)
+    : 0;
 
   // Profile info (for email, created_at, etc.)
   const { data: profile } = await supabaseAdmin
@@ -1698,9 +1779,11 @@ async function getCurrentUsageSnapshot(userId, req = null) {
           billing_interval: subscription.billing_interval || 'month',
           current_period_start: subscription.current_period_start || null,
           current_period_end: subscription.current_period_end || null,
-          cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
+          cancel_at_period_end: subscriptionActive && Boolean(subscription.cancel_at_period_end),
           cancelled_at: subscription.cancelled_at || null,
           dodo_subscription_id: subscription.dodo_subscription_id || null,
+          previous_plan_type:
+            !subscriptionActive && subscription.plan_type ? subscription.plan_type : null,
         }
       : null,
     plan: {
@@ -9311,6 +9394,26 @@ app.post('/api/account/update-payment-method', requireUser, async (req, res) => 
   } catch (err) {
     console.error('account/update-payment-method error:', err);
     return res.status(500).json({ error: 'Failed to start payment method update.', details: err.message || String(err) });
+  }
+});
+
+// Recovery for stuck billing: close any past_due (or provider-inactive) subscription rows
+// so the user can start a clean checkout instead of being trapped in the update-payment loop.
+app.post('/api/account/reset-failed-billing', requireUser, async (req, res) => {
+  try {
+    const result = await clearFailedBillingForUser(req.user.id);
+    if (!result.ok) {
+      return res.status(500).json({ error: 'Failed to reset billing.', details: result.error || null });
+    }
+    return res.json({
+      ok: true,
+      closed: result.closed,
+      message:
+        'Your failed subscription has been cleared. You can now choose a plan and start a fresh checkout from the Pricing page.',
+    });
+  } catch (err) {
+    console.error('account/reset-failed-billing error:', err);
+    return res.status(500).json({ error: 'Failed to reset billing.', details: err.message || String(err) });
   }
 });
 
