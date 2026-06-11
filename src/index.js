@@ -1491,6 +1491,26 @@ function pickAmazonContextUrl(inputUrl, canonicalUrl) {
 }
 
 /**
+ * Manual product override supplied by the user when Amazon (or any page) can't be scraped.
+ * Lets generation proceed from a user-typed title/description + optional uploaded image URLs.
+ * @returns {{title:string, description:string, imageUrls:string[]} | null}
+ */
+function normalizeManualProductOverride(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const title = String(raw.title ?? '').trim().slice(0, 200);
+  const description = String(raw.description ?? '').trim().slice(0, 600);
+  let imageUrls = raw.imageUrls ?? raw.imageUrl ?? [];
+  if (typeof imageUrls === 'string') imageUrls = imageUrls.trim() ? [imageUrls.trim()] : [];
+  if (!Array.isArray(imageUrls)) imageUrls = [];
+  imageUrls = imageUrls
+    .map((u) => (typeof u === 'string' ? u.trim() : ''))
+    .filter(Boolean)
+    .slice(0, 4);
+  if (!title && !description && imageUrls.length === 0) return null;
+  return { title, description, imageUrls };
+}
+
+/**
  * @param {string} userId
  * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas, positive consume, negative refund
  */
@@ -5535,6 +5555,128 @@ const NICHE_VISUAL_HINTS = {
     'Amazon / shopping pins: hero the real product (shape, packaging, context of use); honest worth-it vibe; no fake prices, star ratings, or Amazon UI chrome as invented text.',
 };
 
+/**
+ * Auto-generate a short, catchy headline for a multi-product pin from the product titles.
+ * Falls back to a sensible default if the AI call fails.
+ */
+async function generateMultiProductHeadline({ mode, items, outputLanguage }, openaiClient) {
+  const safeItems = Array.isArray(items) ? items.filter((it) => it && it.title) : [];
+  const titles = safeItems.map((it, i) => `${i + 1}. ${String(it.title).slice(0, 90)}`).join('\n');
+  const count = Math.max(1, safeItems.length);
+  const langLine =
+    outputLanguage && outputLanguage !== 'auto'
+      ? `Write the headline in this language (ISO code): ${outputLanguage}.\n`
+      : '';
+  const fallback =
+    mode === 'comparison'
+      ? (safeItems.length === 2
+          ? `${String(safeItems[0].title).split(/[\s,–-]/)[0]} vs ${String(safeItems[1].title).split(/[\s,–-]/)[0]}: Which Wins?`
+          : 'Which One Should You Buy?')
+      : `${count} Top Picks Worth Buying`;
+  if (!openaiClient || !safeItems.length) return fallback.slice(0, 70);
+  const instruction =
+    mode === 'comparison'
+      ? `Write ONE punchy Pinterest pin headline (max 8 words) comparing these two products. Use a "X vs Y" angle ending in a question or hook. Do not mention any quantity or count. No quotes, no emojis.\n`
+      : `Write ONE punchy Pinterest pin headline (max 8 words) for a product roundup / gift guide of the items below. ` +
+        `There are EXACTLY ${count} product${count === 1 ? '' : 's'}. If the headline includes a number, that number MUST be ${count} — never use any other number. No quotes, no emojis.\n`;
+  try {
+    const completion = await openaiClient.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: `${instruction}${langLine}Products:\n${titles}` }],
+      max_tokens: 40,
+      temperature: 0.8,
+    });
+    let h = String(completion.choices?.[0]?.message?.content || '').trim();
+    h = h.replace(/^["'`\s]+|["'`\s]+$/g, '').replace(/[\r\n]+/g, ' ').slice(0, 80);
+    if (mode !== 'comparison') h = correctHeadlineCount(h, count);
+    return h || fallback.slice(0, 70);
+  } catch (e) {
+    console.warn('multi-product headline generation error:', e.message || e);
+    return fallback.slice(0, 70);
+  }
+}
+
+/**
+ * Safety net: a roundup headline must never claim a count different from the real product count.
+ * Fixes a leading number (digit or spelled-out, e.g. "5 Best…" / "Five Best…") to match `count`.
+ * Only the leading number is touched so mid-headline values like prices ("$100") are left alone.
+ */
+function correctHeadlineCount(text, count) {
+  let t = String(text || '');
+  const words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+  const mDigit = t.match(/^\s*(\d+)\b/);
+  if (mDigit) {
+    if (Number(mDigit[1]) !== count) t = t.replace(/^\s*\d+\b/, String(count));
+    return t.trim();
+  }
+  const mWord = t.match(/^\s*([A-Za-z]+)\b/);
+  if (mWord) {
+    const idx = words.indexOf(mWord[1].toLowerCase());
+    if (idx > 0 && idx !== count) t = t.replace(/^\s*[A-Za-z]+\b/, String(count));
+  }
+  return t.trim();
+}
+
+/**
+ * Nano Banana prompt for multi-product affiliate pins (roundup grid or A-vs-B comparison).
+ * The provided product photos are passed as reference images (imageInput) in the SAME order as `items`,
+ * and the prompt is written to keep numbering exact and to treat similar/same-brand products as distinct cards.
+ */
+function buildMultiProductPinPrompt({ mode, headline, items, footer, brand }) {
+  const safeItems = Array.isArray(items) ? items.filter((it) => it && (it.title || it.imageUrl)) : [];
+  const n = Math.max(1, safeItems.length);
+  const brandColorParts = [];
+  if (brand?.primaryColor) brandColorParts.push(`primary ${brand.primaryColor}`);
+  if (brand?.secondaryColor) brandColorParts.push(`secondary ${brand.secondaryColor}`);
+  if (brand?.accentColor) brandColorParts.push(`accent ${brand.accentColor}`);
+  const paletteHint = brandColorParts.length
+    ? ` Use this brand color palette for the header band, number badges, and accents: ${brandColorParts.join(', ')}.`
+    : '';
+  const footerLine = String(footer || '').trim();
+  const footerHint = footerLine ? ` At the very bottom, add a small footer band with the text "${footerLine}".` : '';
+
+  // Shared rules that protect numbering + product fidelity (most important per product requirements).
+  const fidelityRules =
+    ` CRITICAL RULES: (1) Use the supplied reference photos as the ACTUAL products, in the SAME order given. ` +
+    `(2) Show EXACTLY ${n} product${n === 1 ? '' : 's'} — never add, drop, merge, or duplicate a product. ` +
+    `(3) Some products may look very similar or be from the same brand — still render them as separate, distinct cards in order; do not collapse them into one. ` +
+    `(4) Each product gets its own clean white card with rounded corners and a soft shadow, one product photo per card. ` +
+    `(5) Keep all text crisp, correctly spelled, and high-contrast.`;
+
+  if (mode === 'comparison') {
+    const a = safeItems[0] || {};
+    const b = safeItems[1] || {};
+    return (
+      'Create a vertical 1000x1500 px (2:3) Pinterest pin: a clean, modern side-by-side PRODUCT COMPARISON graphic. ' +
+      `A bold header band across the top shows the title "${String(headline || 'Which one should you buy?').slice(0, 90)}". ` +
+      'Below the header, split the pin into TWO equal columns. ' +
+      `LEFT column = product A: photo of "${String(a.title || 'Option A').slice(0, 80)}" on a card, with a circular "A" badge and the product name as a short label beneath it. ` +
+      `RIGHT column = product B: photo of "${String(b.title || 'Option B').slice(0, 80)}" on a card, with a circular "B" badge and the product name as a short label beneath it. ` +
+      'Place one bold circular "VS" badge in the exact center between the two columns. ' +
+      'Lots of white space, big readable typography, scroll-stopping but uncluttered.' +
+      fidelityRules +
+      paletteHint +
+      footerHint
+    );
+  }
+
+  // roundup / gift guide — numbered list of cards
+  const numberedList = safeItems
+    .map((it, i) => `Card ${i + 1} = "${String(it.title || `Product ${i + 1}`).slice(0, 80)}"`)
+    .join('; ');
+  return (
+    `Create a vertical 1000x1500 px (2:3) Pinterest pin: a clean, modern PRODUCT ROUNDUP / gift-guide graphic with EXACTLY ${n} numbered cards stacked vertically. ` +
+    `A bold header band across the top shows the title "${String(headline || `${n} Top Picks`).slice(0, 90)}". ` +
+    `Below the header, list the ${n} products as ${n} separate rounded cards, top to bottom, in this exact order: ${numberedList}. ` +
+    `Each card has a LARGE, clearly visible NUMBER BADGE in the top-left corner showing its position as a single digit, numbered strictly 1, 2, 3 … ${n} from top to bottom with no skipped, repeated, or out-of-order numbers. ` +
+    `Inside each card: the product photo on the left and the product name as a short label on the right. ` +
+    'Generous spacing between cards, bright, high readability, Pinterest-friendly.' +
+    fidelityRules +
+    paletteHint +
+    footerHint
+  );
+}
+
 function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand, stepCount, niche }) {
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
@@ -6658,15 +6800,22 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
       pinsPerUrl: rawPinsPerUrl,
       outputLanguage: rawOutputLanguage,
       winnerContext: rawWinnerContext,
+      manualProduct: rawManualProduct,
     } = req.body || {};
     if (!url) {
       return res.status(400).json({ error: 'Missing url' });
     }
     const winnerContext = normalizeWinnerContext(rawWinnerContext);
+    const manualProduct = normalizeManualProductOverride(rawManualProduct);
     const requestedCount = Number.parseInt(rawPinsPerUrl ?? rawCount ?? 10, 10);
     const count = [2, 3, 5, 10].includes(requestedCount) ? requestedCount : 10;
     const outputLanguage = String(rawOutputLanguage || '').trim().toLowerCase();
     const { base } = await fetchArticleBaseAndSummary(url, articleData || null, { outputLanguage });
+    if (manualProduct?.title) {
+      base.title = manualProduct.title;
+      if (manualProduct.description) base.description = manualProduct.description.slice(0, 450);
+      base.amazon_blocked = false;
+    }
     let contentProfile = await enrichContentProfile(base, openai, winnerContext);
     try {
       const rawU = String(url || '').trim();
@@ -6714,8 +6863,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       usePageReferenceImages: rawUsePageReferenceImages,
       metadataOnly: rawMetadataOnly,
       winnerContext: rawWinnerContext,
+      manualProduct: rawManualProduct,
     } = req.body || {};
     const winnerContext = normalizeWinnerContext(rawWinnerContext);
+    const manualProduct = normalizeManualProductOverride(rawManualProduct);
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
@@ -6824,11 +6975,24 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           amazonRapid = null;
         }
       }
-      if (!amazonRapid) {
+      if (!amazonRapid && manualProduct?.title) {
+        // User supplied the product details manually (recovery path) — proceed with those.
+        base.title = manualProduct.title;
+        if (manualProduct.description) {
+          base.description = manualProduct.description.slice(0, 450);
+        }
+        const manualSummaryParts = [manualProduct.title, manualProduct.description].filter(Boolean);
+        if (manualSummaryParts.length) {
+          articleSummary = manualSummaryParts.join('. ').slice(0, 600);
+        }
+        base.amazon_blocked = false;
+        base.manual_product_override = true;
+      } else if (!amazonRapid) {
         return res.status(409).json({
           error: 'amazon_blocked',
           message:
-            'Amazon blocked automated access to this product page, so we can’t reliably read the product title/content right now. Please try again later, or use a non-Amazon landing page (your blog post / product page) for this pin.',
+            'Amazon blocked automated access to this product page, so we can’t reliably read the product title/content right now. Enter the product title (and optionally upload a product photo) to build pins anyway, try again later, or use a non-Amazon landing page (your blog post / product page) for this pin.',
+          recoverable: true,
         });
       }
       if (!base.title && typeof amazonRapid.title === 'string' && amazonRapid.title.trim()) {
@@ -6918,12 +7082,34 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       }
     }
+    // Manual recovery: user uploaded a product photo because the page couldn't be scraped.
+    if (
+      !metadataOnly &&
+      !useTextBased &&
+      !useUserComposite &&
+      process.env.USE_DUMMY_IMAGES !== 'true' &&
+      nanoBananaReferenceInputs.length === 0 &&
+      manualProduct?.imageUrls?.length
+    ) {
+      try {
+        nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(
+          manualProduct.imageUrls.slice(0, 3),
+          req.user.id
+        );
+        if (nanoBananaReferenceInputs.length > 0) {
+          nanoBananaReferenceSource = 'manual_product';
+        }
+      } catch (e) {
+        console.warn('urltopin manual product images mirror error:', e.message || e);
+      }
+    }
     if (
       !metadataOnly &&
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       !useTextBased &&
       !useUserComposite &&
       process.env.USE_DUMMY_IMAGES !== 'true' &&
+      nanoBananaReferenceInputs.length === 0 &&
       isAmazonProductPageForNanoReference(amazonCtxUrl)
     ) {
       try {
@@ -8377,6 +8563,394 @@ app.delete('/api/custom-templates/:id', requireUser, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+/** Normalize a brand kit payload to a small, safe shape we persist. */
+function sanitizeBrandKit(raw) {
+  const obj = raw && typeof raw === 'object' ? raw : {};
+  const str = (v, max) => {
+    const s = String(v ?? '').trim();
+    return s ? s.slice(0, max) : '';
+  };
+  return {
+    brandName: str(obj.brandName, 80),
+    logoUrl: str(obj.logoUrl, 1000),
+    primaryColor: str(obj.primaryColor, 32),
+    secondaryColor: str(obj.secondaryColor, 32),
+    accentColor: str(obj.accentColor, 32),
+  };
+}
+
+// Brand kit persistence (stored on profiles.brand_kit jsonb).
+// Gracefully no-ops if the column is missing so the frontend can fall back to localStorage.
+app.get('/api/account/brand-kit', requireUser, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .select('brand_kit')
+      .eq('id', req.user.id)
+      .maybeSingle();
+    if (error) {
+      console.warn('brand-kit fetch error (column may be missing):', error.message || error);
+      return res.json({ ok: true, brandKit: null, persisted: false });
+    }
+    return res.json({ ok: true, brandKit: data?.brand_kit || null, persisted: true });
+  } catch (e) {
+    console.warn('brand-kit fetch unexpected error:', e?.message || e);
+    return res.json({ ok: true, brandKit: null, persisted: false });
+  }
+});
+
+app.put('/api/account/brand-kit', requireUser, async (req, res) => {
+  try {
+    const brandKit = sanitizeBrandKit(req.body?.brandKit ?? req.body);
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({ brand_kit: brandKit, updated_at: new Date().toISOString() })
+      .eq('id', req.user.id);
+    if (error) {
+      console.warn('brand-kit save error (column may be missing):', error.message || error);
+      return res.json({ ok: true, brandKit, persisted: false });
+    }
+    return res.json({ ok: true, brandKit, persisted: true });
+  } catch (e) {
+    console.warn('brand-kit save unexpected error:', e?.message || e);
+    return res.json({ ok: true, brandKit: null, persisted: false });
+  }
+});
+
+/**
+ * Fetch a product's title + primary image for a single URL (Amazon or any product page).
+ * Used by the multi-product (roundup / comparison) pin builder so the frontend can preview items.
+ */
+app.post('/api/urltopin/product-info', requireUser, async (req, res) => {
+  try {
+    const rawUrl = String(req.body?.url || '').trim();
+    if (!rawUrl) return res.status(400).json({ error: 'Missing url' });
+    let effectiveUrl = rawUrl;
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+      if (expanded) effectiveUrl = expanded;
+    } catch {
+      /* keep raw */
+    }
+    const { base } = await fetchArticleBaseAndSummary(rawUrl, null, { fast: true, preResolvedUrl: effectiveUrl });
+    let title = String(base?.title || '').trim();
+    let imageUrl = '';
+
+    // Amazon: prefer product image (scrape, then widget, then RapidAPI if blocked).
+    const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base?.canonicalUrl);
+    if (isAmazonProductPageForNanoReference(amazonCtxUrl)) {
+      try {
+        const azHtml = await fetchArticleHtml(amazonCtxUrl);
+        let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+        if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
+          const widgetImg = await fetchAmazonAsinWidgetImageUrl(amazonCtxUrl);
+          if (widgetImg) candidates = [widgetImg];
+        }
+        if (candidates.length > 0) imageUrl = candidates[0];
+      } catch {
+        /* ignore */
+      }
+      if ((!title || !imageUrl) && base?.amazon_blocked) {
+        const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
+        if (asin) {
+          try {
+            const host = new URL(amazonCtxUrl).hostname;
+            const rapid = await fetchAmazonProductDataViaRapidApi({
+              asin,
+              marketplace: resolveRapidApiAmazonMarketplaceFromHost(host),
+              language: 'en',
+            });
+            if (rapid) {
+              if (!title && rapid.title) title = String(rapid.title).trim();
+              if (!imageUrl && Array.isArray(rapid.images) && rapid.images.length) {
+                const im = rapid.images[0];
+                imageUrl = (im && typeof im === 'object' ? (im.hi_res || im.image || im.large) : im) || '';
+              }
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+    if (!imageUrl) {
+      // Non-Amazon (or no product image yet): pull og:image / twitter:image from the page.
+      try {
+        const html = await fetchArticleHtml(effectiveUrl);
+        const og =
+          html.match(/<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["']/i) ||
+          html.match(/<meta[^>]+name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i);
+        if (og && og[1]) {
+          try {
+            imageUrl = new URL(og[1].trim(), effectiveUrl).href;
+          } catch {
+            imageUrl = og[1].trim();
+          }
+        }
+      } catch {
+        /* image stays empty (optional) */
+      }
+    }
+
+    return res.json({
+      ok: true,
+      url: effectiveUrl,
+      title: title || '',
+      imageUrl: imageUrl || '',
+      amazonBlocked: !!base?.amazon_blocked,
+    });
+  } catch (err) {
+    console.error('urltopin product-info error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Build a single multi-product affiliate pin: a roundup / gift-guide grid, or an A-vs-B comparison.
+ * Body: { mode:'roundup'|'comparison', headline, link, items:[{title,imageUrl,link}], brand, outputLanguage }
+ */
+app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) => {
+  try {
+    const mode = req.body?.mode === 'comparison' ? 'comparison' : 'roundup';
+    let headline = String(req.body?.headline || '').trim().slice(0, 120);
+    const destinationUrl = String(req.body?.link || req.body?.destinationUrl || '').trim();
+    const outputLanguage = String(req.body?.outputLanguage || 'auto').trim().toLowerCase() || 'auto';
+    const strictLanguage = req.body?.strictLanguage === true || req.body?.strictLanguage === 'true';
+    const affiliateDisclosure = normalizeAffiliateDisclosureRequest(req.body || {});
+    const brand = req.body?.brand && typeof req.body.brand === 'object' ? req.body.brand : {};
+
+    let items = Array.isArray(req.body?.items) ? req.body.items : [];
+    // Preserve the exact order the user supplied — numbering is drawn from this order, so it must not be reordered.
+    items = items
+      .map((it) => ({
+        title: String(it?.title || '').trim().slice(0, 120),
+        imageUrl: String(it?.imageUrl || '').trim(),
+        link: String(it?.link || '').trim(),
+      }))
+      .filter((it) => it.title || it.imageUrl);
+
+    if (!destinationUrl) return res.status(400).json({ error: 'Missing link (where the pin should send people)' });
+    if (mode === 'comparison' && items.length !== 2) {
+      return res.status(400).json({ error: 'Comparison pins need exactly 2 products.' });
+    }
+    if (mode === 'roundup' && (items.length < 2 || items.length > 6)) {
+      return res.status(400).json({ error: 'Roundup pins need between 2 and 6 products.' });
+    }
+    // Every product needs a title (it's the on-pin label). Fall back to a numbered placeholder so the layout stays valid.
+    items = items.map((it, i) => ({
+      ...it,
+      title: it.title || (mode === 'comparison' ? `Option ${i === 0 ? 'A' : 'B'}` : `Pick ${i + 1}`),
+    }));
+
+    // Headline is optional — when omitted, let the AI craft one from the products.
+    if (!headline) {
+      headline = await generateMultiProductHeadline({ mode, items, outputLanguage }, openai);
+    }
+
+    // One AI image pin consumed.
+    const usageResult = await applyPinQuotaDelta(req.user.id, { aiDelta: 1 }, req);
+    if (!usageResult.allowed) {
+      return res.status(402).json({
+        error: 'pin_limit_reached',
+        message: `Your current plan allows ${usageResult.planPinsLimit} AI image pins per month. You have already used ${usageResult.currentUsed} this month.`,
+        details: usageResult,
+      });
+    }
+
+    // Mirror product photos to Supabase, then pass them to Nano Banana as ordered reference images so the
+    // generated composite uses the real products in the same order as `items` (keeps numbering aligned).
+    let referenceInputs = [];
+    const photoUrls = items.map((it) => it.imageUrl).filter(Boolean);
+    if (photoUrls.length && process.env.USE_DUMMY_IMAGES !== 'true') {
+      try {
+        referenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(photoUrls.slice(0, 6), req.user.id);
+      } catch (e) {
+        console.warn('multi-product image mirror error:', e.message || e);
+      }
+    }
+
+    const footer = String(brand?.brandName || '').trim().slice(0, 80);
+    const prompt = buildMultiProductPinPrompt({ mode, headline, items, footer, brand });
+
+    let imageUrl = '';
+    try {
+      const providerSoftTimeoutMs = Math.max(
+        30_000,
+        parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000
+      );
+      const nanoOpts = referenceInputs.length ? { imageInput: referenceInputs } : {};
+      let nanoUrl = await withSoftTimeout(generateImageWithNanoBanana(prompt, `multi_${mode}`, nanoOpts), providerSoftTimeoutMs);
+      if (!nanoUrl) {
+        nanoUrl = await withSoftTimeout(generateImageWithNanoBanana(prompt, `multi_${mode}`, nanoOpts), providerSoftTimeoutMs);
+      }
+      imageUrl = nanoUrl || '';
+      if (imageUrl) {
+        try {
+          const imageRes = await fetch(imageUrl);
+          if (imageRes.ok) {
+            const buffer = Buffer.from(await imageRes.arrayBuffer());
+            const fileExt = (imageUrl.split('.').pop() || 'png').split('?')[0] || 'png';
+            const fileName = `urltopin-multi-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}.${fileExt}`;
+            const { error: uploadError } = await supabaseAdmin.storage
+              .from('ai-images')
+              .upload(fileName, buffer, {
+                contentType: imageRes.headers.get('content-type') || 'image/png',
+                upsert: true,
+              });
+            if (!uploadError) {
+              const { data: pub } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+              if (pub?.publicUrl) imageUrl = pub.publicUrl;
+            }
+          }
+        } catch (e) {
+          console.warn('multi-product re-host error:', e.message || e);
+        }
+      }
+    } catch (e) {
+      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 }, req);
+      console.error('multi-product image generation error:', e.message || e);
+      return res.status(500).json({ error: e.message || 'Failed to generate image' });
+    }
+
+    if (!imageUrl) {
+      await applyPinQuotaDelta(req.user.id, { aiDelta: -1 }, req);
+      return res.status(503).json({
+        error: 'image_provider_unavailable',
+        message: 'Image provider is busy right now. Please try again in a moment.',
+      });
+    }
+
+    // Title + description via the shared generate-field endpoint.
+    const tokenHeader = req.headers.authorization || '';
+    const productList = items.map((it, i) => `${i + 1}. ${it.title || `Product ${i + 1}`}`).join('\n');
+    const contentForCopy =
+      (mode === 'comparison'
+        ? `Comparison pin: "${headline}". Comparing:\n${productList}`
+        : `Product roundup / gift guide pin: "${headline}". Featuring:\n${productList}`) +
+      `\n\nDestination: ${destinationUrl}`;
+    let pinTitle = headline;
+    let pinDescription = '';
+    try {
+      const selfBase = process.env.SELF_API_URL || 'http://localhost:' + PORT;
+      const [titleRes, descRes] = await Promise.all([
+        fetch(`${selfBase}/api/generate-field`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: tokenHeader },
+          body: JSON.stringify({ content: contentForCopy, type: 'title', outputLanguage, strictLanguage }),
+        }),
+        fetch(`${selfBase}/api/generate-field`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: tokenHeader },
+          body: JSON.stringify({ content: contentForCopy, type: 'description', outputLanguage, strictLanguage }),
+        }),
+      ]);
+      if (titleRes.ok) {
+        const j = await titleRes.json();
+        if (j?.result) pinTitle = j.result;
+      }
+      if (descRes.ok) {
+        const j = await descRes.json();
+        if (j?.result) pinDescription = j.result;
+      }
+    } catch (e) {
+      console.warn('multi-product metadata error:', e.message || e);
+    }
+
+    const descriptionForPin = appendAffiliateDisclosureToDescription(pinDescription, affiliateDisclosure);
+    const hashtags = hashtagsFromPinDescription(descriptionForPin);
+    let altText = '';
+    try {
+      altText = await generatePinterestAltText(
+        {
+          title: pinTitle,
+          description: pinDescription,
+          overlayText: { headline },
+          styleLabel: mode === 'comparison' ? 'Comparison' : 'Roundup',
+          linkDisplay: destinationUrl,
+          nanoBananaPrompt: prompt,
+          outputLanguage,
+          strictLanguage,
+        },
+        openai
+      );
+    } catch {
+      /* alt text is best-effort */
+    }
+
+    const pinRecord = {
+      styleId: mode === 'comparison' ? 'comparison_split' : 'roundup_grid',
+      styleLabel: mode === 'comparison' ? 'Comparison' : 'Roundup',
+      imagePrompt: prompt,
+      imageUrl,
+      title: pinTitle,
+      description: descriptionForPin,
+      altText,
+      hashtags,
+      link: destinationUrl,
+      overlayText: { headline },
+      imageGenerationMode: 'ai',
+      multiProduct: { mode, items },
+      ...(referenceInputs.length > 0 && {
+        nanoBananaReferenceCount: referenceInputs.length,
+        nanoBananaReferenceSource: 'multi_product',
+      }),
+    };
+
+    // Persist so it shows in the dashboard and can be scheduled (same shape as single pins).
+    try {
+      const baseHistory = {
+        user_id: req.user.id,
+        source_url: destinationUrl,
+        article_title: headline,
+        article_domain: (() => {
+          try {
+            return new URL(destinationUrl).hostname;
+          } catch {
+            return null;
+          }
+        })(),
+        style_id: pinRecord.styleId,
+        style_label: pinRecord.styleLabel,
+        image_url: imageUrl,
+        pin_title: pinTitle,
+        pin_description: descriptionForPin,
+        pin_link: destinationUrl,
+      };
+      supabaseAdmin.from('urltopin_history').insert(baseHistory).then(({ error }) => {
+        if (error) console.warn('urltopin_history (multi) insert error:', error.message || error);
+      }).catch(() => {});
+      supabaseAdmin
+        .from('scheduled_pins')
+        .insert({
+          user_id: req.user.id,
+          pinterest_account_id: null,
+          title: pinTitle,
+          description: descriptionForPin,
+          image_url: imageUrl,
+          board_id: '',
+          link: destinationUrl,
+          scheduled_for: null,
+          timezone: null,
+          is_recurring: false,
+          recurrence_pattern: null,
+          status: 'generated',
+          original_pin_data: { ...baseHistory, source: 'urltopin', overlayText: { headline }, alt_text: altText, multiProduct: { mode, items } },
+        })
+        .then(({ error }) => {
+          if (error) console.warn('scheduled_pins (multi) insert error:', error.message || error);
+        })
+        .catch(() => {});
+    } catch (e) {
+      console.warn('multi-product persist threw:', e.message || e);
+    }
+
+    return res.json({ pins: [pinRecord] });
+  } catch (err) {
+    console.error('urltopin generate-multi-product error:', err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
