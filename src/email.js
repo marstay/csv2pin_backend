@@ -199,12 +199,12 @@ export function renderWelcomeEmail() {
   const subject = `Welcome to ${BRAND} 🎉`;
   const bodyHtml = `
     <p style="margin:0 0 14px;">Welcome aboard!</p>
-    <p style="margin:0 0 14px;">${BRAND} turns any product URL or article into scroll-stopping Pinterest pins — built for Amazon affiliates and bloggers who'd rather create than design.</p>
-    <p style="margin:0 0 8px;font-weight:600;">Here's the 60-second path to your first pin:</p>
+    <p style="margin:0 0 14px;">${BRAND} turns a product page, Etsy listing, or blog post into <strong>multiple Pinterest-ready pins</strong> — images, titles, and descriptions included. Built for Amazon affiliates and bloggers who want traffic without designing in Canva.</p>
+    <p style="margin:0 0 8px;font-weight:600;">Your first pins in about a minute:</p>
     <ol style="margin:0 0 16px 18px;padding:0;color:#3a3a3a;">
-      <li style="margin-bottom:6px;">Paste a product or article URL.</li>
-      <li style="margin-bottom:6px;">Pick a style — we generate the image, title and description.</li>
-      <li>Download or post straight to Pinterest.</li>
+      <li style="margin-bottom:6px;">Paste your URL.</li>
+      <li style="margin-bottom:6px;">Hit Generate — we analyze the page and create several pin angles for you (no design work).</li>
+      <li>Post to Pinterest, schedule, or download.</li>
     </ol>`;
   const html = emailLayout({
     heading: `Welcome to ${BRAND}`,
@@ -218,13 +218,13 @@ export function renderWelcomeEmail() {
 
 /** Day ~1, only if the user hasn't generated a pin yet. */
 export function renderFirstPinEmail() {
-  const subject = `Make your first pin in 5 minutes`;
+  const subject = `Make your first pin in about a minute`;
   const bodyHtml = `
     <p style="margin:0 0 14px;">Hi there,</p>
-    <p style="margin:0 0 14px;">You signed up for ${BRAND} but haven't made a pin yet — and the first one takes about 5 minutes. The affiliates who win on Pinterest are the ones who just start publishing.</p>
+    <p style="margin:0 0 14px;">You signed up for ${BRAND} but haven't made a pin yet — and the first one takes about a minute. The affiliates who win on Pinterest are the ones who just start publishing.</p>
     <p style="margin:0 0 14px;">Grab any Amazon product link (or a blog post) and paste it in. We'll handle the image, the title, and the SEO description for you.</p>`;
   const html = emailLayout({
-    heading: 'Your first pin is 5 minutes away',
+    heading: 'Your first pin is about a minute away',
     bodyHtml,
     ctaText: 'Create my first pin',
     ctaUrl: APP_URL,
@@ -239,7 +239,7 @@ export function renderDay3TipEmail() {
   const bodyHtml = `
     <p style="margin:0 0 14px;">Hi there,</p>
     <p style="margin:0 0 14px;">One tip that compounds on Pinterest: <strong>make several pins per product</strong>, not one. Different angles, titles and images mean more chances to get picked up in search and feeds.</p>
-    <p style="margin:0 0 14px;">With ${BRAND} you can spin up multiple styles from the same URL in seconds — try generating 3–5 variations for your best product and scheduling them across the week.</p>`;
+    <p style="margin:0 0 14px;">With ${BRAND} you can spin up multiple pin angles from the same URL in seconds — try generating 3–5 variations for your best product and scheduling them across the week.</p>`;
   const html = emailLayout({
     heading: 'Multiply your pins, multiply your reach',
     bodyHtml,
