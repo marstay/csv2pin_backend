@@ -22,6 +22,15 @@ import {
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
+import {
+  sendPaymentFailedEmail,
+  sendUpgradeNudgeEmail,
+  nextPlanFor,
+  sendWelcomeEmail,
+  sendFirstPinEmail,
+  sendDay3TipEmail,
+  isEmailEnabled,
+} from './email.js';
 dotenv.config();
 
 const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -1396,6 +1405,112 @@ async function markBillingSubscriptionPastDueAndDowngradeProfile(userId, dodoSub
   return { ok: true };
 }
 
+/** Resolve a user's email: prefer profiles.email, fall back to the Supabase auth record. */
+async function getUserEmailById(userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return '';
+  try {
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('email')
+      .eq('id', uid)
+      .maybeSingle();
+    const profileEmail = String(profile?.email || '').trim();
+    if (profileEmail) return profileEmail;
+  } catch {
+    /* fall through to auth lookup */
+  }
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(uid);
+    if (!error) return String(data?.user?.email || '').trim();
+  } catch {
+    /* ignore */
+  }
+  return '';
+}
+
+// Avoid emailing the same subscription repeatedly when Dodo fires payment.failed
+// then subscription.on_hold/failed in quick succession.
+const recentDunningEmails = new Map(); // dedupeKey -> timestamp(ms)
+const DUNNING_EMAIL_DEDUPE_MS = 12 * 60 * 60 * 1000; // 12h
+
+/**
+ * Send a "your payment failed — update your card" email, deduped per subscription.
+ * `emailHint` (from the webhook payload) is used first to avoid an extra lookup.
+ */
+async function triggerDunningEmail({ userId, dodoSubId, planType, emailHint, logReason }) {
+  if (!isEmailEnabled()) return { ok: false, skipped: true, reason: 'email_disabled' };
+  const uid = String(userId || '').trim();
+  const dedupeKey = `${uid}:${String(dodoSubId || '').trim()}`;
+  const last = recentDunningEmails.get(dedupeKey);
+  const nowMs = Date.now();
+  if (last && nowMs - last < DUNNING_EMAIL_DEDUPE_MS) {
+    return { ok: false, skipped: true, reason: 'recently_emailed' };
+  }
+
+  let email = String(emailHint || '').trim();
+  if (!email) email = await getUserEmailById(uid);
+  if (!email) {
+    console.warn('dunning: no email for user — skipping', { userId: uid, dodoSubId, logReason });
+    return { ok: false, skipped: true, reason: 'no_email' };
+  }
+
+  let plan = String(planType || '').trim();
+  if (!plan && dodoSubId) {
+    try {
+      const local = await lookupLocalSubscriptionByDodoSubscriptionId(dodoSubId);
+      plan = String(local?.plan_type || '').trim();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const result = await sendPaymentFailedEmail({ to: email, planType: plan });
+  if (result.ok) {
+    recentDunningEmails.set(dedupeKey, nowMs);
+    console.log('dunning: payment-failed email sent', { userId: uid, dodoSubId, plan, logReason });
+  }
+  return result;
+}
+
+// At most one upgrade-nudge email per user per usage month (keyed below), to avoid spam.
+const recentUpgradeNudges = new Map(); // `${userId}:${yearMonth}` -> timestamp(ms)
+const UPGRADE_NUDGE_DEDUPE_MS = 26 * 24 * 60 * 60 * 1000; // ~ once per billing month
+
+/**
+ * Fire-and-forget expansion nudge when a user hits (or nears) their AI pin cap.
+ * No-ops for top-tier (agency) and when email is disabled. Deduped per user/month.
+ */
+async function triggerUpgradeNudge({ userId, planType, used, limit, reason, yearMonth }) {
+  try {
+    if (!isEmailEnabled()) return;
+    if (!nextPlanFor(planType)) return; // top tier — nothing to upsell
+    const uid = String(userId || '').trim();
+    if (!uid) return;
+    const dedupeKey = `${uid}:${yearMonth || ''}`;
+    const last = recentUpgradeNudges.get(dedupeKey);
+    const nowMs = Date.now();
+    if (last && nowMs - last < UPGRADE_NUDGE_DEDUPE_MS) return;
+    // Reserve the slot before the await so concurrent pin requests don't double-send.
+    recentUpgradeNudges.set(dedupeKey, nowMs);
+
+    const email = await getUserEmailById(uid);
+    if (!email) {
+      recentUpgradeNudges.delete(dedupeKey);
+      return;
+    }
+    const result = await sendUpgradeNudgeEmail({ to: email, currentPlan: planType, used, limit, reason });
+    if (result?.ok) {
+      console.log('upgrade nudge: email sent', { userId: uid, planType, reason, used, limit });
+    } else {
+      // Failed/skipped send shouldn't permanently suppress a future nudge.
+      if (!result?.ok && result?.reason !== 'top_tier') recentUpgradeNudges.delete(dedupeKey);
+    }
+  } catch (e) {
+    console.warn('upgrade nudge: error', { userId, planType, error: e?.message || e });
+  }
+}
+
 async function resolvePlanTypeForUser(userId) {
   const sub = await getActiveSubscriptionForUser(userId);
   if (sub?.plan_type) return sub.plan_type;
@@ -1570,6 +1685,16 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
       }
 
       if (aiDelta > 0 && tentativeAi > planPinsLimit) {
+        if (!unlimitedPins) {
+          void triggerUpgradeNudge({
+            userId,
+            planType,
+            used: effectiveCurrentAi,
+            limit: planPinsLimit,
+            reason: 'limit_reached',
+            yearMonth,
+          });
+        }
         return {
           allowed: false,
           limitKind: 'ai',
@@ -1613,6 +1738,22 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
 
       if (upsertError) {
         console.warn('pin_usage upsert error:', upsertError.message || upsertError);
+      }
+
+      // Proactive expansion nudge: fire once when AI usage first crosses 80% of the plan cap.
+      if (aiDelta > 0 && !unlimitedPins && planPinsLimit > 0) {
+        const newEffectiveAi = Math.max(0, newAi - baselineAi);
+        const threshold = planPinsLimit * 0.8;
+        if (effectiveCurrentAi < threshold && newEffectiveAi >= threshold && newEffectiveAi <= planPinsLimit) {
+          void triggerUpgradeNudge({
+            userId,
+            planType,
+            used: newEffectiveAi,
+            limit: planPinsLimit,
+            reason: 'approaching_limit',
+            yearMonth,
+          });
+        }
       }
 
       return {
@@ -4839,6 +4980,7 @@ async function syncUserAnalytics(userId, accessToken) {
 let schedulerInterval;
 let analyticsInterval;
 let refImageCleanupInterval;
+let onboardingEmailInterval;
 
 async function cleanupOldUrlToPinReferenceImages() {
   // Deletes only our temporary reference images mirrored into Storage for Nano Banana.
@@ -4932,6 +5074,119 @@ function startRefImageCleanup() {
   console.log('🧹 URL→Pin reference image cleanup started (runs every 6 hours)');
 }
 
+/**
+ * Claim a lifecycle email for a user so it's only sent once (idempotent across
+ * restarts). Returns true if WE claimed it (i.e., not previously sent).
+ * Returns false if already sent, on error, or if the email_events table is missing
+ * (so onboarding degrades gracefully to "send nothing" until the table exists).
+ */
+async function claimEmailEvent(userId, emailKey) {
+  const uid = String(userId || '').trim();
+  const key = String(emailKey || '').trim();
+  if (!uid || !key) return false;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('email_events')
+      .upsert({ user_id: uid, email_key: key }, { onConflict: 'user_id,email_key', ignoreDuplicates: true })
+      .select('user_id');
+    if (error) {
+      console.warn('claimEmailEvent error (skipping send):', error.message || error);
+      return false;
+    }
+    return Array.isArray(data) && data.length > 0;
+  } catch (e) {
+    console.warn('claimEmailEvent exception (skipping send):', e?.message || e);
+    return false;
+  }
+}
+
+/** Set of user_ids that have generated at least one pin (AI or own-photo), any month. */
+async function fetchActivatedUserIds() {
+  const activated = new Set();
+  try {
+    const rows = await founderFetchAll('pin_usage', 'user_id, pins_used, user_photo_pins_used');
+    for (const r of rows) {
+      const used = (Number(r?.pins_used) || 0) + (Number(r?.user_photo_pins_used) || 0);
+      if (used > 0 && r?.user_id) activated.add(String(r.user_id));
+    }
+  } catch (e) {
+    console.warn('fetchActivatedUserIds error:', e?.message || e);
+  }
+  return activated;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Lifecycle onboarding emails. Age-windowed so we only ever email *new* signups
+ * (never the existing backlog), and idempotent via email_events:
+ *   - welcome:               age < 2 days
+ *   - activation_first_pin:  1–3 days old AND no pin generated yet
+ *   - day3_tip:              3–5 days old
+ */
+async function processOnboardingEmails() {
+  if (!isEmailEnabled()) return;
+  let users;
+  try {
+    users = await founderFetchAuthUsers();
+  } catch (e) {
+    console.warn('processOnboardingEmails: failed to list users:', e?.message || e);
+    return;
+  }
+  if (!Array.isArray(users) || users.length === 0) return;
+
+  const activated = await fetchActivatedUserIds();
+  const now = Date.now();
+  let sent = 0;
+  const MAX_PER_RUN = 100; // safety valve against accidental blasts
+
+  for (const u of users) {
+    if (sent >= MAX_PER_RUN) break;
+    const email = String(u?.email || '').trim();
+    const uid = String(u?.id || '').trim();
+    const createdAt = u?.created_at ? new Date(u.created_at).getTime() : NaN;
+    if (!email || !uid || !Number.isFinite(createdAt)) continue;
+    const ageDays = (now - createdAt) / DAY_MS;
+    if (ageDays < 0) continue;
+
+    try {
+      if (ageDays < 2) {
+        if (await claimEmailEvent(uid, 'welcome')) {
+          const r = await sendWelcomeEmail({ to: email });
+          if (r?.ok) { sent += 1; console.log('onboarding: welcome sent', { uid }); }
+        }
+      }
+      if (ageDays >= 1 && ageDays < 3 && !activated.has(uid)) {
+        if (await claimEmailEvent(uid, 'activation_first_pin')) {
+          const r = await sendFirstPinEmail({ to: email });
+          if (r?.ok) { sent += 1; console.log('onboarding: first-pin sent', { uid }); }
+        }
+      }
+      if (ageDays >= 3 && ageDays < 5) {
+        if (await claimEmailEvent(uid, 'day3_tip')) {
+          const r = await sendDay3TipEmail({ to: email });
+          if (r?.ok) { sent += 1; console.log('onboarding: day3-tip sent', { uid }); }
+        }
+      }
+    } catch (e) {
+      console.warn('processOnboardingEmails: per-user error', { uid, error: e?.message || e });
+    }
+  }
+  if (sent > 0) console.log(`📧 Onboarding emails: ${sent} sent this run`);
+}
+
+function startOnboardingEmails() {
+  if (onboardingEmailInterval) clearInterval(onboardingEmailInterval);
+  if (!isEmailEnabled()) {
+    console.log('📧 Onboarding emails disabled (no RESEND_API_KEY)');
+    return;
+  }
+  // Hourly is plenty: age-windows are 1–5 days wide, so timing is forgiving.
+  onboardingEmailInterval = setInterval(processOnboardingEmails, 60 * 60 * 1000);
+  setTimeout(processOnboardingEmails, 90 * 1000); // once shortly after startup
+  console.log('📧 Onboarding email processor started (runs hourly)');
+}
+
 function stopScheduler() {
   if (schedulerInterval) {
     clearInterval(schedulerInterval);
@@ -4947,6 +5202,11 @@ function stopScheduler() {
     clearInterval(refImageCleanupInterval);
     refImageCleanupInterval = null;
     console.log('🧹 URL→Pin reference image cleanup stopped');
+  }
+  if (onboardingEmailInterval) {
+    clearInterval(onboardingEmailInterval);
+    onboardingEmailInterval = null;
+    console.log('📧 Onboarding email processor stopped');
   }
 }
 
@@ -11663,6 +11923,13 @@ app.post('/api/dodo/webhook', async (req, res) => {
         return res.json({ ok: true, ignored: true, reason: 'payment_failed_unknown_subscription' });
       }
       await markBillingSubscriptionPastDueAndDowngradeProfile(uid, subId, `dodo_webhook:${eventType}`);
+      await triggerDunningEmail({
+        userId: uid,
+        dodoSubId: subId,
+        planType: planTypeFromMeta,
+        emailHint: dataObj?.customer?.email || dataObj?.customer_email || metadata?.email,
+        logReason: `dodo_webhook:${eventType}`,
+      });
       return res.json({ ok: true, action: 'marked_past_due_payment_failed', userId: uid });
     }
 
@@ -11675,6 +11942,13 @@ app.post('/api/dodo/webhook', async (req, res) => {
         return res.json({ ok: true, ignored: true, reason: 'subscription_hold_unknown' });
       }
       await markBillingSubscriptionPastDueAndDowngradeProfile(uid, dodoSubId, `dodo_webhook:${eventType}`);
+      await triggerDunningEmail({
+        userId: uid,
+        dodoSubId,
+        planType: planTypeFromMeta,
+        emailHint: dataObj?.customer?.email || dataObj?.customer_email || metadata?.email,
+        logReason: `dodo_webhook:${eventType}`,
+      });
       return res.json({ ok: true, action: 'marked_past_due_subscription', userId: uid });
     }
 
@@ -11689,6 +11963,13 @@ app.post('/api/dodo/webhook', async (req, res) => {
         }
         if (uid && dodoSubId) {
           await markBillingSubscriptionPastDueAndDowngradeProfile(uid, dodoSubId, `subscription.updated:status=${st}`);
+          await triggerDunningEmail({
+            userId: uid,
+            dodoSubId,
+            planType: planTypeFromMeta,
+            emailHint: dataObj?.customer?.email || dataObj?.customer_email || metadata?.email,
+            logReason: `subscription.updated:status=${st}`,
+          });
           return res.json({ ok: true, action: 'marked_past_due_status', userId: uid });
         }
       }
@@ -14358,4 +14639,5 @@ app.listen(PORT, () => {
   startAnalyticsSync();
   startRefImageCleanup();
   startTrendsScheduler();
+  startOnboardingEmails();
 }); 
