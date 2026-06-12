@@ -10281,16 +10281,49 @@ async function founderComputeMetrics() {
     return st === 'succeeded' || st === 'completed' || st === 'paid' || st === '';
   };
 
+  const paymentId = (p) => p.payment_id || p.id || null;
+  const paymentById = new Map();
+  payments.forEach((p) => { const id = paymentId(p); if (id) paymentById.set(id, p); });
+
+  // ---- DEDUP / IGNORE: immediate ("test") refunds void the underlying sale ----
+  // A refund issued within 24h of its payment (or whose reason mentions "test") is
+  // treated as a cancelled/test sale: the payment is voided from revenue and the
+  // refund itself is NOT counted as a loss. Later refunds are real and subtract.
+  const REFUND_TEST_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const voidedPaymentIds = new Set();
+  const countedRefunds = [];
+  let immediateRefundCount = 0;
+  refunds.forEach((r) => {
+    const st = String(r.status || '').toLowerCase();
+    if (st && st !== 'succeeded' && st !== 'completed' && st !== 'processed') return;
+    const pid = r.payment_id || r.payment?.payment_id || null;
+    const pay = pid ? paymentById.get(pid) : null;
+    const reasonTest = /test/i.test(String(r.reason || ''));
+    let immediate = false;
+    if (pay && pay.created_at && r.created_at) {
+      const delta = new Date(r.created_at).getTime() - new Date(pay.created_at).getTime();
+      if (delta >= 0 && delta <= REFUND_TEST_WINDOW_MS) immediate = true;
+    }
+    if (immediate || reasonTest) {
+      if (pid) voidedPaymentIds.add(pid);
+      immediateRefundCount += 1;
+    } else {
+      countedRefunds.push(r);
+    }
+  });
+
   let grossRevenue = 0;
   let netRevenue = 0;
   let paymentFees = 0;
   const revenueByMonth = new Map(); // mk -> { gross, net, fees }
   const revenueByPlan = new Map();
   const grossByUser = new Map();
+  let voidedSaleCount = 0;
   months24.forEach((mk) => revenueByMonth.set(mk, { gross: 0, net: 0, fees: 0 }));
 
   payments.forEach((p) => {
     if (!paymentStatusOk(p)) return;
+    if (voidedPaymentIds.has(paymentId(p))) { voidedSaleCount += 1; return; } // immediate/test refund -> void sale
     const uid = paymentUser(p);
     if (uid && isExcludedUser(uid)) return;
     const gross = founderConvertToUsd(p.total_amount ?? p.amount, p.currency, rates);
@@ -10310,12 +10343,12 @@ async function founderComputeMetrics() {
     if (uid) grossByUser.set(uid, (grossByUser.get(uid) || 0) + gross);
   });
 
-  // ---- Refunds ----
+  // ---- Refunds (real refunds only; immediate/test ones already voided above) ----
   let refundsTotal = 0;
   const refundsByMonth = new Map();
-  refunds.forEach((r) => {
-    const st = String(r.status || '').toLowerCase();
-    if (st && st !== 'succeeded' && st !== 'completed' && st !== 'processed') return;
+  countedRefunds.forEach((r) => {
+    const uid = r.subscription_id && userByDodoSub.get(r.subscription_id);
+    if (uid && isExcludedUser(uid)) return;
     const amt = founderConvertToUsd(r.amount, r.currency, rates);
     refundsTotal += amt;
     const mk = founderMonthKey(r.created_at);
@@ -10323,12 +10356,26 @@ async function founderComputeMetrics() {
   });
   const netRevenueAfterRefunds = netRevenue - refundsTotal;
 
-  // ---- Failed payments ----
-  const failedPayments = payments.filter((p) => {
+  // ---- Failed payments (dedup duplicate retries of the same charge) ----
+  // Multiple dunning retries for the same subscription within a month are one event.
+  const failedRaw = payments.filter((p) => {
     const st = String(p.status || '').toLowerCase();
-    return st === 'failed' || st === 'declined';
+    if (st !== 'failed' && st !== 'declined') return false;
+    const uid = paymentUser(p);
+    return !(uid && isExcludedUser(uid));
   });
-  const failedSubs = new Set(failedPayments.map((p) => p.subscription_id).filter(Boolean));
+  const failedSeen = new Set();
+  const failedPayments = [];
+  failedRaw
+    .slice()
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+    .forEach((p) => {
+      const key = `${p.subscription_id || paymentId(p)}|${founderMonthKey(p.created_at)}`;
+      if (failedSeen.has(key)) return; // duplicate retry
+      failedSeen.add(key);
+      failedPayments.push(p);
+    });
+  const failedRetriesIgnored = failedRaw.length - failedPayments.length;
   let recoveredCount = 0;
   let revenueSaved = 0;
   let revenueLost = 0;
@@ -10547,11 +10594,24 @@ async function founderComputeMetrics() {
 
   const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
+  // ---- Data hygiene summary (dedup / ignore rules applied) ----
+  const rawActiveSubRows = subIntervals.filter((iv) => activeAtMs(iv, nowMs)).length;
+  const duplicateActiveSubsDeduped = Math.max(0, rawActiveSubRows - activeSubscriptions);
+
   return {
     generatedAt: new Date().toISOString(),
     dodoMode: DODO_BASE_URL.includes('test') ? 'test' : 'live',
     dodoConfigured: !!DODO_API_KEY,
     paymentsCount: payments.length,
+    dataHygiene: {
+      excludedTestAccounts: excludedEmails.size,
+      immediateOrTestRefundsVoided: voidedSaleCount,
+      immediateOrTestRefundsDetected: immediateRefundCount,
+      realRefundsCounted: countedRefunds.length,
+      failedRetriesIgnored,
+      duplicateActiveSubsDeduped,
+      note: 'Test/admin accounts excluded by email. Refunds within 24h (or reason=test) void the underlying sale and are not counted as losses. Duplicate failed-payment retries are collapsed to one per subscription per month. Upgrade/downgrade chains and duplicate subscriptions are deduped to one (highest) active sub per customer.',
+    },
     executive: {
       mrr: round2(currentMrr),
       arr: round2(arr),
