@@ -9924,6 +9924,8 @@ const FOUNDER_PLAN_ORDER = ['starter', 'creator', 'pro', 'agency'];
 const FOUNDER_PLAN_DISPLAY = { starter: 'Starter', creator: 'Creator', pro: 'Pro', agency: 'Agency' };
 const FOUNDER_EXPENSE_CATEGORIES = ['openai', 'hosting', 'domains', 'email', 'ads', 'contractors', 'other'];
 const FOUNDER_ACQUISITION_SOURCES = ['tiktok', 'pinterest', 'seo', 'affiliate', 'direct', 'other'];
+// Sentinel "still active / auto-renewing" interval end (far future).
+const FOUNDER_ONGOING_MS = Date.UTC(2999, 0, 1);
 
 // Default config; overridden by admin_settings row 'founder_dashboard'.
 const FOUNDER_DEFAULT_SETTINGS = {
@@ -10166,11 +10168,22 @@ async function founderComputeMetrics() {
     if (isExcludedUser(s.user_id)) return;
     const startMs = s.created_at ? new Date(s.created_at).getTime() : (s.current_period_start ? new Date(s.current_period_start).getTime() : null);
     if (startMs == null || Number.isNaN(startMs)) return;
+    const cpe = s.current_period_end ? new Date(s.current_period_end).getTime() : null;
+    // Interval end semantics:
+    //  - cancelled            -> ended at cancelled_at (or period end)
+    //  - active but lapsed     -> stale row, ended at period end
+    //  - active + will cancel  -> ends at current_period_end (scheduled churn)
+    //  - active + renewing     -> ONGOING (it auto-renews; do NOT cap at period end,
+    //                             otherwise every monthly sub looks "churned" each month)
     let endMs;
     if (s.status === 'cancelled') {
-      endMs = s.cancelled_at ? new Date(s.cancelled_at).getTime() : (s.current_period_end ? new Date(s.current_period_end).getTime() : startMs);
+      endMs = s.cancelled_at ? new Date(s.cancelled_at).getTime() : (cpe || startMs);
+    } else if (cpe && cpe <= nowMs) {
+      endMs = cpe; // active row whose period already lapsed (not yet cleaned up)
+    } else if (s.cancel_at_period_end) {
+      endMs = cpe || FOUNDER_ONGOING_MS;
     } else {
-      endMs = s.current_period_end ? new Date(s.current_period_end).getTime() : nowMs;
+      endMs = FOUNDER_ONGOING_MS;
     }
     const interval = {
       userId: s.user_id,
@@ -10222,14 +10235,16 @@ async function founderComputeMetrics() {
   const mrrLast = mrrAt(founderMonthStart(lastMonth));
   const growthRate = mrrLast.mrr > 0 ? (mrrThis.mrr - mrrLast.mrr) / mrrLast.mrr : 0;
 
-  // ---- Churn (compare start of this month vs start of next month using intervals) ----
-  const startThis = founderMonthStart(thisMonth);
-  const startNext = founderMonthStart(founderAddMonths(thisMonth, 1));
-  const snapStart = mrrAt(startThis);
+  // ---- Churn (realized over the last COMPLETED month: start-of-last-month -> start-of-this-month) ----
+  // We measure who was active at the start of the previous month but is no longer active now,
+  // so the number reflects actual cancellations rather than mid-cycle billing dates.
+  const churnStart = founderMonthStart(lastMonth);
+  const churnEnd = founderMonthStart(thisMonth);
+  const snapStart = mrrAt(churnStart);
   const churnedCustomers = [];
   let lostMrr = 0;
   snapStart.perUser.forEach((iv, userId) => {
-    const stillActive = subIntervals.some((x) => x.userId === userId && activeAtMs(x, startNext));
+    const stillActive = subIntervals.some((x) => x.userId === userId && activeAtMs(x, churnEnd));
     if (!stillActive) { churnedCustomers.push(userId); lostMrr += iv.mrr; }
   });
   const customerChurnPct = snapStart.customers ? (churnedCustomers.length / snapStart.customers) * 100 : 0;
@@ -10256,7 +10271,16 @@ async function founderComputeMetrics() {
   });
   scheduledCancellations.sort((a, b) => (a.daysUntilChurn ?? 1e9) - (b.daysUntilChurn ?? 1e9));
 
-  const projectedNextMonthMrr = Math.max(0, currentMrr * (1 + growthRate) - 0); // growth-based projection
+  // Projected next-month MRR: continue the recent absolute trend (avg of the last up-to-3
+  // month-over-month changes), then subtract MRR already scheduled to cancel. Additive trend
+  // avoids the explosive ratios you get from MoM % on a tiny base.
+  const recentMrr = mrrSeries.map((s) => s.mrr);
+  const recentDeltas = [];
+  for (let i = Math.max(1, recentMrr.length - 3); i < recentMrr.length; i++) {
+    recentDeltas.push(recentMrr[i] - recentMrr[i - 1]);
+  }
+  const avgRecentDelta = recentDeltas.length ? recentDeltas.reduce((a, b) => a + b, 0) / recentDeltas.length : 0;
+  const projectedNextMonthMrr = Math.max(0, currentMrr + avgRecentDelta - mrrAtRisk);
 
   // ---- Dodo payments (revenue / fees / refunds) ----
   const dodoSubToPlan = new Map();
@@ -10329,6 +10353,7 @@ async function founderComputeMetrics() {
     const gross = founderConvertToUsd(p.total_amount ?? p.amount, p.currency, rates);
     let net = founderConvertToUsd(p.settlement_amount, p.settlement_currency || p.currency, rates);
     if (!net) net = gross * (1 - (Number(settings.paymentFeePctFallback) || 0) / 100);
+    net = Math.min(net, gross); // settlement should never exceed gross; guards FX/shape oddities
     const fee = Math.max(0, gross - net);
     grossRevenue += gross;
     netRevenue += net;
