@@ -9907,6 +9907,846 @@ app.post('/api/admin/affiliates/:id/reject', requireUser, requireAffiliateAdmin,
   }
 });
 
+// ===========================================================================
+// Founder analytics dashboard (admin only)
+// ---------------------------------------------------------------------------
+// Revenue/fees/refunds are pulled live from the Dodo Payments API; subscription
+// STATE comes from billing_subscriptions; expenses/acquisition/targets come from
+// the manual admin_* tables. Results are cached in-memory for a few minutes
+// because the Dodo list endpoints are paginated.
+// ===========================================================================
+
+// Canonical USD pricing + per-sale monthly profit (provided by the founder).
+const FOUNDER_PLAN_PRICE_USD = { starter: 9, creator: 19, pro: 39, agency: 79 };
+const FOUNDER_PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
+const FOUNDER_PLAN_MONTHLY_PROFIT_USD = { starter: 5.67, creator: 11.74, pro: 17.91, agency: 33.34 };
+const FOUNDER_PLAN_ORDER = ['starter', 'creator', 'pro', 'agency'];
+const FOUNDER_PLAN_DISPLAY = { starter: 'Starter', creator: 'Creator', pro: 'Pro', agency: 'Agency' };
+const FOUNDER_EXPENSE_CATEGORIES = ['openai', 'hosting', 'domains', 'email', 'ads', 'contractors', 'other'];
+const FOUNDER_ACQUISITION_SOURCES = ['tiktok', 'pinterest', 'seo', 'affiliate', 'direct', 'other'];
+
+// Default config; overridden by admin_settings row 'founder_dashboard'.
+const FOUNDER_DEFAULT_SETTINGS = {
+  // USD value of 1 unit of each currency (Dodo amounts are in minor units / cents).
+  exchangeRates: { USD: 1, EUR: 1.08, CAD: 0.73, AUD: 0.66, BRL: 0.18 },
+  startingCashUsd: 0,
+  targets: { mrr: 10000, customers: 500, profit: 5000 },
+  forecast: { monthlyGrowthPct: 10, monthlyChurnPct: 5 },
+  testEmails: [],
+  paymentFeePctFallback: 5, // used only when Dodo doesn't return settlement_amount
+};
+
+function founderMonthKey(d) {
+  const dt = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function founderMonthStart(monthKey) {
+  const [y, m] = String(monthKey).split('-').map(Number);
+  return Date.UTC(y, m - 1, 1);
+}
+
+function founderAddMonths(monthKey, n) {
+  const [y, m] = String(monthKey).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1 + n, 1));
+  return founderMonthKey(dt);
+}
+
+function founderLastNMonths(n, endMonthKey) {
+  const end = endMonthKey || founderMonthKey(new Date());
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) out.push(founderAddMonths(end, -i));
+  return out;
+}
+
+function founderMonthlyPriceUsd(planType, billingInterval) {
+  const p = String(planType || '').toLowerCase();
+  if (!FOUNDER_PLAN_PRICE_USD[p]) return 0;
+  if (normalizeBillingInterval(billingInterval) === 'year') {
+    return (FOUNDER_PLAN_ANNUAL_PRICE_USD[p] || 0) / 12;
+  }
+  return FOUNDER_PLAN_PRICE_USD[p] || 0;
+}
+
+function founderConvertToUsd(minorAmount, currency, rates) {
+  const n = Number(minorAmount);
+  if (!Number.isFinite(n) || n === 0) return 0;
+  const code = String(currency || 'USD').toUpperCase();
+  const rate = rates && Number.isFinite(Number(rates[code])) ? Number(rates[code]) : 1;
+  return (n / 100) * rate; // minor units -> major, then -> USD
+}
+
+// --- Dodo API list helper (paginated) ---
+async function founderDodoList(path, extraParams = {}) {
+  if (!DODO_API_KEY) return [];
+  const out = [];
+  const pageSize = 100;
+  for (let page = 0; page < 200; page++) {
+    const qs = new URLSearchParams({ page_size: String(pageSize), page_number: String(page), ...extraParams });
+    let json;
+    try {
+      const resp = await fetch(`${DODO_BASE_URL}${path}?${qs.toString()}`, {
+        headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+      });
+      if (!resp.ok) {
+        console.warn(`founderDodoList ${path} HTTP ${resp.status}`);
+        break;
+      }
+      json = await resp.json();
+    } catch (e) {
+      console.warn(`founderDodoList ${path} error:`, e?.message || e);
+      break;
+    }
+    const items = Array.isArray(json) ? json : Array.isArray(json?.items) ? json.items : Array.isArray(json?.data) ? json.data : [];
+    out.push(...items);
+    if (items.length < pageSize) break;
+  }
+  return out;
+}
+
+// --- Supabase paginated fetch helper ---
+async function founderFetchAll(table, columns) {
+  const out = [];
+  const pageSize = 1000;
+  for (let from = 0; from < 500000; from += pageSize) {
+    const { data, error } = await supabaseAdmin.from(table).select(columns).range(from, from + pageSize - 1);
+    if (error) {
+      console.warn(`founderFetchAll ${table} error:`, error.message || error);
+      break;
+    }
+    const rows = data || [];
+    out.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return out;
+}
+
+async function founderFetchAuthUsers() {
+  const all = [];
+  for (let page = 1; page <= 500; page++) {
+    let res;
+    try {
+      res = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
+    } catch (e) {
+      console.warn('founderFetchAuthUsers error:', e?.message || e);
+      break;
+    }
+    const batch = res?.data?.users || [];
+    all.push(...batch);
+    if (batch.length < 1000) break;
+  }
+  return all;
+}
+
+// --- Manual admin_* tables (graceful if missing) ---
+async function founderLoadSettings() {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('admin_settings')
+      .select('value')
+      .eq('key', 'founder_dashboard')
+      .maybeSingle();
+    if (error) throw error;
+    const stored = (data && data.value) || {};
+    return {
+      ...FOUNDER_DEFAULT_SETTINGS,
+      ...stored,
+      exchangeRates: { ...FOUNDER_DEFAULT_SETTINGS.exchangeRates, ...(stored.exchangeRates || {}) },
+      targets: { ...FOUNDER_DEFAULT_SETTINGS.targets, ...(stored.targets || {}) },
+      forecast: { ...FOUNDER_DEFAULT_SETTINGS.forecast, ...(stored.forecast || {}) },
+    };
+  } catch (e) {
+    return { ...FOUNDER_DEFAULT_SETTINGS };
+  }
+}
+
+async function founderSaveSettings(partial) {
+  const current = await founderLoadSettings();
+  const merged = {
+    ...current,
+    ...partial,
+    exchangeRates: { ...current.exchangeRates, ...(partial.exchangeRates || {}) },
+    targets: { ...current.targets, ...(partial.targets || {}) },
+    forecast: { ...current.forecast, ...(partial.forecast || {}) },
+  };
+  const { error } = await supabaseAdmin
+    .from('admin_settings')
+    .upsert({ key: 'founder_dashboard', value: merged, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
+  return merged;
+}
+
+async function founderLoadExpenses() {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('admin_expenses')
+      .select('id, month, category, amount_usd, cost_type, note, created_at')
+      .order('month', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function founderLoadAcquisition() {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('customer_acquisition')
+      .select('user_id, source, note, updated_at');
+    if (error) throw error;
+    const map = new Map();
+    (data || []).forEach((r) => map.set(r.user_id, String(r.source || 'other').toLowerCase()));
+    return map;
+  } catch (e) {
+    return new Map();
+  }
+}
+
+// --- Heavy aggregator (cached) ---
+let founderMetricsCache = { at: 0, payload: null };
+const FOUNDER_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function founderComputeMetrics() {
+  const settings = await founderLoadSettings();
+  const rates = settings.exchangeRates || FOUNDER_DEFAULT_SETTINGS.exchangeRates;
+  const now = new Date();
+  const nowMs = now.getTime();
+  const thisMonth = founderMonthKey(now);
+  const lastMonth = founderAddMonths(thisMonth, -1);
+  const months12 = founderLastNMonths(12);
+  const months24 = founderLastNMonths(24);
+
+  // ---- Load everything in parallel ----
+  const [subs, profiles, authUsers, expenses, acquisitionMap, payments, refunds] = await Promise.all([
+    founderFetchAll(
+      'billing_subscriptions',
+      'id, user_id, plan_type, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, created_at'
+    ),
+    founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug, created_at'),
+    founderFetchAuthUsers(),
+    founderLoadExpenses(),
+    founderLoadAcquisition(),
+    founderDodoList('/payments'),
+    founderDodoList('/refunds'),
+  ]);
+
+  // ---- Identity maps ----
+  const emailByUser = new Map();
+  const signupByUser = new Map();
+  const nameByUser = new Map();
+  authUsers.forEach((u) => {
+    if (u?.id) {
+      emailByUser.set(u.id, normalizeEmail(u.email) || '');
+      if (u.created_at) signupByUser.set(u.id, u.created_at);
+      const nm = u.user_metadata?.full_name || u.user_metadata?.name || '';
+      if (nm) nameByUser.set(u.id, nm);
+    }
+  });
+  profiles.forEach((p) => {
+    if (p?.id) {
+      if (!emailByUser.get(p.id) && p.email) emailByUser.set(p.id, normalizeEmail(p.email));
+      if (!signupByUser.get(p.id) && p.created_at) signupByUser.set(p.id, p.created_at);
+    }
+  });
+
+  // ---- Excluded (test) accounts ----
+  const adminEmails = parseAffiliateAdminEmails();
+  const excludedEmails = new Set([...adminEmails, ...(settings.testEmails || []).map(normalizeEmail)].filter(Boolean));
+  const isExcludedUser = (userId) => excludedEmails.has(emailByUser.get(userId));
+
+  // ---- Subscription intervals (for MRR history / churn / cohorts) ----
+  // One interval per paid subscription row: [start, end).
+  const subIntervals = [];
+  const subsByUser = new Map();
+  subs.forEach((s) => {
+    const plan = String(s.plan_type || '').toLowerCase();
+    if (!FOUNDER_PLAN_PRICE_USD[plan]) return; // skip free/unknown
+    if (isExcludedUser(s.user_id)) return;
+    const startMs = s.created_at ? new Date(s.created_at).getTime() : (s.current_period_start ? new Date(s.current_period_start).getTime() : null);
+    if (startMs == null || Number.isNaN(startMs)) return;
+    let endMs;
+    if (s.status === 'cancelled') {
+      endMs = s.cancelled_at ? new Date(s.cancelled_at).getTime() : (s.current_period_end ? new Date(s.current_period_end).getTime() : startMs);
+    } else {
+      endMs = s.current_period_end ? new Date(s.current_period_end).getTime() : nowMs;
+    }
+    const interval = {
+      userId: s.user_id,
+      plan,
+      interval: s.billing_interval,
+      mrr: founderMonthlyPriceUsd(plan, s.billing_interval),
+      startMs,
+      endMs: Math.max(endMs, startMs),
+      status: s.status,
+      cancelAtPeriodEnd: !!s.cancel_at_period_end,
+      currentPeriodEnd: s.current_period_end,
+      createdAt: s.created_at,
+    };
+    subIntervals.push(interval);
+    if (!subsByUser.has(s.user_id)) subsByUser.set(s.user_id, []);
+    subsByUser.get(s.user_id).push(interval);
+  });
+  subsByUser.forEach((arr) => arr.sort((a, b) => a.startMs - b.startMs));
+
+  const activeAtMs = (interval, ms) => interval.startMs <= ms && ms < interval.endMs;
+
+  // MRR for a given timestamp: one (highest) active sub per user.
+  function mrrAt(ms) {
+    const perUser = new Map();
+    for (const iv of subIntervals) {
+      if (!activeAtMs(iv, ms)) continue;
+      const prev = perUser.get(iv.userId);
+      if (!prev || iv.mrr > prev.mrr) perUser.set(iv.userId, iv);
+    }
+    let mrr = 0;
+    perUser.forEach((iv) => { mrr += iv.mrr; });
+    return { mrr, customers: perUser.size, perUser };
+  }
+
+  // ---- Current snapshot ----
+  const current = mrrAt(nowMs);
+  const currentMrr = current.mrr;
+  const activeCustomers = current.customers;
+  const activeSubscriptions = current.perUser.size; // one paid sub per customer (deduped)
+  const arpu = activeCustomers ? currentMrr / activeCustomers : 0;
+
+  // ---- MRR history (start of each month) ----
+  const mrrSeries = months24.map((mk) => {
+    const ms = founderMonthStart(mk);
+    const snap = mrrAt(ms);
+    return { month: mk, mrr: Math.round(snap.mrr * 100) / 100, customers: snap.customers };
+  });
+  const mrrThis = mrrAt(founderMonthStart(thisMonth));
+  const mrrLast = mrrAt(founderMonthStart(lastMonth));
+  const growthRate = mrrLast.mrr > 0 ? (mrrThis.mrr - mrrLast.mrr) / mrrLast.mrr : 0;
+
+  // ---- Churn (compare start of this month vs start of next month using intervals) ----
+  const startThis = founderMonthStart(thisMonth);
+  const startNext = founderMonthStart(founderAddMonths(thisMonth, 1));
+  const snapStart = mrrAt(startThis);
+  const churnedCustomers = [];
+  let lostMrr = 0;
+  snapStart.perUser.forEach((iv, userId) => {
+    const stillActive = subIntervals.some((x) => x.userId === userId && activeAtMs(x, startNext));
+    if (!stillActive) { churnedCustomers.push(userId); lostMrr += iv.mrr; }
+  });
+  const customerChurnPct = snapStart.customers ? (churnedCustomers.length / snapStart.customers) * 100 : 0;
+  const revenueChurnPct = snapStart.mrr ? (lostMrr / snapStart.mrr) * 100 : 0;
+  const monthlyChurnRate = customerChurnPct / 100;
+
+  // ---- MRR at risk (active subs scheduled to cancel) ----
+  let mrrAtRisk = 0;
+  const scheduledCancellations = [];
+  current.perUser.forEach((iv, userId) => {
+    if (iv.cancelAtPeriodEnd) {
+      mrrAtRisk += iv.mrr;
+      const daysUntil = iv.currentPeriodEnd ? Math.max(0, Math.ceil((new Date(iv.currentPeriodEnd).getTime() - nowMs) / 86400000)) : null;
+      scheduledCancellations.push({
+        userId,
+        email: emailByUser.get(userId) || '',
+        name: nameByUser.get(userId) || '',
+        plan: FOUNDER_PLAN_DISPLAY[iv.plan] || iv.plan,
+        mrr: Math.round(iv.mrr * 100) / 100,
+        nextBillingDate: iv.currentPeriodEnd || null,
+        daysUntilChurn: daysUntil,
+      });
+    }
+  });
+  scheduledCancellations.sort((a, b) => (a.daysUntilChurn ?? 1e9) - (b.daysUntilChurn ?? 1e9));
+
+  const projectedNextMonthMrr = Math.max(0, currentMrr * (1 + growthRate) - 0); // growth-based projection
+
+  // ---- Dodo payments (revenue / fees / refunds) ----
+  const dodoSubToPlan = new Map();
+  subs.forEach((s) => { if (s.dodo_subscription_id) dodoSubToPlan.set(s.dodo_subscription_id, String(s.plan_type || '').toLowerCase()); });
+  const userByDodoSub = new Map();
+  subs.forEach((s) => { if (s.dodo_subscription_id) userByDodoSub.set(s.dodo_subscription_id, s.user_id); });
+
+  const paymentPlan = (p) => {
+    const sid = p.subscription_id || p.subscription?.subscription_id;
+    if (sid && dodoSubToPlan.get(sid)) return dodoSubToPlan.get(sid);
+    const metaPlan = String(p.metadata?.app_plan_type || '').toLowerCase();
+    if (FOUNDER_PLAN_PRICE_USD[metaPlan]) return metaPlan;
+    return 'unknown';
+  };
+  const paymentUser = (p) => {
+    const sid = p.subscription_id || p.subscription?.subscription_id;
+    if (sid && userByDodoSub.get(sid)) return userByDodoSub.get(sid);
+    return p.customer?.customer_id || null;
+  };
+  const paymentStatusOk = (p) => {
+    const st = String(p.status || '').toLowerCase();
+    return st === 'succeeded' || st === 'completed' || st === 'paid' || st === '';
+  };
+
+  let grossRevenue = 0;
+  let netRevenue = 0;
+  let paymentFees = 0;
+  const revenueByMonth = new Map(); // mk -> { gross, net, fees }
+  const revenueByPlan = new Map();
+  const grossByUser = new Map();
+  months24.forEach((mk) => revenueByMonth.set(mk, { gross: 0, net: 0, fees: 0 }));
+
+  payments.forEach((p) => {
+    if (!paymentStatusOk(p)) return;
+    const uid = paymentUser(p);
+    if (uid && isExcludedUser(uid)) return;
+    const gross = founderConvertToUsd(p.total_amount ?? p.amount, p.currency, rates);
+    let net = founderConvertToUsd(p.settlement_amount, p.settlement_currency || p.currency, rates);
+    if (!net) net = gross * (1 - (Number(settings.paymentFeePctFallback) || 0) / 100);
+    const fee = Math.max(0, gross - net);
+    grossRevenue += gross;
+    netRevenue += net;
+    paymentFees += fee;
+    const mk = founderMonthKey(p.created_at);
+    if (mk && revenueByMonth.has(mk)) {
+      const r = revenueByMonth.get(mk);
+      r.gross += gross; r.net += net; r.fees += fee;
+    }
+    const plan = paymentPlan(p);
+    revenueByPlan.set(plan, (revenueByPlan.get(plan) || 0) + gross);
+    if (uid) grossByUser.set(uid, (grossByUser.get(uid) || 0) + gross);
+  });
+
+  // ---- Refunds ----
+  let refundsTotal = 0;
+  const refundsByMonth = new Map();
+  refunds.forEach((r) => {
+    const st = String(r.status || '').toLowerCase();
+    if (st && st !== 'succeeded' && st !== 'completed' && st !== 'processed') return;
+    const amt = founderConvertToUsd(r.amount, r.currency, rates);
+    refundsTotal += amt;
+    const mk = founderMonthKey(r.created_at);
+    if (mk) refundsByMonth.set(mk, (refundsByMonth.get(mk) || 0) + amt);
+  });
+  const netRevenueAfterRefunds = netRevenue - refundsTotal;
+
+  // ---- Failed payments ----
+  const failedPayments = payments.filter((p) => {
+    const st = String(p.status || '').toLowerCase();
+    return st === 'failed' || st === 'declined';
+  });
+  const failedSubs = new Set(failedPayments.map((p) => p.subscription_id).filter(Boolean));
+  let recoveredCount = 0;
+  let revenueSaved = 0;
+  let revenueLost = 0;
+  failedPayments.forEach((fp) => {
+    const sid = fp.subscription_id;
+    const failMs = new Date(fp.created_at).getTime();
+    const recovered = sid && payments.some((p) => p.subscription_id === sid && paymentStatusOk(p) && new Date(p.created_at).getTime() > failMs);
+    const amt = founderConvertToUsd(fp.total_amount ?? fp.amount, fp.currency, rates);
+    if (recovered) { recoveredCount += 1; revenueSaved += amt; }
+    else { revenueLost += amt; }
+  });
+  const recoveryRate = failedPayments.length ? (recoveredCount / failedPayments.length) * 100 : 0;
+
+  // ---- Subscription analytics (this month) ----
+  let newCustomers = 0;
+  let reactivatedCustomers = 0;
+  let upgradeEvents = 0;
+  let downgradeEvents = 0;
+  let expansionRevenue = 0;
+  let contractionRevenue = 0;
+  subsByUser.forEach((arr) => {
+    const first = arr[0];
+    if (first && founderMonthKey(first.startMs) === thisMonth) newCustomers += 1;
+    for (let i = 1; i < arr.length; i++) {
+      const prev = arr[i - 1];
+      const curr = arr[i];
+      if (founderMonthKey(curr.startMs) !== thisMonth) continue;
+      // reactivation: gap between previous end and this start
+      if (curr.startMs > prev.endMs + 86400000) reactivatedCustomers += 1;
+      const dRank = planRank(curr.plan) - planRank(prev.plan);
+      if (dRank > 0) { upgradeEvents += 1; expansionRevenue += Math.max(0, curr.mrr - prev.mrr); }
+      else if (dRank < 0) { downgradeEvents += 1; contractionRevenue += Math.max(0, prev.mrr - curr.mrr); }
+    }
+  });
+  const churnedCustomersCount = churnedCustomers.length;
+
+  // ---- Plan analytics ----
+  const planAnalytics = FOUNDER_PLAN_ORDER.map((plan) => {
+    let custs = 0;
+    let mrr = 0;
+    current.perUser.forEach((iv) => { if (iv.plan === plan) { custs += 1; mrr += iv.mrr; } });
+    // churned this month on this plan
+    let planChurned = 0;
+    snapStart.perUser.forEach((iv, userId) => {
+      if (iv.plan !== plan) return;
+      if (churnedCustomers.includes(userId)) planChurned += 1;
+    });
+    const profit = (FOUNDER_PLAN_MONTHLY_PROFIT_USD[plan] || 0) * custs;
+    return {
+      plan: FOUNDER_PLAN_DISPLAY[plan],
+      slug: plan,
+      price: FOUNDER_PLAN_PRICE_USD[plan],
+      activeCustomers: custs,
+      mrr: Math.round(mrr * 100) / 100,
+      revenue: Math.round((revenueByPlan.get(plan) || 0) * 100) / 100,
+      churnedThisMonth: planChurned,
+      monthlyProfit: Math.round(profit * 100) / 100,
+    };
+  });
+  const totalMonthlyProfit = planAnalytics.reduce((a, b) => a + b.monthlyProfit, 0);
+  const grossMargin = currentMrr > 0 ? (totalMonthlyProfit / currentMrr) * 100 : 0;
+
+  // ---- Expenses (this month) ----
+  const expenseByMonthCat = new Map();
+  expenses.forEach((e) => {
+    const key = `${e.month}|${e.category}`;
+    expenseByMonthCat.set(key, (expenseByMonthCat.get(key) || 0) + Number(e.amount_usd || 0));
+  });
+  const expenseTotalsByMonth = new Map();
+  const fixedByMonth = new Map();
+  const variableByMonth = new Map();
+  expenses.forEach((e) => {
+    const amt = Number(e.amount_usd || 0);
+    expenseTotalsByMonth.set(e.month, (expenseTotalsByMonth.get(e.month) || 0) + amt);
+    if (String(e.cost_type) === 'variable') variableByMonth.set(e.month, (variableByMonth.get(e.month) || 0) + amt);
+    else fixedByMonth.set(e.month, (fixedByMonth.get(e.month) || 0) + amt);
+  });
+  const fixedThis = fixedByMonth.get(thisMonth) || 0;
+  const variableThis = variableByMonth.get(thisMonth) || 0;
+  const grossThisMonth = (revenueByMonth.get(thisMonth) || {}).gross || 0;
+  const feesThisMonth = (revenueByMonth.get(thisMonth) || {}).fees || 0;
+  const refundsThisMonth = refundsByMonth.get(thisMonth) || 0;
+  const netProfitThisMonth = grossThisMonth - feesThisMonth - refundsThisMonth - variableThis - fixedThis;
+  const netMargin = grossThisMonth > 0 ? (netProfitThisMonth / grossThisMonth) * 100 : 0;
+  const expenseCategoryThisMonth = FOUNDER_EXPENSE_CATEGORIES.map((cat) => ({
+    category: cat,
+    amount: Math.round((expenseByMonthCat.get(`${thisMonth}|${cat}`) || 0) * 100) / 100,
+  }));
+
+  // ---- LTV / CAC / runway ----
+  const grossMarginFrac = grossMargin / 100;
+  const ltv = monthlyChurnRate > 0 ? (arpu * grossMarginFrac) / monthlyChurnRate : arpu * grossMarginFrac * 36;
+  const adsThisMonth = expenseByMonthCat.get(`${thisMonth}|ads`) || 0;
+  const cac = newCustomers > 0 ? adsThisMonth / newCustomers : 0;
+  const ltvCacRatio = cac > 0 ? ltv / cac : null;
+  const monthlyBurn = Math.max(0, fixedThis + variableThis + feesThisMonth + refundsThisMonth - ((revenueByMonth.get(thisMonth) || {}).net || 0));
+  const startingCash = Number(settings.startingCashUsd) || 0;
+  const cumulativeProfitAllTime = netRevenueAfterRefunds - expenses.reduce((a, e) => a + Number(e.amount_usd || 0), 0);
+  const cashOnHand = startingCash + cumulativeProfitAllTime;
+  const runwayMonths = monthlyBurn > 0 ? cashOnHand / monthlyBurn : null; // null = profitable / infinite
+
+  // ---- Cohort retention ----
+  // Cohort = month of a user's first paid subscription. Retention[k] = fraction active at cohort+k.
+  const cohorts = new Map();
+  subsByUser.forEach((arr, userId) => {
+    const first = arr[0];
+    const cohortMonth = founderMonthKey(first.startMs);
+    if (!cohorts.has(cohortMonth)) cohorts.set(cohortMonth, []);
+    cohorts.get(cohortMonth).push(userId);
+  });
+  const cohortOffsets = [0, 1, 2, 3, 6, 12];
+  const cohortRows = founderLastNMonths(12)
+    .filter((mk) => cohorts.has(mk))
+    .map((mk) => {
+      const users = cohorts.get(mk) || [];
+      const size = users.length;
+      const retention = {};
+      cohortOffsets.forEach((k) => {
+        const checkMs = founderMonthStart(founderAddMonths(mk, k));
+        if (checkMs > nowMs) { retention[k] = null; return; }
+        const stillActive = users.filter((u) => subIntervals.some((x) => x.userId === u && activeAtMs(x, checkMs))).length;
+        retention[k] = size ? Math.round((stillActive / size) * 1000) / 10 : 0;
+      });
+      return { cohort: mk, size, retention };
+    });
+
+  // ---- Acquisition ----
+  const acqAgg = new Map();
+  FOUNDER_ACQUISITION_SOURCES.forEach((s) => acqAgg.set(s, { source: s, customers: 0, mrr: 0, revenue: 0, churned: 0, ltvSum: 0 }));
+  const sourceForUser = (userId) => {
+    const manual = acquisitionMap.get(userId);
+    if (manual && acqAgg.has(manual)) return manual;
+    const prof = profiles.find((p) => p.id === userId);
+    if (prof && prof.referred_by_affiliate_slug) return 'affiliate';
+    return 'other';
+  };
+  current.perUser.forEach((iv, userId) => {
+    const src = sourceForUser(userId);
+    const a = acqAgg.get(src);
+    a.customers += 1;
+    a.mrr += iv.mrr;
+    a.revenue += grossByUser.get(userId) || 0;
+  });
+  churnedCustomers.forEach((userId) => {
+    const src = sourceForUser(userId);
+    if (acqAgg.has(src)) acqAgg.get(src).churned += 1;
+  });
+  const acquisition = Array.from(acqAgg.values()).map((a) => {
+    const churnPct = a.customers + a.churned > 0 ? (a.churned / (a.customers + a.churned)) * 100 : 0;
+    const arpuSrc = a.customers ? a.mrr / a.customers : 0;
+    const ltvSrc = monthlyChurnRate > 0 ? (arpuSrc * grossMarginFrac) / monthlyChurnRate : arpuSrc * grossMarginFrac * 36;
+    return {
+      source: a.source,
+      customers: a.customers,
+      mrr: Math.round(a.mrr * 100) / 100,
+      revenue: Math.round(a.revenue * 100) / 100,
+      churnPct: Math.round(churnPct * 10) / 10,
+      ltv: Math.round(ltvSrc * 100) / 100,
+    };
+  });
+
+  // ---- Cash flow (last 12 months) ----
+  const cashFlow = (() => {
+    let cumulative = startingCash;
+    return months12.map((mk) => {
+      const r = revenueByMonth.get(mk) || { gross: 0, net: 0, fees: 0 };
+      const cashIn = r.net - (refundsByMonth.get(mk) || 0);
+      const cashOut = expenseTotalsByMonth.get(mk) || 0;
+      const profit = cashIn - cashOut;
+      cumulative += profit;
+      return {
+        month: mk,
+        cashIn: Math.round(cashIn * 100) / 100,
+        cashOut: Math.round(cashOut * 100) / 100,
+        monthlyProfit: Math.round(profit * 100) / 100,
+        cumulativeProfit: Math.round(cumulative * 100) / 100,
+      };
+    });
+  })();
+
+  // ---- Forecast (12 + 24 months) ----
+  const fGrowth = (Number(settings.forecast?.monthlyGrowthPct) || 0) / 100;
+  const fChurn = (Number(settings.forecast?.monthlyChurnPct) || 0) / 100;
+  const netRate = fGrowth - fChurn;
+  const avgMarginFrac = grossMarginFrac > 0 ? grossMarginFrac : 0.5;
+  function buildForecast(nMonths) {
+    const out = [];
+    let mrr = currentMrr;
+    for (let i = 1; i <= nMonths; i++) {
+      mrr = Math.max(0, mrr * (1 + netRate));
+      out.push({
+        month: founderAddMonths(thisMonth, i),
+        mrr: Math.round(mrr * 100) / 100,
+        arr: Math.round(mrr * 12 * 100) / 100,
+        profit: Math.round(mrr * avgMarginFrac * 100) / 100,
+      });
+    }
+    return out;
+  }
+  const forecast12 = buildForecast(12);
+  const forecast24 = buildForecast(24);
+
+  // ---- Valuation ----
+  const arr = currentMrr * 12;
+  const valuation = [3, 5, 8, 10].map((mult) => ({ multiple: mult, value: Math.round(arr * mult) }));
+
+  // ---- Founder scorecard ----
+  const targets = settings.targets || FOUNDER_DEFAULT_SETTINGS.targets;
+  const milestones = [1000, 3000, 5000, 10000, 25000, 50000].map((m) => ({ mrr: m, reached: currentMrr >= m }));
+  const scorecard = {
+    mrr: { current: Math.round(currentMrr), target: targets.mrr, gap: Math.round((targets.mrr || 0) - currentMrr) },
+    customers: { current: activeCustomers, target: targets.customers, gap: (targets.customers || 0) - activeCustomers },
+    profit: { current: Math.round(totalMonthlyProfit), target: targets.profit, gap: Math.round((targets.profit || 0) - totalMonthlyProfit) },
+    milestones,
+  };
+
+  const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    dodoMode: DODO_BASE_URL.includes('test') ? 'test' : 'live',
+    dodoConfigured: !!DODO_API_KEY,
+    paymentsCount: payments.length,
+    executive: {
+      mrr: round2(currentMrr),
+      arr: round2(arr),
+      activeCustomers,
+      activeSubscriptions,
+      netRevenue: round2(netRevenueAfterRefunds),
+      grossRevenue: round2(grossRevenue),
+      paymentFees: round2(paymentFees),
+      netProfit: round2(netProfitThisMonth),
+      mrrAtRisk: round2(mrrAtRisk),
+      projectedNextMonthMrr: round2(projectedNextMonthMrr),
+      customerChurnPct: round2(customerChurnPct),
+      revenueChurnPct: round2(revenueChurnPct),
+      growthRatePct: round2(growthRate * 100),
+      arpu: round2(arpu),
+      ltv: round2(ltv),
+      ltvCacRatio: ltvCacRatio == null ? null : round2(ltvCacRatio),
+      cac: round2(cac),
+      runwayMonths: runwayMonths == null ? null : round2(runwayMonths),
+      cashOnHand: round2(cashOnHand),
+    },
+    revenueAnalytics: {
+      mrrSeries,
+      revenueByMonth: months24.map((mk) => {
+        const r = revenueByMonth.get(mk) || { gross: 0, net: 0, fees: 0 };
+        return { month: mk, gross: round2(r.gross), net: round2(r.net), fees: round2(r.fees) };
+      }),
+      revenueByPlan: planAnalytics.map((p) => ({ plan: p.plan, revenue: p.revenue })),
+    },
+    subscriptionAnalytics: {
+      newCustomers,
+      churnedCustomers: churnedCustomersCount,
+      reactivatedCustomers,
+      expansionRevenue: round2(expansionRevenue),
+      contractionRevenue: round2(contractionRevenue),
+      upgradeEvents,
+      downgradeEvents,
+    },
+    planAnalytics: {
+      plans: planAnalytics,
+      grossMarginPct: round2(grossMargin),
+      netMarginPct: round2(netMargin),
+      totalMonthlyProfit: round2(totalMonthlyProfit),
+    },
+    scheduledCancellations: {
+      customersAtRisk: scheduledCancellations.length,
+      mrrAtRisk: round2(mrrAtRisk),
+      revenueAtRisk: round2(mrrAtRisk * 12),
+      rows: scheduledCancellations,
+    },
+    cohorts: { offsets: cohortOffsets, rows: cohortRows },
+    failedPayments: {
+      failed: failedPayments.length,
+      recovered: recoveredCount,
+      recoveryRatePct: round2(recoveryRate),
+      revenueSaved: round2(revenueSaved),
+      revenueLost: round2(revenueLost),
+    },
+    acquisition,
+    expenses: {
+      thisMonth,
+      categories: expenseCategoryThisMonth,
+      fixed: round2(fixedThis),
+      variable: round2(variableThis),
+      fees: round2(feesThisMonth),
+      refunds: round2(refundsThisMonth),
+      grossRevenueThisMonth: round2(grossThisMonth),
+      netProfitThisMonth: round2(netProfitThisMonth),
+      rows: expenses,
+    },
+    cashFlow,
+    forecast: { months12: forecast12, months24: forecast24, assumptions: { monthlyGrowthPct: settings.forecast?.monthlyGrowthPct, monthlyChurnPct: settings.forecast?.monthlyChurnPct } },
+    valuation: { arr: round2(arr), scenarios: valuation },
+    scorecard,
+    settings,
+  };
+}
+
+app.get('/api/admin/metrics', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const force = String(req.query.refresh || '') === '1';
+    if (!force && founderMetricsCache.payload && Date.now() - founderMetricsCache.at < FOUNDER_CACHE_TTL_MS) {
+      return res.json({ ok: true, cached: true, ...founderMetricsCache.payload });
+    }
+    const payload = await founderComputeMetrics();
+    founderMetricsCache = { at: Date.now(), payload };
+    return res.json({ ok: true, cached: false, ...payload });
+  } catch (err) {
+    console.error('admin/metrics error:', err);
+    return res.status(500).json({ error: 'Failed to compute metrics' });
+  }
+});
+
+app.get('/api/admin/metrics/settings', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const settings = await founderLoadSettings();
+    return res.json({ ok: true, settings });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load settings' });
+  }
+});
+
+app.put('/api/admin/metrics/settings', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const merged = await founderSaveSettings(req.body || {});
+    founderMetricsCache = { at: 0, payload: null };
+    return res.json({ ok: true, settings: merged });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to save settings (is the admin_settings table created?)' });
+  }
+});
+
+app.get('/api/admin/metrics/expenses', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const rows = await founderLoadExpenses();
+    return res.json({ ok: true, expenses: rows, categories: FOUNDER_EXPENSE_CATEGORIES });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load expenses' });
+  }
+});
+
+app.post('/api/admin/metrics/expenses', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { month, category, amount_usd, cost_type, note } = req.body || {};
+    if (!/^\d{4}-\d{2}$/.test(String(month || ''))) return res.status(400).json({ error: 'month must be YYYY-MM' });
+    if (!FOUNDER_EXPENSE_CATEGORIES.includes(String(category))) return res.status(400).json({ error: 'invalid category' });
+    const { data, error } = await supabaseAdmin
+      .from('admin_expenses')
+      .insert({
+        month: String(month),
+        category: String(category),
+        amount_usd: Number(amount_usd) || 0,
+        cost_type: String(cost_type) === 'variable' ? 'variable' : 'fixed',
+        note: note ? String(note) : null,
+      })
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    founderMetricsCache = { at: 0, payload: null };
+    return res.json({ ok: true, id: data?.id });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to add expense (is the admin_expenses table created?)' });
+  }
+});
+
+app.delete('/api/admin/metrics/expenses/:id', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { error } = await supabaseAdmin.from('admin_expenses').delete().eq('id', String(req.params.id));
+    if (error) throw error;
+    founderMetricsCache = { at: 0, payload: null };
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete expense' });
+  }
+});
+
+app.get('/api/admin/metrics/acquisition', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const [profiles, authUsers, acqMap] = await Promise.all([
+      founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug'),
+      founderFetchAuthUsers(),
+      founderLoadAcquisition(),
+    ]);
+    const emailByUser = new Map();
+    authUsers.forEach((u) => u?.id && emailByUser.set(u.id, normalizeEmail(u.email) || ''));
+    const paid = profiles
+      .filter((p) => p.plan_type && p.plan_type !== 'free')
+      .map((p) => ({
+        userId: p.id,
+        email: emailByUser.get(p.id) || normalizeEmail(p.email) || '',
+        plan: p.plan_type,
+        source: acqMap.get(p.id) || (p.referred_by_affiliate_slug ? 'affiliate' : 'other'),
+      }));
+    return res.json({ ok: true, customers: paid, sources: FOUNDER_ACQUISITION_SOURCES });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load acquisition data' });
+  }
+});
+
+app.post('/api/admin/metrics/acquisition', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { user_id, source, note } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    if (!FOUNDER_ACQUISITION_SOURCES.includes(String(source))) return res.status(400).json({ error: 'invalid source' });
+    const { error } = await supabaseAdmin
+      .from('customer_acquisition')
+      .upsert({ user_id: String(user_id), source: String(source), note: note ? String(note) : null, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    if (error) throw error;
+    founderMetricsCache = { at: 0, payload: null };
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to save acquisition source (is the customer_acquisition table created?)' });
+  }
+});
+
 // Hosted billing recovery flow (update payment method) for failed renewals.
 // Uses Dodo "update payment method" which returns a payment_link to redirect the customer.
 app.post('/api/account/update-payment-method', requireUser, async (req, res) => {
