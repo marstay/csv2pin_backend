@@ -9936,6 +9936,7 @@ const FOUNDER_DEFAULT_SETTINGS = {
   forecast: { monthlyGrowthPct: 10, monthlyChurnPct: 5 },
   testEmails: [],
   paymentFeePctFallback: 5, // used only when Dodo doesn't return settlement_amount
+  immediateRefundHours: 24, // refunds within this window (or reason=test) void the sale; set 0 to disable
 };
 
 function founderMonthKey(d) {
@@ -10201,7 +10202,16 @@ async function founderComputeMetrics() {
     if (!subsByUser.has(s.user_id)) subsByUser.set(s.user_id, []);
     subsByUser.get(s.user_id).push(interval);
   });
-  subsByUser.forEach((arr) => arr.sort((a, b) => a.startMs - b.startMs));
+  // Collapse upgrade/downgrade/re-subscribe CHAINS into a single continuous timeline per
+  // customer: an earlier subscription can't outlive the start of the next one. This removes
+  // phantom overlaps from old rows whose cancelled_at is null but current_period_end is still
+  // in the future (otherwise the same customer counts as several active subs at once).
+  subsByUser.forEach((arr) => {
+    arr.sort((a, b) => a.startMs - b.startMs);
+    for (let i = 0; i < arr.length - 1; i++) {
+      if (arr[i].endMs > arr[i + 1].startMs) arr[i].endMs = arr[i + 1].startMs;
+    }
+  });
 
   const activeAtMs = (interval, ms) => interval.startMs <= ms && ms < interval.endMs;
 
@@ -10313,7 +10323,8 @@ async function founderComputeMetrics() {
   // A refund issued within 24h of its payment (or whose reason mentions "test") is
   // treated as a cancelled/test sale: the payment is voided from revenue and the
   // refund itself is NOT counted as a loss. Later refunds are real and subtract.
-  const REFUND_TEST_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const refundWindowHours = Number(settings.immediateRefundHours);
+  const REFUND_TEST_WINDOW_MS = (Number.isFinite(refundWindowHours) ? refundWindowHours : 24) * 60 * 60 * 1000;
   const voidedPaymentIds = new Set();
   const countedRefunds = [];
   let immediateRefundCount = 0;
@@ -10324,7 +10335,7 @@ async function founderComputeMetrics() {
     const pay = pid ? paymentById.get(pid) : null;
     const reasonTest = /test/i.test(String(r.reason || ''));
     let immediate = false;
-    if (pay && pay.created_at && r.created_at) {
+    if (REFUND_TEST_WINDOW_MS > 0 && pay && pay.created_at && r.created_at) {
       const delta = new Date(r.created_at).getTime() - new Date(pay.created_at).getTime();
       if (delta >= 0 && delta <= REFUND_TEST_WINDOW_MS) immediate = true;
     }
