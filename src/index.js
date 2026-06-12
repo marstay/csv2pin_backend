@@ -10155,8 +10155,10 @@ async function founderComputeMetrics() {
   });
 
   // ---- Excluded (test) accounts ----
-  const adminEmails = parseAffiliateAdminEmails();
-  const excludedEmails = new Set([...adminEmails, ...(settings.testEmails || []).map(normalizeEmail)].filter(Boolean));
+  // ONLY emails the founder explicitly lists as test accounts (Settings → "Test emails").
+  // Admin emails are for dashboard ACCESS control and must NOT be excluded from revenue —
+  // the founder's own login is often also a real paying customer.
+  const excludedEmails = new Set((settings.testEmails || []).map(normalizeEmail).filter(Boolean));
   const isExcludedUser = (userId) => excludedEmails.has(emailByUser.get(userId));
 
   // ---- Subscription intervals (for MRR history / churn / cohorts) ----
