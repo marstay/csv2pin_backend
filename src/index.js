@@ -10292,6 +10292,12 @@ async function founderComputeMetrics() {
   const avgRecentDelta = recentDeltas.length ? recentDeltas.reduce((a, b) => a + b, 0) / recentDeltas.length : 0;
   const projectedNextMonthMrr = Math.max(0, currentMrr + avgRecentDelta - mrrAtRisk);
 
+  // Forward-looking churn: active subs scheduled to cancel at period end, as a % of the
+  // current base (distinct from realized churn, which only counts subs that already lapsed).
+  const customersAtRisk = scheduledCancellations.length;
+  const scheduledCustomerChurnPct = activeCustomers ? (customersAtRisk / activeCustomers) * 100 : 0;
+  const scheduledRevenueChurnPct = currentMrr ? (mrrAtRisk / currentMrr) * 100 : 0;
+
   // ---- Dodo payments (revenue / fees / refunds) ----
   const dodoSubToPlan = new Map();
   subs.forEach((s) => { if (s.dodo_subscription_id) dodoSubToPlan.set(s.dodo_subscription_id, String(s.plan_type || '').toLowerCase()); });
@@ -10661,6 +10667,8 @@ async function founderComputeMetrics() {
       projectedNextMonthMrr: round2(projectedNextMonthMrr),
       customerChurnPct: round2(customerChurnPct),
       revenueChurnPct: round2(revenueChurnPct),
+      scheduledCustomerChurnPct: round2(scheduledCustomerChurnPct),
+      scheduledRevenueChurnPct: round2(scheduledRevenueChurnPct),
       growthRatePct: round2(growthRate * 100),
       arpu: round2(arpu),
       ltv: round2(ltv),
