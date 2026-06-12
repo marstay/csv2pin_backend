@@ -7,6 +7,7 @@ import net from 'node:net';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import JSZip from 'jszip';
+import sharp from 'sharp';
 import {
   enrichContentProfile,
   planStrategies,
@@ -7048,6 +7049,271 @@ app.post('/api/urltopin/scrape', async (req, res) => {
   } catch (err) {
     console.error('urltopin scrape error:', err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Free anonymous "first pin" preview (no auth) -------------------------
+// Cold SEO/Pinterest traffic hits a signup wall before seeing any value. This
+// endpoint generates ONE real pin from the visitor's URL so they get the "aha"
+// moment, then the frontend shows the signup wall to unlock the rest. It is
+// deliberately isolated from /generate: no auth, no quota writes, no scheduling
+// or export, exactly one pin, watermarked, and strictly rate-limited so it can
+// never run up the image bill.
+// Default: one free preview per IP (long window ≈ "once per visitor"), not per day.
+// The free plan is only 10 pins lifetime, so a single taste is enough to earn the
+// signup; more would just cost image credits with no extra conversion. NOTE: the
+// limiter is in-memory, so this resets on each backend restart/deploy (which also
+// conveniently auto-unblocks shared/NAT IPs over time).
+const FREE_PREVIEW_PER_IP_WINDOW_MS = Math.max(
+  60_000,
+  parseInt(process.env.FREE_PREVIEW_PER_IP_WINDOW_MS || String(365 * 24 * 60 * 60 * 1000), 10) ||
+    365 * 24 * 60 * 60 * 1000
+);
+const FREE_PREVIEW_PER_IP_MAX = Math.max(1, parseInt(process.env.FREE_PREVIEW_PER_IP_MAX || '1', 10) || 1);
+const FREE_PREVIEW_GLOBAL_DAILY_MAX = Math.max(
+  1,
+  parseInt(process.env.FREE_PREVIEW_GLOBAL_DAILY_MAX || '150', 10) || 150
+);
+let freePreviewGlobalDay = '';
+let freePreviewGlobalCount = 0;
+// Global circuit-breaker so a distributed/botnet attack can't exhaust the image budget.
+function tryConsumeGlobalFreePreview() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== freePreviewGlobalDay) {
+    freePreviewGlobalDay = today;
+    freePreviewGlobalCount = 0;
+  }
+  if (freePreviewGlobalCount >= FREE_PREVIEW_GLOBAL_DAILY_MAX) return false;
+  freePreviewGlobalCount += 1;
+  return true;
+}
+function refundGlobalFreePreview() {
+  if (freePreviewGlobalCount > 0) freePreviewGlobalCount -= 1;
+}
+
+// Overlays a repeated diagonal watermark + bottom banner onto the preview image
+// so it cannot be passed off as a finished pin. Signup yields the clean version.
+async function watermarkPreviewImage(inputBuffer) {
+  const img = sharp(inputBuffer, { failOn: 'none' });
+  const meta = await img.metadata();
+  const w = meta.width || 1024;
+  const h = meta.height || 1536;
+  const diagFont = Math.round(w * 0.07);
+  const rows = [];
+  const stepY = Math.round(diagFont * 3.4);
+  const stepX = Math.round(diagFont * 9);
+  for (let y = Math.round(h * 0.12); y < h; y += stepY) {
+    for (let x = -Math.round(w * 0.3); x < w; x += stepX) {
+      rows.push(
+        `<text x="${x}" y="${y}" transform="rotate(-28 ${x} ${y})" class="wm">URL2Pin</text>`
+      );
+    }
+  }
+  const bannerH = Math.round(h * 0.085);
+  const bannerFont = Math.round(w * 0.042);
+  const svg = `<svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+    <style>
+      .wm { fill:#ffffff; fill-opacity:0.30; font-family:Arial, Helvetica, sans-serif; font-weight:800; font-size:${diagFont}px; }
+      .banner { fill:#ffffff; font-family:Arial, Helvetica, sans-serif; font-weight:700; font-size:${bannerFont}px; }
+    </style>
+    ${rows.join('')}
+    <rect x="0" y="${h - bannerH}" width="${w}" height="${bannerH}" fill="#000000" fill-opacity="0.55"/>
+    <text x="${Math.round(w / 2)}" y="${h - Math.round(bannerH * 0.32)}" text-anchor="middle" class="banner">Free preview — sign up to remove</text>
+  </svg>`;
+  return img
+    .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
+    .jpeg({ quality: 82 })
+    .toBuffer();
+}
+
+function goalLabelForPreview(goal) {
+  switch (goal) {
+    case 'clicks':
+      return 'High Click Potential';
+    case 'saves':
+      return 'Save-Friendly';
+    case 'engagement':
+      return 'Engagement Focused';
+    case 'trust':
+      return 'Trust & Clarity';
+    default:
+      return 'Experimental';
+  }
+}
+
+app.post('/api/urltopin/preview', async (req, res) => {
+  let consumedGlobal = false;
+  try {
+    // 1. Strict per-IP limit (default: 1 free preview per IP per 24h).
+    if (
+      !rateLimitTool(req, 'free-preview', {
+        windowMs: FREE_PREVIEW_PER_IP_WINDOW_MS,
+        max: FREE_PREVIEW_PER_IP_MAX,
+      })
+    ) {
+      return res.status(429).json({
+        error: 'preview_limit_reached',
+        message:
+          'You’ve used your free preview pin. Sign up free to generate the full set — up to 10 pins per URL, no watermark, with download and scheduling.',
+      });
+    }
+
+    // 2. Global daily circuit-breaker (protects the image budget).
+    if (!tryConsumeGlobalFreePreview()) {
+      return res.status(429).json({
+        error: 'preview_capacity',
+        message: 'Free previews are at capacity right now. Sign up free to generate your pins instantly.',
+      });
+    }
+    consumedGlobal = true;
+
+    const { url, articleData, outputLanguage: rawOutputLanguage } = req.body || {};
+    const rawUrl = String(url || '').trim();
+    if (!rawUrl) {
+      refundGlobalFreePreview();
+      return res.status(400).json({ error: 'Missing url' });
+    }
+    const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
+
+    // 3. Scrape (same pipeline as /scrape and /generate).
+    const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, articleData || null, {
+      outputLanguage,
+    });
+    const hasScrapeContent =
+      (base.title && String(base.title).trim().length >= 3) ||
+      (base.description && String(base.description).trim().length >= 20);
+    if (!hasScrapeContent) {
+      refundGlobalFreePreview();
+      return res.status(502).json({
+        error: 'scrape_failed',
+        message:
+          'We couldn’t read this page (some sites block automated access). Try a different URL — a blog post or product page works best.',
+      });
+    }
+
+    // 4. Enrich + plan exactly ONE strategy.
+    let contentProfile = await enrichContentProfile(base, openai);
+    try {
+      const abs = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+      if (isAmazonRelatedHost(new URL(abs).hostname)) {
+        contentProfile = { ...contentProfile, amazonLanding: true };
+      }
+    } catch {
+      /* ignore invalid url */
+    }
+    const plan = planStrategies(contentProfile, 1);
+    const p = plan && plan[0];
+    if (!p) {
+      refundGlobalFreePreview();
+      return res.status(502).json({ error: 'plan_failed', message: 'Could not plan a pin for this page.' });
+    }
+
+    // 5. Metadata for the single pin (mirrors the strategic path in /generate).
+    const keyword = base.keyword || '';
+    const keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
+    const angle = pickAngle(p.strategy, contentProfile, []);
+    const layoutOverlayGuidance = STYLE_ON_IMAGE_TEXT_GUIDANCE[p.layoutId] || null;
+    const meta = await generateStrategicPinMetadata(
+      {
+        articleSummary,
+        keyword,
+        strategy: p.strategy,
+        layoutId: p.layoutId,
+        suggestedAngle: angle,
+        keyIdeas,
+        usedOverlayTexts: [],
+        layoutOverlayGuidance,
+        outputLanguage,
+        strictLanguage: false,
+      },
+      openai
+    );
+
+    const topic = contentProfile?.topic || base.title || keyword || 'this topic';
+    const domain = base.domain || '';
+    const overlayText = {
+      headline: meta.overlay_headline || topic,
+      subheadline: meta.overlay_subheadline || '',
+      source: domain,
+    };
+
+    // 6. Build the image prompt and generate ONE image (no reference images, no brand).
+    let imagePrompt = buildOverlayImagePrompt({
+      styleId: p.layoutId,
+      topic,
+      domain,
+      keyword,
+      year: new Date().getFullYear(),
+      overlayText,
+      brand: null,
+      stepCount: meta.step_count ?? null,
+      niche: contentProfile?.amazonLanding === true ? 'amazon_affiliate' : contentProfile?.niche || null,
+    });
+    imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, rawUrl);
+
+    let rawImageUrl = '';
+    if (process.env.USE_DUMMY_IMAGES === 'true') {
+      rawImageUrl = 'https://via.placeholder.com/1024x1536.png?text=URL2Pin+Preview';
+    } else {
+      const providerSoftTimeoutMs = Math.max(
+        30_000,
+        parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000
+      );
+      rawImageUrl =
+        (await withSoftTimeout(
+          generateImageWithNanoBanana(imagePrompt, `preview-${p.layoutId}`, {}),
+          providerSoftTimeoutMs
+        )) || '';
+    }
+
+    if (!rawImageUrl) {
+      refundGlobalFreePreview();
+      return res.status(502).json({
+        error: 'preview_image_failed',
+        message: 'We couldn’t generate the preview just now. Please try again in a moment.',
+      });
+    }
+
+    // 7. Watermark the image. Download → composite → return as a data URL so the
+    //    full-resolution clean image is never exposed pre-signup. If anything
+    //    fails, fall back to the raw image URL (never break the aha moment).
+    let previewImage = rawImageUrl;
+    let watermarked = false;
+    try {
+      const imgRes = await fetch(rawImageUrl);
+      if (imgRes.ok) {
+        const buf = Buffer.from(await imgRes.arrayBuffer());
+        const wmBuf = await watermarkPreviewImage(buf);
+        previewImage = `data:image/jpeg;base64,${wmBuf.toString('base64')}`;
+        watermarked = true;
+      }
+    } catch (e) {
+      console.warn('urltopin preview watermark error:', e.message || e);
+    }
+
+    return res.json({
+      preview: true,
+      watermarked,
+      totalAvailable: 10,
+      pin: {
+        styleId: p.layoutId,
+        imageUrl: previewImage,
+        title: meta.title || topic,
+        description: meta.description || base.description || '',
+        overlayText,
+        strategy: p.strategy,
+        goal: p.goal,
+        goalLabel: goalLabelForPreview(p.goal),
+        link: rawUrl,
+      },
+    });
+  } catch (err) {
+    if (consumedGlobal) refundGlobalFreePreview();
+    console.error('urltopin preview error:', err);
+    return res.status(500).json({
+      error: 'preview_failed',
+      message: 'Something went wrong generating your preview. Please try again.',
+    });
   }
 });
 
