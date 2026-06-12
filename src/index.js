@@ -10241,24 +10241,44 @@ async function founderComputeMetrics() {
     const snap = mrrAt(ms);
     return { month: mk, mrr: Math.round(snap.mrr * 100) / 100, customers: snap.customers };
   });
-  const mrrThis = mrrAt(founderMonthStart(thisMonth));
-  const mrrLast = mrrAt(founderMonthStart(lastMonth));
-  const growthRate = mrrLast.mrr > 0 ? (mrrThis.mrr - mrrLast.mrr) / mrrLast.mrr : 0;
+  // Growth rate: trailing 3-month average of month-over-month MRR growth (smooths the
+  // explosive ratios you get from a single MoM step on a small base).
+  const growthSeries = mrrSeries.map((s) => s.mrr);
+  const growthRatesArr = [];
+  for (let i = Math.max(1, growthSeries.length - 3); i < growthSeries.length; i++) {
+    const prev = growthSeries[i - 1];
+    if (prev > 0) growthRatesArr.push((growthSeries[i] - prev) / prev);
+  }
+  const growthRate = growthRatesArr.length ? growthRatesArr.reduce((a, b) => a + b, 0) / growthRatesArr.length : 0;
 
-  // ---- Churn (realized over the last COMPLETED month: start-of-last-month -> start-of-this-month) ----
-  // We measure who was active at the start of the previous month but is no longer active now,
-  // so the number reflects actual cancellations rather than mid-cycle billing dates.
-  const churnStart = founderMonthStart(lastMonth);
-  const churnEnd = founderMonthStart(thisMonth);
-  const snapStart = mrrAt(churnStart);
-  const churnedCustomers = [];
-  let lostMrr = 0;
-  snapStart.perUser.forEach((iv, userId) => {
-    const stillActive = subIntervals.some((x) => x.userId === userId && activeAtMs(x, churnEnd));
-    if (!stillActive) { churnedCustomers.push(userId); lostMrr += iv.mrr; }
-  });
-  const customerChurnPct = snapStart.customers ? (churnedCustomers.length / snapStart.customers) * 100 : 0;
-  const revenueChurnPct = snapStart.mrr ? (lostMrr / snapStart.mrr) * 100 : 0;
+  // ---- Churn ----
+  // Realized churn over a single completed-month transition: who was active at the start of
+  // `startMk` but is no longer active at the start of `endMk`.
+  function churnForTransition(startMk, endMk) {
+    const snap = mrrAt(founderMonthStart(startMk));
+    const endMsLocal = founderMonthStart(endMk);
+    const churned = [];
+    let lost = 0;
+    snap.perUser.forEach((iv, userId) => {
+      const stillActive = subIntervals.some((x) => x.userId === userId && activeAtMs(x, endMsLocal));
+      if (!stillActive) { churned.push(userId); lost += iv.mrr; }
+    });
+    return { startCustomers: snap.customers, startMrr: snap.mrr, snap, churned, lostMrr: lost };
+  }
+
+  // Last completed month — used for per-plan and per-source realized churn.
+  const lastMonthChurn = churnForTransition(lastMonth, thisMonth);
+  const snapStart = lastMonthChurn.snap;
+  const churnedCustomers = lastMonthChurn.churned;
+
+  // Executive churn = trailing 3-month average (smooths small-base volatility).
+  const churnTransitions = [];
+  for (let i = 3; i >= 1; i--) {
+    churnTransitions.push(churnForTransition(founderAddMonths(thisMonth, -i), founderAddMonths(thisMonth, -(i - 1))));
+  }
+  const avgArr = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+  const customerChurnPct = avgArr(churnTransitions.filter((t) => t.startCustomers > 0).map((t) => t.churned.length / t.startCustomers)) * 100;
+  const revenueChurnPct = avgArr(churnTransitions.filter((t) => t.startMrr > 0).map((t) => t.lostMrr / t.startMrr)) * 100;
   const monthlyChurnRate = customerChurnPct / 100;
 
   // ---- MRR at risk (active subs scheduled to cancel) ----
@@ -10536,10 +10556,15 @@ async function founderComputeMetrics() {
       const size = users.length;
       const retention = {};
       cohortOffsets.forEach((k) => {
-        const checkMs = founderMonthStart(founderAddMonths(mk, k));
-        if (checkMs > nowMs) { retention[k] = null; return; }
-        const stillActive = users.filter((u) => subIntervals.some((x) => x.userId === u && activeAtMs(x, checkMs))).length;
-        retention[k] = size ? Math.round((stillActive / size) * 1000) / 10 : 0;
+        const offMonth = founderAddMonths(mk, k);
+        const mStart = founderMonthStart(offMonth);
+        const mEnd = founderMonthStart(founderAddMonths(offMonth, 1));
+        if (mStart > nowMs) { retention[k] = null; return; } // future month
+        // Retained = had a subscription active at ANY point during the offset month
+        // (overlap test). This makes M0 = 100% since the signup happens that month,
+        // instead of checking only the 1st (before a mid-month signup is active).
+        const retained = users.filter((u) => subIntervals.some((x) => x.userId === u && x.startMs < mEnd && x.endMs > mStart)).length;
+        retention[k] = size ? Math.round((retained / size) * 1000) / 10 : 0;
       });
       return { cohort: mk, size, retention };
     });
@@ -10561,12 +10586,20 @@ async function founderComputeMetrics() {
     a.mrr += iv.mrr;
     a.revenue += grossByUser.get(userId) || 0;
   });
+  // Per-source realized churn uses the SAME definition as the executive churn:
+  // churned last month / active at the start of last month (per source).
+  const startBySource = new Map();
+  snapStart.perUser.forEach((iv, userId) => {
+    const src = sourceForUser(userId);
+    startBySource.set(src, (startBySource.get(src) || 0) + 1);
+  });
   churnedCustomers.forEach((userId) => {
     const src = sourceForUser(userId);
     if (acqAgg.has(src)) acqAgg.get(src).churned += 1;
   });
   const acquisition = Array.from(acqAgg.values()).map((a) => {
-    const churnPct = a.customers + a.churned > 0 ? (a.churned / (a.customers + a.churned)) * 100 : 0;
+    const startCount = startBySource.get(a.source) || 0;
+    const churnPct = startCount > 0 ? (a.churned / startCount) * 100 : 0;
     const arpuSrc = a.customers ? a.mrr / a.customers : 0;
     const ltvSrc = monthlyChurnRate > 0 ? (arpuSrc * grossMarginFrac) / monthlyChurnRate : arpuSrc * grossMarginFrac * 36;
     return {
@@ -10659,6 +10692,8 @@ async function founderComputeMetrics() {
       arr: round2(arr),
       activeCustomers,
       activeSubscriptions,
+      activeScheduledToCancel: customersAtRisk,
+      netActiveCustomers: Math.max(0, activeCustomers - customersAtRisk),
       netRevenue: round2(netRevenueAfterRefunds),
       grossRevenue: round2(grossRevenue),
       paymentFees: round2(paymentFees),
