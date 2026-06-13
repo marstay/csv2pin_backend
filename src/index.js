@@ -7143,9 +7143,13 @@ function goalLabelForPreview(goal) {
 
 app.post('/api/urltopin/preview', async (req, res) => {
   let consumedGlobal = false;
+  // Local dev only: skip the per-IP + global caps so the preview can be tested
+  // repeatedly. Never active in production (see isLocalhostDevBypass).
+  const devBypassLimits = isLocalhostDevBypass(req);
   try {
     // 1. Strict per-IP limit (default: 1 free preview per IP per 24h).
     if (
+      !devBypassLimits &&
       !rateLimitTool(req, 'free-preview', {
         windowMs: FREE_PREVIEW_PER_IP_WINDOW_MS,
         max: FREE_PREVIEW_PER_IP_MAX,
@@ -7159,18 +7163,20 @@ app.post('/api/urltopin/preview', async (req, res) => {
     }
 
     // 2. Global daily circuit-breaker (protects the image budget).
-    if (!tryConsumeGlobalFreePreview()) {
-      return res.status(429).json({
-        error: 'preview_capacity',
-        message: 'Free previews are at capacity right now. Sign up free to generate your pins instantly.',
-      });
+    if (!devBypassLimits) {
+      if (!tryConsumeGlobalFreePreview()) {
+        return res.status(429).json({
+          error: 'preview_capacity',
+          message: 'Free previews are at capacity right now. Sign up free to generate your pins instantly.',
+        });
+      }
+      consumedGlobal = true;
     }
-    consumedGlobal = true;
 
     const { url, articleData, outputLanguage: rawOutputLanguage } = req.body || {};
     const rawUrl = String(url || '').trim();
     if (!rawUrl) {
-      refundGlobalFreePreview();
+      if (consumedGlobal) refundGlobalFreePreview();
       return res.status(400).json({ error: 'Missing url' });
     }
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
@@ -7183,7 +7189,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
       (base.title && String(base.title).trim().length >= 3) ||
       (base.description && String(base.description).trim().length >= 20);
     if (!hasScrapeContent) {
-      refundGlobalFreePreview();
+      if (consumedGlobal) refundGlobalFreePreview();
       return res.status(502).json({
         error: 'scrape_failed',
         message:
@@ -7204,7 +7210,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
     const plan = planStrategies(contentProfile, 1);
     const p = plan && plan[0];
     if (!p) {
-      refundGlobalFreePreview();
+      if (consumedGlobal) refundGlobalFreePreview();
       return res.status(502).json({ error: 'plan_failed', message: 'Could not plan a pin for this page.' });
     }
 
@@ -7267,7 +7273,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
     }
 
     if (!rawImageUrl) {
-      refundGlobalFreePreview();
+      if (consumedGlobal) refundGlobalFreePreview();
       return res.status(502).json({
         error: 'preview_image_failed',
         message: 'We couldn’t generate the preview just now. Please try again in a moment.',

@@ -7,12 +7,15 @@
  * Required env:
  *   RESEND_API_KEY        Resend API key (re_...). Without it, emails are skipped.
  * Optional env:
- *   EMAIL_FROM            From header, e.g. "URL2Pin <noreply@url2pin.com>".
+ *   EMAIL_FROM            From header. Prefer a personal, monitored sender (NOT "no-reply"),
+ *                         e.g. "Aristomenis from URL2Pin <aristomenis@url2pin.com>".
  *                         Defaults to Resend's shared test sender for early testing.
  *   FRONTEND_URL          Base app URL (used to build recovery links).
  *   BILLING_RECOVERY_URL  Where dunning links point. Defaults to `${FRONTEND_URL}/my-account`
  *                         (the page with the "Update payment method" recovery flow).
- *   SUPPORT_EMAIL         Reply-to address for support.
+ *   SUPPORT_EMAIL         Support address (also the default reply-to).
+ *   REPLY_TO_EMAIL        Reply-to for all emails. Defaults to SUPPORT_EMAIL. Set so replies
+ *                         always reach a real inbox — never send from an unmonitored "no-reply".
  */
 import fetch from 'node-fetch';
 
@@ -21,6 +24,10 @@ const EMAIL_FROM = String(process.env.EMAIL_FROM || 'URL2Pin <onboarding@resend.
 const FRONTEND_URL = String(process.env.FRONTEND_URL || 'https://url2pin.com').trim().replace(/\/$/, '');
 const BILLING_RECOVERY_URL = String(process.env.BILLING_RECOVERY_URL || `${FRONTEND_URL}/my-account`).trim();
 const SUPPORT_EMAIL = String(process.env.SUPPORT_EMAIL || 'support@url2pin.com').trim();
+// Default reply-to so every email is replyable even if a send doesn't pass one.
+// Avoid "no-reply" senders: replies build trust + are a positive inbox signal,
+// and at this stage they're a valuable feedback/support channel.
+const REPLY_TO_EMAIL = String(process.env.REPLY_TO_EMAIL || SUPPORT_EMAIL).trim();
 
 // Upgrades / plan changes go through the Pricing page, which routes active
 // subscribers to change-plan (and free users to checkout) automatically.
@@ -30,6 +37,8 @@ const APP_URL = String(process.env.APP_URL || FRONTEND_URL).trim().replace(/\/$/
 
 const BRAND = 'URL2Pin';
 const ACCENT = '#1A237E';
+// Personal founder voice: emails are signed by the founder and invite replies.
+const FOUNDER_NAME = String(process.env.FOUNDER_NAME || 'Aristomenis').trim();
 const PLAN_LABELS = { free: 'Free', starter: 'Starter', creator: 'Creator', pro: 'Pro', agency: 'Agency' };
 const PLAN_PRICES_USD = { free: 0, starter: 9, creator: 19, pro: 39, agency: 79 };
 const PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
@@ -65,7 +74,7 @@ export async function sendEmail({ to, subject, html, replyTo } = {}) {
         to: [recipient],
         subject,
         html,
-        ...(replyTo ? { reply_to: replyTo } : {}),
+        ...((replyTo || REPLY_TO_EMAIL) ? { reply_to: String(replyTo || REPLY_TO_EMAIL).trim() } : {}),
       }),
     });
     const json = await resp.json().catch(() => ({}));
@@ -82,11 +91,20 @@ export async function sendEmail({ to, subject, html, replyTo } = {}) {
 }
 
 /** Shared responsive shell. Keep inline styles — many clients strip <style>. */
-function emailLayout({ heading, bodyHtml, ctaText, ctaUrl, footerNote }) {
+function emailLayout({ heading, bodyHtml, ctaText, ctaUrl, footerNote, ps, signoff = true }) {
   const cta = ctaText && ctaUrl
     ? `<tr><td style="padding:8px 0 24px;">
          <a href="${ctaUrl}" style="display:inline-block;background:${ACCENT};color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:12px 22px;border-radius:8px;">${ctaText}</a>
        </td></tr>`
+    : '';
+  const signature = signoff
+    ? `<tr><td style="font-size:15px;line-height:1.6;color:#3a3a3a;padding:4px 0 0;">
+         — ${FOUNDER_NAME}<br/>
+         <span style="color:#8a8f98;font-size:13px;">Founder, ${BRAND}</span>
+       </td></tr>`
+    : '';
+  const psBlock = ps
+    ? `<tr><td style="font-size:13px;line-height:1.6;color:#6a6f78;padding:18px 0 0;">P.S. ${ps}</td></tr>`
     : '';
   return `<!doctype html>
 <html>
@@ -102,6 +120,8 @@ function emailLayout({ heading, bodyHtml, ctaText, ctaUrl, footerNote }) {
               <tr><td style="font-size:20px;font-weight:700;color:#1a1a1a;padding-bottom:12px;">${heading}</td></tr>
               <tr><td style="font-size:15px;line-height:1.6;color:#3a3a3a;padding-bottom:20px;">${bodyHtml}</td></tr>
               ${cta}
+              ${signature}
+              ${psBlock}
             </table>
           </td></tr>
           <tr><td style="padding:18px 28px;border-top:1px solid #eef0f3;font-size:12px;line-height:1.5;color:#8a8f98;">
@@ -130,6 +150,7 @@ export function renderPaymentFailedEmail({ planType, recoveryUrl } = {}) {
     bodyHtml,
     ctaText: 'Update payment & restore my plan',
     ctaUrl: url,
+    ps: `If you think this is a mistake or you'd like a hand, just reply to this email — it comes straight to me and I'll sort it out personally.`,
     footerNote: `You're receiving this because a recent charge for your ${BRAND} subscription failed.`,
   });
   return { subject, html };
@@ -180,6 +201,7 @@ export function renderUpgradeNudgeEmail({ currentPlan, used, limit, reason } = {
     bodyHtml,
     ctaText: `Upgrade to ${nextLabel}`,
     ctaUrl: url,
+    ps: `Not sure which plan fits your volume? Reply and tell me what you're working on — I'll point you to the right one.`,
     footerNote: `You're receiving this because you're an active ${curLabel} user on ${BRAND}.`,
   });
   return { subject, html };
@@ -211,6 +233,7 @@ export function renderWelcomeEmail() {
     bodyHtml,
     ctaText: 'Create my first pin',
     ctaUrl: APP_URL,
+    ps: `Hit reply and tell me what you're promoting — I read every email and I'm happy to suggest the best first URL to try.`,
     footerNote: `You're receiving this because you just created a ${BRAND} account.`,
   });
   return { subject, html };
@@ -228,6 +251,7 @@ export function renderFirstPinEmail() {
     bodyHtml,
     ctaText: 'Create my first pin',
     ctaUrl: APP_URL,
+    ps: `Stuck on what to pin first? Reply with your niche and I'll suggest a good URL to start with.`,
     footerNote: `You're receiving this because you have a ${BRAND} account but no pins yet.`,
   });
   return { subject, html };
@@ -245,6 +269,7 @@ export function renderDay3TipEmail() {
     bodyHtml,
     ctaText: 'Create more pins',
     ctaUrl: APP_URL,
+    ps: `Got a product you're not sure how to pin? Reply and I'll brainstorm a few angles with you.`,
     footerNote: `You're receiving this as part of getting started with ${BRAND}.`,
   });
   return { subject, html };
@@ -286,6 +311,7 @@ export function renderAnnualUpgradeEmail({ planType } = {}) {
     bodyHtml,
     ctaText: 'Switch to annual',
     ctaUrl: UPGRADE_URL,
+    ps: `Want me to switch you over manually so you don't lose your current billing date? Just reply and I'll handle it.`,
     footerNote: `You're receiving this because you're on the monthly ${label} plan.`,
   });
   return { subject, html };
