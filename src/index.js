@@ -2087,6 +2087,8 @@ const URL_SHORTENER_HOSTNAMES = new Set([
   // Amazon affiliate / Genius-style short links (must expand so ASIN + Amazon flows run)
   'amzlink.to',
   'amznlink.to',
+  // Walmart official share/affiliate short links (expand → walmart.com/ip/...)
+  'walmrt.us',
   'netlify.app',
   'netlify.com',
   'etsy.me',
@@ -2208,6 +2210,9 @@ const AFFILIATE_TRACKING_HOST_EXACT = new Set([
   'track.flexlinkspro.com',
   // Refersion
   'rfer.us',
+  // Walmart Creator / Impact affiliate redirect domains (expand → walmart.com/ip/...)
+  'goto.walmart.com',
+  'linkst.walmart.com',
 ]);
 
 function isAffiliateTrackingRedirectHost(host) {
@@ -2730,6 +2735,19 @@ function assessUrlBrandingGate(urlString) {
       };
     }
 
+    if (isWalmartRelatedHost(host)) {
+      const productish = /\/ip\//i.test(path) || /\/browse\//i.test(path) || /\/cp\//i.test(path);
+      const reason = productish ? 'walmart_product_affiliate' : 'walmart_store';
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: reason,
+        brandingGateMessage:
+          reason === 'walmart_product_affiliate'
+            ? 'This looks like a Walmart product or affiliate link. Pins should show your brand in the footer, not Walmart. Before generating, open Pin look & brand and add your brand name or CTA (e.g. your site name).'
+            : 'This looks like a Walmart page. Before generating pins, add your brand name or CTA so the footer represents you, not the store.',
+      };
+    }
+
     if (isAmazonRelatedHost(host)) {
       const hasAffiliate =
         /[?&]tag=[^&]+/i.test(search) ||
@@ -2786,6 +2804,380 @@ function isAmazonProductPageForNanoReference(urlString) {
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Walmart support — mirrors the Amazon affiliate product-image pipeline:
+// detect Walmart product/affiliate links, harvest the product hero photo
+// (HTML scrape first, RapidAPI fallback because Walmart blocks bots hard),
+// and feed it to Nano Banana as a reference. Footer stays the user's brand/CTA.
+// ---------------------------------------------------------------------------
+
+/** Walmart's official share/affiliate short-link domains (resolve to a product page). */
+function isWalmartShortLinkHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (h === 'walmrt.us' || h.endsWith('.walmrt.us')) return true;
+  if (h === 'goto.walmart.com' || h.endsWith('.goto.walmart.com')) return true;
+  if (h === 'linkst.walmart.com' || h.endsWith('.linkst.walmart.com')) return true;
+  return false;
+}
+
+function isWalmartRelatedHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (isWalmartShortLinkHost(h)) return true;
+  if (h === 'walmart.com' || h.endsWith('.walmart.com')) return true;
+  return false;
+}
+
+/** Numeric item id from https://www.walmart.com/ip/<slug>/<itemId> (or /ip/<itemId>). */
+function extractWalmartItemIdFromUrl(urlString) {
+  try {
+    const raw = String(urlString || '').trim();
+    if (!raw) return '';
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!isWalmartRelatedHost(u.hostname)) return '';
+    const path = u.pathname || '';
+    let m = path.match(/\/ip\/(?:[^/]+\/)?(\d{5,15})(?:\/|$)/i);
+    if (m) return m[1];
+    m = String(u.search || '').match(/[?&](?:item_id|itemId|selectedItemId)=(\d{5,15})/i);
+    if (m) return m[1];
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+/** Product / affiliate pages where we try to attach Walmart product images to Nano Banana. */
+function isWalmartProductPageForNanoReference(urlString) {
+  try {
+    const raw = String(urlString || '').trim();
+    if (!raw) return false;
+    const u = new URL(raw);
+    if (!isWalmartRelatedHost(u.hostname)) return false;
+    // Short links (walmrt.us, goto.walmart.com) are always product/affiliate shares — the
+    // RapidAPI provider resolves them server-side even when our own fetch hits the bot wall.
+    if (isWalmartShortLinkHost(u.hostname)) return true;
+    const path = u.pathname || '';
+    return /\/ip\//i.test(path) || !!extractWalmartItemIdFromUrl(raw);
+  } catch {
+    return false;
+  }
+}
+
+function pickWalmartContextUrl(inputUrl, canonicalUrl) {
+  const rawInput = String(inputUrl || '').trim();
+  const rawCanon = String(canonicalUrl || '').trim();
+  try {
+    if (rawCanon) {
+      const cu = new URL(rawCanon);
+      if (isWalmartRelatedHost(cu.hostname)) return rawCanon;
+    }
+  } catch {
+    // ignore
+  }
+  return rawInput;
+}
+
+/** Walmart product photos live on i5.walmartimages.com (and regional *.walmartimages.com). */
+function isAllowedWalmartCdnImageUrl(urlString) {
+  try {
+    const u = new URL(urlString);
+    if (!/^https:/i.test(u.protocol)) return false;
+    return u.hostname.toLowerCase().endsWith('walmartimages.com');
+  } catch {
+    return false;
+  }
+}
+
+function normalizeWalmartImageUrlString(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (s.startsWith('//')) s = `https:${s}`;
+  // Walmart embeds image URLs inside JSON with escaped slashes.
+  s = s.replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
+  try {
+    const p = new URL(s);
+    if (!isAllowedWalmartCdnImageUrl(p.href)) return null;
+    // Strip sizing query (?odnHeight=...&odnWidth=...) so we mirror the full-res asset.
+    return `${p.origin}${p.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Recursively pull Product images out of a JSON-LD node using a CDN-specific normalizer. */
+function collectLdJsonProductImagesWith(node, out, seen, normalizeFn) {
+  if (node == null) return;
+  if (Array.isArray(node)) {
+    node.forEach((x) => collectLdJsonProductImagesWith(x, out, seen, normalizeFn));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  if (node['@graph']) collectLdJsonProductImagesWith(node['@graph'], out, seen, normalizeFn);
+  const typesRaw = node['@type'];
+  const types = Array.isArray(typesRaw)
+    ? typesRaw.map((t) => String(t).toLowerCase())
+    : typesRaw
+      ? [String(typesRaw).toLowerCase()]
+      : [];
+  const isProduct = types.some((t) => t.includes('product'));
+  if (isProduct && node.image != null) {
+    const imgs = Array.isArray(node.image) ? node.image : [node.image];
+    for (const im of imgs) {
+      let raw = null;
+      if (typeof im === 'string') raw = im;
+      else if (im && typeof im === 'object' && im.url) raw = im.url;
+      const n = raw ? normalizeFn(raw) : null;
+      if (n && !seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+  }
+  for (const key of Object.keys(node)) {
+    if (key === '@context' || key === '@type' || key === '@id' || key === '@graph') continue;
+    collectLdJsonProductImagesWith(node[key], out, seen, normalizeFn);
+  }
+}
+
+function extractWalmartProductImageUrlsFromHtml(html, pageUrl = '') {
+  if (!html || typeof html !== 'string') return [];
+  const ordered = [];
+  const seen = new Set();
+  const push = (raw) => {
+    const n = normalizeWalmartImageUrlString(raw);
+    if (!n || seen.has(n)) return;
+    seen.add(n);
+    ordered.push(n);
+  };
+  let m;
+  const ogRe = /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while ((m = ogRe.exec(html)) !== null) push(m[1]);
+  const ogReAlt = /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["'][^>]*>/gi;
+  while ((m = ogReAlt.exec(html)) !== null) push(m[1]);
+  const twRe = /<meta[^>]+name=["']twitter:image["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while ((m = twRe.exec(html)) !== null) push(m[1]);
+
+  const scriptRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  while ((m = scriptRe.exec(html)) !== null) {
+    try {
+      const jsonText = m[1].trim();
+      if (!jsonText) continue;
+      const out = [];
+      const seenLd = new Set();
+      collectLdJsonProductImagesWith(JSON.parse(jsonText), out, seenLd, normalizeWalmartImageUrlString);
+      out.forEach(push);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Gallery URLs embedded in __NEXT_DATA__ / inline JSON (escaped or plain).
+  const cdnRe = /https?:(?:\\u002f|\\\/|\/){2}i5\.walmartimages\.com(?:\\u002f|\\\/|\/)[^"'\\\s)]+/gi;
+  let c;
+  while ((c = cdnRe.exec(html)) !== null && ordered.length < 12) push(c[0]);
+
+  return ordered.slice(0, 12);
+}
+
+/** Walmart bot/consent interstitials surface as generic/empty titles. */
+function looksLikeBlockedWalmartTitle(title) {
+  const t = String(title || '').trim().toLowerCase();
+  if (!t) return true;
+  if (t === 'walmart.com' || t.startsWith('walmart.com')) return true;
+  if (t.includes('robot or human')) return true;
+  if (t.includes('access denied')) return true;
+  if (t.includes('activate and hold')) return true;
+  if (t.includes('are you a human')) return true;
+  return false;
+}
+
+// Short-lived cache so strategic fan-out doesn't hammer RapidAPI for the same item.
+const WALMART_RAPIDAPI_CACHE_TTL_MS = 2 * 60 * 1000;
+const walmartRapidApiCache = new Map();
+const walmartRapidApiInFlight = new Map();
+
+function deepCollectWalmartImageUrls(node, out, seen, cap = 12) {
+  if (node == null || out.length >= cap) return;
+  if (typeof node === 'string') {
+    if (/walmartimages\.com/i.test(node)) {
+      const n = normalizeWalmartImageUrlString(node);
+      if (n && !seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const x of node) deepCollectWalmartImageUrls(x, out, seen, cap);
+    return;
+  }
+  if (typeof node === 'object') {
+    for (const k of Object.keys(node)) deepCollectWalmartImageUrls(node[k], out, seen, cap);
+  }
+}
+
+/** Accept any https(s) image URL the provider returns (not just walmartimages CDN). */
+function normalizeProviderImageUrlString(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (!s) return null;
+  if (s.startsWith('//')) s = `https:${s}`;
+  s = s.replace(/\\u002f/gi, '/').replace(/\\\//g, '/');
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    if (/\.svg(\?|$)/i.test(u.pathname || '')) return null;
+    return u.href;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * RapidAPI Walmart product data — locked to the "Walmart API" by mahmudulhasandev:
+ *   https://rapidapi.com/mahmudulhasandev/api/walmart-api4
+ *   GET https://walmart-api4.p.rapidapi.com/product-details.php?url=<full product URL>
+ *   → { original_status, pc_status, url, body: { title, price, currency, images:[...], ratings, reviewsCount } }
+ *
+ * Only RAPIDAPI_KEY is required (host/endpoint default to this provider). To swap providers later,
+ * set RAPIDAPI_WALMART_HOST and RAPIDAPI_WALMART_URL_TEMPLATE ({host},{itemId},{url} placeholders).
+ * Returns { title, description, images:[urls] } or null.
+ */
+async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
+  let cacheKey = '';
+  try {
+    const key = String(process.env.RAPIDAPI_KEY || '').trim();
+    const host =
+      String(process.env.RAPIDAPI_WALMART_HOST || '').trim() || 'walmart-api4.p.rapidapi.com';
+    if (!key) return null;
+    const id = String(itemId || '').trim();
+    const link = String(url || '').trim();
+    // This provider keys off the full product URL; bail if we have neither.
+    if (!id && !link) return null;
+
+    cacheKey = `${host}::${link || id}`;
+    const now = Date.now();
+    const cached = walmartRapidApiCache.get(cacheKey);
+    if (cached && cached.data && now - cached.ts < WALMART_RAPIDAPI_CACHE_TTL_MS) {
+      return cached.data;
+    }
+    const inflight = walmartRapidApiInFlight.get(cacheKey);
+    if (inflight) return await inflight;
+
+    const template =
+      String(process.env.RAPIDAPI_WALMART_URL_TEMPLATE || '').trim() ||
+      'https://{host}/product-details.php?url={url}';
+    const endpoint = template
+      .replace(/\{host\}/g, host)
+      .replace(/\{itemId\}/g, encodeURIComponent(id))
+      .replace(/\{url\}/g, encodeURIComponent(link));
+
+    const p = (async () => {
+      const resp = await fetchWithTimeout(
+        endpoint,
+        {
+          headers: {
+            'x-rapidapi-key': key,
+            'x-rapidapi-host': host,
+            Accept: 'application/json',
+          },
+        },
+        20000
+      );
+      if (!resp.ok) return null;
+      const json = await resp.json().catch(() => null);
+      if (!json || typeof json !== 'object') return null;
+
+      // walmart-api4 wraps everything in `body`; tolerate flatter shapes too.
+      const body = json.body && typeof json.body === 'object' ? json.body : json;
+
+      const images = [];
+      const seen = new Set();
+      if (Array.isArray(body.images)) {
+        for (const im of body.images) {
+          const raw = typeof im === 'string' ? im : im && typeof im === 'object' ? im.url || im.src : '';
+          const n = normalizeProviderImageUrlString(raw);
+          if (n && !seen.has(n)) {
+            seen.add(n);
+            images.push(n);
+          }
+          if (images.length >= 12) break;
+        }
+      }
+      // Fallback: deep-scan for walmartimages CDN URLs if the provider shape changes.
+      if (images.length === 0) {
+        deepCollectWalmartImageUrls(json, images, seen, 12);
+      }
+
+      const title = String(
+        body.title || body.name || body.productName || json.title || ''
+      ).trim();
+      const description = String(
+        body.description || body.shortDescription || body.short_description || ''
+      )
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const data = { title, description, images };
+      walmartRapidApiCache.set(cacheKey, { ts: Date.now(), data });
+      return data;
+    })();
+    walmartRapidApiInFlight.set(cacheKey, p);
+    return await p;
+  } catch (e) {
+    console.warn('fetchWalmartProductDataViaRapidApi:', e.message || e);
+    return null;
+  } finally {
+    if (cacheKey) {
+      try {
+        walmartRapidApiInFlight.delete(cacheKey);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
+ * Harvest Walmart product reference images (mirrored to Supabase → public URLs) for Nano Banana.
+ * HTML scrape first, RapidAPI fallback when Walmart blocks the scrape.
+ * Returns { images: string[], rapid: {title,description,images}|null }.
+ */
+async function harvestWalmartReferenceImages(walmartUrl, userId, preRapid = null) {
+  const result = { images: [], rapid: preRapid || null };
+  try {
+    let candidates = [];
+    if (preRapid && Array.isArray(preRapid.images) && preRapid.images.length > 0) {
+      candidates = preRapid.images;
+    }
+    if (candidates.length === 0) {
+      try {
+        const html = await fetchArticleHtml(walmartUrl);
+        candidates = extractWalmartProductImageUrlsFromHtml(html, walmartUrl);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (candidates.length === 0) {
+      const rapid = await fetchWalmartProductDataViaRapidApi({
+        itemId: extractWalmartItemIdFromUrl(walmartUrl),
+        url: walmartUrl,
+      });
+      result.rapid = rapid;
+      if (rapid && Array.isArray(rapid.images)) candidates = rapid.images;
+    }
+    if (candidates.length > 0) {
+      result.images = await mirrorGenericPageImageUrlsForNanoBanana(candidates.slice(0, 3), userId);
+    }
+  } catch (e) {
+    console.warn('harvestWalmartReferenceImages:', e.message || e);
+  }
+  return result;
 }
 
 /** Nano Banana + reference images often 422 or look wrong on infographic-style layouts. */
@@ -7201,8 +7593,11 @@ app.post('/api/urltopin/preview', async (req, res) => {
     let contentProfile = await enrichContentProfile(base, openai);
     try {
       const abs = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
-      if (isAmazonRelatedHost(new URL(abs).hostname)) {
+      const ctxHost = new URL(abs).hostname;
+      if (isAmazonRelatedHost(ctxHost)) {
         contentProfile = { ...contentProfile, amazonLanding: true };
+      } else if (isWalmartRelatedHost(ctxHost)) {
+        contentProfile = { ...contentProfile, walmartLanding: true };
       }
     } catch {
       /* ignore invalid url */
@@ -7253,7 +7648,10 @@ app.post('/api/urltopin/preview', async (req, res) => {
       overlayText,
       brand: null,
       stepCount: meta.step_count ?? null,
-      niche: contentProfile?.amazonLanding === true ? 'amazon_affiliate' : contentProfile?.niche || null,
+      niche:
+        contentProfile?.amazonLanding === true || contentProfile?.walmartLanding === true
+          ? 'amazon_affiliate'
+          : contentProfile?.niche || null,
     });
     imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, rawUrl);
 
@@ -7352,8 +7750,11 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
     try {
       const rawU = String(url || '').trim();
       const abs = /^https?:\/\//i.test(rawU) ? rawU : `https://${rawU}`;
-      if (isAmazonRelatedHost(new URL(abs).hostname)) {
+      const ctxHost = new URL(abs).hostname;
+      if (isAmazonRelatedHost(ctxHost)) {
         contentProfile = { ...contentProfile, amazonLanding: true };
+      } else if (isWalmartRelatedHost(ctxHost)) {
+        contentProfile = { ...contentProfile, walmartLanding: true };
       }
     } catch {
       /* ignore invalid url */
@@ -7452,8 +7853,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       let contentProfile = await enrichContentProfile(base, openai, winnerContext);
       try {
         const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
-        if (isAmazonRelatedHost(new URL(abs).hostname)) {
+        const ctxHost = new URL(abs).hostname;
+        if (isAmazonRelatedHost(ctxHost)) {
           contentProfile = { ...contentProfile, amazonLanding: true };
+        } else if (isWalmartRelatedHost(ctxHost)) {
+          contentProfile = { ...contentProfile, walmartLanding: true };
         }
       } catch {
         /* ignore */
@@ -7542,6 +7946,38 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         articleSummary = rapidSummary;
       }
       base.amazon_blocked = false;
+    }
+
+    // Walmart: blocks bots aggressively, so when scraping returns a bot/empty title,
+    // recover the product title/description (and reuse images) from RapidAPI before spending quota.
+    const walmartCtxUrl = pickWalmartContextUrl(effectiveUrl, base.canonicalUrl);
+    let walmartRapid = null;
+    if (
+      isWalmartProductPageForNanoReference(walmartCtxUrl) &&
+      (!base.title || looksLikeBlockedWalmartTitle(base.title))
+    ) {
+      try {
+        walmartRapid = await fetchWalmartProductDataViaRapidApi({
+          itemId: extractWalmartItemIdFromUrl(walmartCtxUrl),
+          url: walmartCtxUrl,
+        });
+      } catch {
+        walmartRapid = null;
+      }
+      if (walmartRapid) {
+        if ((!base.title || looksLikeBlockedWalmartTitle(base.title)) && walmartRapid.title) {
+          base.title = walmartRapid.title;
+        }
+        if (!base.description && walmartRapid.description) {
+          base.description = walmartRapid.description.slice(0, 450);
+        }
+        if (!articleSummary && walmartRapid.description) {
+          articleSummary = walmartRapid.description.slice(0, 600);
+        }
+      } else if (manualProduct?.title) {
+        base.title = manualProduct.title;
+        if (manualProduct.description) base.description = manualProduct.description.slice(0, 450);
+      }
     }
 
     // Own-photo composites use a separate monthly cap (no image model). AI pins use pins_used.
@@ -7695,6 +8131,37 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }
     } else if (
       !metadataOnly &&
+      process.env.URLTOPIN_WALMART_PRODUCT_IMAGES !== '0' &&
+      !useTextBased &&
+      !useUserComposite &&
+      process.env.USE_DUMMY_IMAGES !== 'true' &&
+      nanoBananaReferenceInputs.length === 0 &&
+      isWalmartProductPageForNanoReference(walmartCtxUrl)
+    ) {
+      try {
+        const harvested = await harvestWalmartReferenceImages(
+          walmartCtxUrl,
+          req.user.id,
+          walmartRapid
+        );
+        nanoBananaReferenceInputs = harvested.images;
+        if (harvested.rapid) walmartRapid = harvested.rapid;
+        if (nanoBananaReferenceInputs.length > 0) {
+          nanoBananaReferenceSource = 'walmart_product';
+          console.log(
+            `urltopin: Nano Banana Walmart reference images: ${nanoBananaReferenceInputs.length} (${String(walmartCtxUrl).slice(0, 96)})`
+          );
+        } else {
+          console.warn(
+            '[urltopin] Walmart product page: no reference images attached this run (pins will use AI-only visuals).',
+            { url: String(walmartCtxUrl).slice(0, 120), rapidApi: !!walmartRapid }
+          );
+        }
+      } catch (e) {
+        console.warn('urltopin Walmart product images for Nano:', e.message || e);
+      }
+    } else if (
+      !metadataOnly &&
       usePageReferenceImages &&
       process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0' &&
       !useTextBased &&
@@ -7791,7 +8258,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const contentProfile = req._contentProfile || null;
     const niche = contentProfile?.niche || null;
     const nicheForVisualHints =
-      contentProfile?.amazonLanding === true ? 'amazon_affiliate' : niche;
+      contentProfile?.amazonLanding === true || contentProfile?.walmartLanding === true
+        ? 'amazon_affiliate'
+        : niche;
     const stylePrompts = [];
     let strategicMetadataByIndex = [];
     let keyIdeas = [];
@@ -8024,7 +8493,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         brand: brandForPrompt,
         stepCount: meta.step_count ?? null,
         niche:
-          contentProfile?.amazonLanding === true
+          contentProfile?.amazonLanding === true || contentProfile?.walmartLanding === true
             ? 'amazon_affiliate'
             : contentProfile?.niche || null,
       });
@@ -8039,6 +8508,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
               promptTier(
                 'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
                 'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+              );
+          } else if (nanoBananaReferenceSource === 'walmart_product') {
+            imagePrompt +=
+              ' ' +
+              promptTier(
+                'Attached reference image(s) show the real product from the Walmart listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
+                'Reference: use attached Walmart product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
               );
           } else if (nanoBananaReferenceSource === 'etsy_product') {
             imagePrompt +=
@@ -8706,6 +9182,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     let regenNanoReferenceInputs = [];
     let regenNanoReferenceSource = null;
     const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base.canonicalUrl);
+    const walmartCtxUrl = pickWalmartContextUrl(effectiveUrl, base.canonicalUrl);
     const refHtmlUrl = amazonCtxUrl || effectiveUrl;
     // Etsy: RapidAPI listing images when present; else oEmbed thumbnail.
     if (isEtsyHost(new URL(effectiveUrl).hostname)) {
@@ -8787,6 +9264,29 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
         console.warn('urltopin regenerate Amazon refs:', e.message || e);
       }
     } else if (
+      process.env.URLTOPIN_WALMART_PRODUCT_IMAGES !== '0' &&
+      regenNanoReferenceInputs.length === 0 &&
+      isWalmartProductPageForNanoReference(walmartCtxUrl)
+    ) {
+      try {
+        const walmartRapid = await fetchWalmartProductDataViaRapidApi({
+          itemId: extractWalmartItemIdFromUrl(walmartCtxUrl),
+          url: walmartCtxUrl,
+        });
+        if (walmartRapid && walmartRapid.title && looksLikeBlockedWalmartTitle(topic)) {
+          topic = walmartRapid.title;
+        }
+        const harvested = await harvestWalmartReferenceImages(
+          walmartCtxUrl,
+          req.user.id,
+          walmartRapid
+        );
+        regenNanoReferenceInputs = harvested.images;
+        if (regenNanoReferenceInputs.length > 0) regenNanoReferenceSource = 'walmart_product';
+      } catch (e) {
+        console.warn('urltopin regenerate Walmart refs:', e.message || e);
+      }
+    } else if (
       usePageReferenceImages &&
       process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0'
     ) {
@@ -8815,7 +9315,10 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     let regenNicheHint = null;
     try {
       const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
-      if (isAmazonRelatedHost(new URL(abs).hostname)) regenNicheHint = 'amazon_affiliate';
+      const ctxHost = new URL(abs).hostname;
+      if (isAmazonRelatedHost(ctxHost) || isWalmartRelatedHost(ctxHost)) {
+        regenNicheHint = 'amazon_affiliate';
+      }
     } catch {
       /* ignore */
     }
@@ -8886,6 +9389,13 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
           promptTier(
             'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
             'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
+          );
+      } else if (regenNanoReferenceSource === 'walmart_product') {
+        imagePromptForNano +=
+          ' ' +
+          promptTier(
+            'Attached reference image(s) show the real product from the Walmart listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+            'Reference: use attached Walmart product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
           );
       } else if (regenNanoReferenceSource === 'etsy_product') {
         imagePromptForNano +=
@@ -9204,6 +9714,31 @@ app.post('/api/urltopin/product-info', requireUser, async (req, res) => {
             }
           } catch {
             /* ignore */
+          }
+        }
+      }
+    }
+    // Walmart: scrape product image, then RapidAPI fallback (and title) when blocked.
+    const walmartCtxUrl = pickWalmartContextUrl(effectiveUrl, base?.canonicalUrl);
+    if (!imageUrl && isWalmartProductPageForNanoReference(walmartCtxUrl)) {
+      try {
+        const wHtml = await fetchArticleHtml(walmartCtxUrl);
+        const candidates = extractWalmartProductImageUrlsFromHtml(wHtml, walmartCtxUrl);
+        if (candidates.length > 0) imageUrl = candidates[0];
+      } catch {
+        /* ignore */
+      }
+      if (!title || looksLikeBlockedWalmartTitle(title) || !imageUrl) {
+        const rapid = await fetchWalmartProductDataViaRapidApi({
+          itemId: extractWalmartItemIdFromUrl(walmartCtxUrl),
+          url: walmartCtxUrl,
+        });
+        if (rapid) {
+          if ((!title || looksLikeBlockedWalmartTitle(title)) && rapid.title) {
+            title = String(rapid.title).trim();
+          }
+          if (!imageUrl && Array.isArray(rapid.images) && rapid.images.length) {
+            imageUrl = rapid.images[0];
           }
         }
       }
