@@ -3109,7 +3109,10 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
     const key = String(process.env.RAPIDAPI_KEY || '').trim();
     const host =
       String(process.env.RAPIDAPI_WALMART_HOST || '').trim() || 'walmart-data.p.rapidapi.com';
-    if (!key) return null;
+    if (!key) {
+      console.warn('[walmart] RAPIDAPI_KEY is not set in this environment — falling back to scrape (will hit Walmart bot wall).');
+      return null;
+    }
     const id = String(itemId || '').trim();
     let link = String(url || '').trim();
     // This provider keys off the full product URL; bail if we have neither.
@@ -3153,9 +3156,18 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
         },
         45000 // this provider scrapes live; product pages can take ~30s.
       );
-      if (!resp.ok) return null;
+      if (!resp.ok) {
+        const snippet = await resp.text().catch(() => '');
+        console.warn(
+          `[walmart] RapidAPI ${resp.status} for ${host} — ${snippet.slice(0, 160)} (key …${key.slice(-4)})`
+        );
+        return null;
+      }
       const json = await resp.json().catch(() => null);
       if (!json || typeof json !== 'object') return null;
+      if (json.pc_status && json.pc_status >= 400) {
+        console.warn(`[walmart] provider could not scrape ${link} — pc_status ${json.pc_status} ${String(json.error || '').slice(0, 120)}`);
+      }
 
       // walmart-data wraps everything in `body`; tolerate flatter shapes too.
       const body = json.body && typeof json.body === 'object' ? json.body : json;
@@ -3190,6 +3202,9 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
         .trim();
 
       const data = { title, description, images };
+      console.log(
+        `[walmart] RapidAPI ok — title:"${title.slice(0, 60)}" images:${images.length} (${String(link).slice(0, 80)})`
+      );
       walmartRapidApiCache.set(cacheKey, { ts: Date.now(), data });
       return data;
     })();
