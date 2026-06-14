@@ -29,7 +29,6 @@ import {
   nextPlanFor,
   sendWelcomeEmail,
   sendFirstPinEmail,
-  sendDay3TipEmail,
   isEmailEnabled,
 } from './email.js';
 dotenv.config();
@@ -1739,22 +1738,6 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
 
       if (upsertError) {
         console.warn('pin_usage upsert error:', upsertError.message || upsertError);
-      }
-
-      // Proactive expansion nudge: fire once when AI usage first crosses 80% of the plan cap.
-      if (aiDelta > 0 && !unlimitedPins && planPinsLimit > 0) {
-        const newEffectiveAi = Math.max(0, newAi - baselineAi);
-        const threshold = planPinsLimit * 0.8;
-        if (effectiveCurrentAi < threshold && newEffectiveAi >= threshold && newEffectiveAi <= planPinsLimit) {
-          void triggerUpgradeNudge({
-            userId,
-            planType,
-            used: newEffectiveAi,
-            limit: planPinsLimit,
-            reason: 'approaching_limit',
-            yearMonth,
-          });
-        }
       }
 
       return {
@@ -5687,7 +5670,6 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * (never the existing backlog), and idempotent via email_events:
  *   - welcome:               age < 2 days
  *   - activation_first_pin:  1–3 days old AND no pin generated yet
- *   - day3_tip:              3–5 days old
  */
 async function processOnboardingEmails() {
   if (!isEmailEnabled()) return;
@@ -5725,12 +5707,6 @@ async function processOnboardingEmails() {
         if (await claimEmailEvent(uid, 'activation_first_pin')) {
           const r = await sendFirstPinEmail({ to: email });
           if (r?.ok) { sent += 1; console.log('onboarding: first-pin sent', { uid }); }
-        }
-      }
-      if (ageDays >= 3 && ageDays < 5) {
-        if (await claimEmailEvent(uid, 'day3_tip')) {
-          const r = await sendDay3TipEmail({ to: email });
-          if (r?.ok) { sent += 1; console.log('onboarding: day3-tip sent', { uid }); }
         }
       }
     } catch (e) {

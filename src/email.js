@@ -164,7 +164,7 @@ export async function sendPaymentFailedEmail({ to, planType, recoveryUrl } = {})
 
 /**
  * Build the "you're out of / running low on pins — upgrade" expansion email.
- * `reason` is 'limit_reached' or 'approaching_limit'.
+ * `reason` is 'limit_reached' (sent when the user hits their monthly AI pin cap).
  */
 export function renderUpgradeNudgeEmail({ currentPlan, used, limit, reason } = {}) {
   const cur = String(currentPlan || '').toLowerCase();
