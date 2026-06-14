@@ -2900,10 +2900,66 @@ function normalizeWalmartImageUrlString(raw) {
   try {
     const p = new URL(s);
     if (!isAllowedWalmartCdnImageUrl(p.href)) return null;
-    // Strip sizing query (?odnHeight=...&odnWidth=...) so we mirror the full-res asset.
+    // Drop non-photo assets (Walmart mixes in interactive-video.svg etc.).
+    if (/\.svg(\?|$)/i.test(p.pathname || '')) return null;
+    // Strip sizing query (?odnHeight=117&odnWidth=117) so we mirror the full-res asset.
     return `${p.origin}${p.pathname}`;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Resolve a Walmart share/affiliate short link to a real product URL. The provider can't
+ * scrape walmrt.us / goto.walmart.com directly, but the destination item id is embedded in
+ * the goto.walmart.com redirect (?u=... / ?prodsku=...). Returns '' if it can't resolve.
+ */
+async function resolveWalmartShortLinkToProductUrl(shortUrl) {
+  try {
+    let current = String(shortUrl || '').trim();
+    if (!current) return '';
+    for (let hop = 0; hop < 4; hop++) {
+      let u;
+      try {
+        u = new URL(current);
+      } catch {
+        return '';
+      }
+      const host = normalizeUrlHostname(u.hostname);
+      // Already a usable product URL.
+      if ((host === 'walmart.com' || host.endsWith('.walmart.com')) && /\/ip\//i.test(u.pathname || '')) {
+        return current;
+      }
+      // goto.walmart.com carries the destination in ?u= and the item id in ?prodsku=.
+      if (host === 'goto.walmart.com' || host.endsWith('.goto.walmart.com')) {
+        const uParam = u.searchParams.get('u');
+        if (uParam) {
+          let dest = uParam;
+          try {
+            dest = decodeURIComponent(uParam);
+          } catch {
+            /* use raw */
+          }
+          const idFromDest = extractWalmartItemIdFromUrl(dest) || (dest.match(/\/ip\/(\d{5,15})/i)?.[1] || '');
+          if (idFromDest) return `https://www.walmart.com/ip/${idFromDest}`;
+          if (/\/ip\//i.test(dest)) return dest;
+        }
+        const sku = u.searchParams.get('prodsku');
+        if (sku && /^\d{5,15}$/.test(sku)) return `https://www.walmart.com/ip/${sku}`;
+      }
+      // Otherwise follow one redirect hop and re-inspect.
+      const resp = await fetchWithTimeout(current, { redirect: 'manual' }, 12000).catch(() => null);
+      const loc = resp && resp.headers ? resp.headers.get('location') : null;
+      if (!loc) return '';
+      try {
+        current = new URL(loc, current).href;
+      } catch {
+        return '';
+      }
+    }
+    return '';
+  } catch {
+    return '';
   }
 }
 
@@ -3038,9 +3094,9 @@ function normalizeProviderImageUrlString(raw) {
 }
 
 /**
- * RapidAPI Walmart product data — locked to the "Walmart API" by mahmudulhasandev:
- *   https://rapidapi.com/mahmudulhasandev/api/walmart-api4
- *   GET https://walmart-api4.p.rapidapi.com/product-details.php?url=<full product URL>
+ * RapidAPI Walmart product data — locked to "Walmart Data" by mahmudulhasandev:
+ *   https://rapidapi.com/mahmudulhasandev/api/walmart-data
+ *   GET https://walmart-data.p.rapidapi.com/product-details.php?url=<full product URL>
  *   → { original_status, pc_status, url, body: { title, price, currency, images:[...], ratings, reviewsCount } }
  *
  * Only RAPIDAPI_KEY is required (host/endpoint default to this provider). To swap providers later,
@@ -3052,12 +3108,21 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
   try {
     const key = String(process.env.RAPIDAPI_KEY || '').trim();
     const host =
-      String(process.env.RAPIDAPI_WALMART_HOST || '').trim() || 'walmart-api4.p.rapidapi.com';
+      String(process.env.RAPIDAPI_WALMART_HOST || '').trim() || 'walmart-data.p.rapidapi.com';
     if (!key) return null;
     const id = String(itemId || '').trim();
-    const link = String(url || '').trim();
+    let link = String(url || '').trim();
     // This provider keys off the full product URL; bail if we have neither.
     if (!id && !link) return null;
+
+    // The provider can't scrape share/affiliate short links (walmrt.us / goto.walmart.com) —
+    // resolve them to a real walmart.com/ip/<id> URL first.
+    if (link && isWalmartShortLinkHost((() => { try { return new URL(link).hostname; } catch { return ''; } })())) {
+      const resolved = await resolveWalmartShortLinkToProductUrl(link);
+      if (resolved) link = resolved;
+    }
+    // If we only have an item id, synthesize a product URL the provider accepts.
+    if (!link && id) link = `https://www.walmart.com/ip/${id}`;
 
     cacheKey = `${host}::${link || id}`;
     const now = Date.now();
@@ -3086,13 +3151,13 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
             Accept: 'application/json',
           },
         },
-        20000
+        45000 // this provider scrapes live; product pages can take ~30s.
       );
       if (!resp.ok) return null;
       const json = await resp.json().catch(() => null);
       if (!json || typeof json !== 'object') return null;
 
-      // walmart-api4 wraps everything in `body`; tolerate flatter shapes too.
+      // walmart-data wraps everything in `body`; tolerate flatter shapes too.
       const body = json.body && typeof json.body === 'object' ? json.body : json;
 
       const images = [];
@@ -3100,7 +3165,8 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
       if (Array.isArray(body.images)) {
         for (const im of body.images) {
           const raw = typeof im === 'string' ? im : im && typeof im === 'object' ? im.url || im.src : '';
-          const n = normalizeProviderImageUrlString(raw);
+          // Prefer the Walmart CDN normalizer (strips ?odnHeight sizing → full-res, drops svg).
+          const n = normalizeWalmartImageUrlString(raw) || normalizeProviderImageUrlString(raw);
           if (n && !seen.has(n)) {
             seen.add(n);
             images.push(n);
@@ -4494,6 +4560,27 @@ async function tryAmazonRapidPrefetchForUrl(workingUrl) {
 }
 
 /**
+ * When RapidAPI returns a usable product, skip our own (always bot-walled) Walmart HTML fetch
+ * and Puppeteer entirely — the provider gives title + description + images directly.
+ */
+async function tryWalmartRapidPrefetchForUrl(workingUrl) {
+  const key = String(process.env.RAPIDAPI_KEY || '').trim();
+  if (!key) return null;
+  try {
+    const raw = String(workingUrl || '').trim();
+    if (!raw) return null;
+    if (process.env.URLTOPIN_WALMART_PRODUCT_IMAGES === '0') return null;
+    if (!isWalmartProductPageForNanoReference(raw)) return null;
+    return await fetchWalmartProductDataViaRapidApi({
+      itemId: extractWalmartItemIdFromUrl(raw),
+      url: raw,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch full article HTML and build richer base metadata + summary.
  * Falls back gracefully to meta tags only if fetch or parsing fails.
  */
@@ -4519,10 +4606,14 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
 
   let etsyRapidEarly = null;
   let amazonRapidEarly = null;
+  let walmartRapidEarly = null;
   if (String(process.env.RAPIDAPI_KEY || '').trim()) {
     etsyRapidEarly = await tryEtsyRapidPrefetchForUrl(workingUrl);
     if (!etsyRapidEarly) {
       amazonRapidEarly = await tryAmazonRapidPrefetchForUrl(workingUrl);
+    }
+    if (!etsyRapidEarly && !amazonRapidEarly) {
+      walmartRapidEarly = await tryWalmartRapidPrefetchForUrl(workingUrl);
     }
   }
   const etsyRapidTitleOk =
@@ -4533,11 +4624,16 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     amazonRapidEarly &&
     typeof amazonRapidEarly.title === 'string' &&
     amazonRapidEarly.title.trim().length >= 3;
+  const walmartRapidTitleOk =
+    walmartRapidEarly &&
+    typeof walmartRapidEarly.title === 'string' &&
+    walmartRapidEarly.title.trim().length >= 3;
   // Amazon: skip HTML when RapidAPI returned a real title. Etsy listing pages: always skip HTML (403 from Etsy;
   // title/thumb come from RapidAPI + oEmbed in enrichEtsyListingBaseFromApis). All other URLs still use
   // fetchArticleHtml (+ Puppeteer on hard blocks).
   const skipEtsyListingHtml = isEtsyListingPageUrl(workingUrl);
-  const skipMerchantHtmlScrape = !!(etsyRapidTitleOk || amazonRapidTitleOk) || skipEtsyListingHtml;
+  const skipMerchantHtmlScrape =
+    !!(etsyRapidTitleOk || amazonRapidTitleOk || walmartRapidTitleOk) || skipEtsyListingHtml;
 
   // In "fast" mode (used for strategic_single fan-out requests), avoid refetching full HTML.
   // We already scraped client-side and pass basic metadata; the slight summary quality drop is
@@ -4575,6 +4671,16 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     }
     base.amazon_blocked = false;
     base.amazon_rapidapi_data = amazonRapidEarly;
+  }
+
+  if (walmartRapidEarly && walmartRapidTitleOk) {
+    const t = String(walmartRapidEarly.title || '').trim();
+    if (t) base.title = t.slice(0, 300);
+    const d = typeof walmartRapidEarly.description === 'string' ? walmartRapidEarly.description.trim() : '';
+    if (d && (!base.description || String(base.description).trim().length < 30)) {
+      base.description = d.slice(0, 450);
+    }
+    base.walmart_rapidapi_data = walmartRapidEarly;
   }
 
   // Amazon fallback: if scraping yields a generic / blocked title, flag it so callers can abort
@@ -7951,9 +8057,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     // Walmart: blocks bots aggressively, so when scraping returns a bot/empty title,
     // recover the product title/description (and reuse images) from RapidAPI before spending quota.
     const walmartCtxUrl = pickWalmartContextUrl(effectiveUrl, base.canonicalUrl);
-    let walmartRapid = null;
+    let walmartRapid = base.walmart_rapidapi_data || null;
     if (
       isWalmartProductPageForNanoReference(walmartCtxUrl) &&
+      !walmartRapid &&
       (!base.title || looksLikeBlockedWalmartTitle(base.title))
     ) {
       try {
@@ -9269,10 +9376,12 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       isWalmartProductPageForNanoReference(walmartCtxUrl)
     ) {
       try {
-        const walmartRapid = await fetchWalmartProductDataViaRapidApi({
-          itemId: extractWalmartItemIdFromUrl(walmartCtxUrl),
-          url: walmartCtxUrl,
-        });
+        const walmartRapid =
+          base.walmart_rapidapi_data ||
+          (await fetchWalmartProductDataViaRapidApi({
+            itemId: extractWalmartItemIdFromUrl(walmartCtxUrl),
+            url: walmartCtxUrl,
+          }));
         if (walmartRapid && walmartRapid.title && looksLikeBlockedWalmartTitle(topic)) {
           topic = walmartRapid.title;
         }
