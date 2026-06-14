@@ -2839,9 +2839,22 @@ function extractWalmartItemIdFromUrl(urlString) {
     const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
     if (!isWalmartRelatedHost(u.hostname)) return '';
     const path = u.pathname || '';
+    // Bot interstitial encodes the intended product path in ?url= (base64).
+    if (/\/blocked/i.test(path)) {
+      const enc = u.searchParams.get('url');
+      if (enc) {
+        try {
+          const decoded = Buffer.from(decodeURIComponent(enc), 'base64').toString('utf8');
+          const mBlocked = decoded.match(/\/ip\/(?:[^/]+\/)?(\d{5,15})/i);
+          if (mBlocked) return mBlocked[1];
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     let m = path.match(/\/ip\/(?:[^/]+\/)?(\d{5,15})(?:\/|$)/i);
     if (m) return m[1];
-    m = String(u.search || '').match(/[?&](?:item_id|itemId|selectedItemId)=(\d{5,15})/i);
+    m = String(u.search || '').match(/[?&](?:item_id|itemId|selectedItemId|prodsku)=(\d{5,15})/i);
     if (m) return m[1];
     return '';
   } catch {
@@ -2849,21 +2862,36 @@ function extractWalmartItemIdFromUrl(urlString) {
   }
 }
 
-/** Product / affiliate pages where we try to attach Walmart product images to Nano Banana. */
-function isWalmartProductPageForNanoReference(urlString) {
+/** True when we should call walmart-data RapidAPI (short links, /ip/, or bot-blocked interstitial). */
+function isWalmartUrlEligibleForApi(urlString) {
   try {
     const raw = String(urlString || '').trim();
     if (!raw) return false;
-    const u = new URL(raw);
-    if (!isWalmartRelatedHost(u.hostname)) return false;
-    // Short links (walmrt.us, goto.walmart.com) are always product/affiliate shares — the
-    // RapidAPI provider resolves them server-side even when our own fetch hits the bot wall.
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
     if (isWalmartShortLinkHost(u.hostname)) return true;
-    const path = u.pathname || '';
-    return /\/ip\//i.test(path) || !!extractWalmartItemIdFromUrl(raw);
+    if (!isWalmartRelatedHost(u.hostname)) return false;
+    if (/\/blocked/i.test(u.pathname || '')) return !!extractWalmartItemIdFromUrl(raw);
+    return /\/ip\//i.test(u.pathname || '') || !!extractWalmartItemIdFromUrl(raw);
   } catch {
     return false;
   }
+}
+
+/** Resolve any Walmart share/affiliate/blocked URL to a canonical https://www.walmart.com/ip/<id>. */
+async function resolveWalmartProductUrlForApi(urlString) {
+  const raw = String(urlString || '').trim();
+  if (!raw || !isWalmartUrlEligibleForApi(raw)) return '';
+  const id = extractWalmartItemIdFromUrl(raw);
+  if (id) return `https://www.walmart.com/ip/${id}`;
+  if (isWalmartShortLinkHost(new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname)) {
+    return await resolveWalmartShortLinkToProductUrl(raw);
+  }
+  return '';
+}
+
+/** Product / affiliate pages where we try to attach Walmart product images to Nano Banana. */
+function isWalmartProductPageForNanoReference(urlString) {
+  return isWalmartUrlEligibleForApi(urlString);
 }
 
 function pickWalmartContextUrl(inputUrl, canonicalUrl) {
@@ -3118,10 +3146,9 @@ async function fetchWalmartProductDataViaRapidApi({ itemId, url }) {
     // This provider keys off the full product URL; bail if we have neither.
     if (!id && !link) return null;
 
-    // The provider can't scrape share/affiliate short links (walmrt.us / goto.walmart.com) —
-    // resolve them to a real walmart.com/ip/<id> URL first.
-    if (link && isWalmartShortLinkHost((() => { try { return new URL(link).hostname; } catch { return ''; } })())) {
-      const resolved = await resolveWalmartShortLinkToProductUrl(link);
+    // Resolve share/affiliate/blocked URLs to a canonical walmart.com/ip/<id> the provider accepts.
+    if (link && isWalmartUrlEligibleForApi(link)) {
+      const resolved = await resolveWalmartProductUrlForApi(link);
       if (resolved) link = resolved;
     }
     // If we only have an item id, synthesize a product URL the provider accepts.
@@ -4466,11 +4493,14 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
  */
 async function fetchArticleHtml(url) {
   let hostIsAmazon = false;
+  let hostIsWalmart = false;
   try {
     const u = new URL(String(url || '').trim());
     hostIsAmazon = isAmazonRelatedHost(u.hostname);
+    hostIsWalmart = isWalmartRelatedHost(u.hostname);
   } catch {
     hostIsAmazon = false;
+    hostIsWalmart = false;
   }
 
   try {
@@ -4480,11 +4510,14 @@ async function fetchArticleHtml(url) {
       if (hostIsAmazon && detectAmazonBotOrConsentPage(html)) {
         return '';
       }
+      if (hostIsWalmart && /robot or human|activate and hold the button/i.test(html)) {
+        return '';
+      }
       return html;
     }
     const status = resp.status;
     console.warn('fetchArticleHtml non-OK:', String(url).slice(0, 96), status);
-    if (hostIsAmazon) {
+    if (hostIsAmazon || hostIsWalmart) {
       return '';
     }
     if (status === 403 || status === 401 || status === 503 || status === 429) {
@@ -4494,7 +4527,7 @@ async function fetchArticleHtml(url) {
     return '';
   } catch (e) {
     console.warn('fetchArticleHtml error:', e.message || e);
-    if (hostIsAmazon) {
+    if (hostIsAmazon || hostIsWalmart) {
       return '';
     }
     const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
@@ -4578,19 +4611,32 @@ async function tryAmazonRapidPrefetchForUrl(workingUrl) {
  * When RapidAPI returns a usable product, skip our own (always bot-walled) Walmart HTML fetch
  * and Puppeteer entirely — the provider gives title + description + images directly.
  */
-async function tryWalmartRapidPrefetchForUrl(workingUrl) {
+async function tryWalmartRapidPrefetchForUrl(workingUrl, originalUrl = '') {
   const key = String(process.env.RAPIDAPI_KEY || '').trim();
-  if (!key) return null;
+  if (!key) {
+    console.warn('[walmart] prefetch skipped — RAPIDAPI_KEY not set in this environment');
+    return null;
+  }
+  if (process.env.URLTOPIN_WALMART_PRODUCT_IMAGES === '0') return null;
   try {
-    const raw = String(workingUrl || '').trim();
-    if (!raw) return null;
-    if (process.env.URLTOPIN_WALMART_PRODUCT_IMAGES === '0') return null;
-    if (!isWalmartProductPageForNanoReference(raw)) return null;
-    return await fetchWalmartProductDataViaRapidApi({
-      itemId: extractWalmartItemIdFromUrl(raw),
-      url: raw,
-    });
-  } catch {
+    const candidates = [...new Set([String(originalUrl || '').trim(), String(workingUrl || '').trim()].filter(Boolean))];
+    for (const candidate of candidates) {
+      if (!isWalmartUrlEligibleForApi(candidate)) continue;
+      const productUrl = await resolveWalmartProductUrlForApi(candidate);
+      if (!productUrl) {
+        console.warn(`[walmart] could not resolve product URL from ${candidate.slice(0, 96)}`);
+        continue;
+      }
+      console.log(`[walmart] prefetch → ${productUrl.slice(0, 96)}`);
+      const data = await fetchWalmartProductDataViaRapidApi({
+        itemId: extractWalmartItemIdFromUrl(productUrl),
+        url: productUrl,
+      });
+      if (data && data.title) return data;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[walmart] prefetch error:', e.message || e);
     return null;
   }
 }
@@ -4628,7 +4674,7 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
       amazonRapidEarly = await tryAmazonRapidPrefetchForUrl(workingUrl);
     }
     if (!etsyRapidEarly && !amazonRapidEarly) {
-      walmartRapidEarly = await tryWalmartRapidPrefetchForUrl(workingUrl);
+      walmartRapidEarly = await tryWalmartRapidPrefetchForUrl(workingUrl, url);
     }
   }
   const etsyRapidTitleOk =
@@ -4696,6 +4742,11 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
       base.description = d.slice(0, 450);
     }
     base.walmart_rapidapi_data = walmartRapidEarly;
+  }
+
+  // Never surface Walmart's bot-challenge page title when RapidAPI didn't recover the product.
+  if (looksLikeBlockedWalmartTitle(base.title)) {
+    base.title = '';
   }
 
   // Amazon fallback: if scraping yields a generic / blocked title, flag it so callers can abort
@@ -7518,8 +7569,8 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
     const rawUrl = String(url || '').trim();
-    // Shared pipeline with generate: short-link resolve; RapidAPI-first only for Etsy listings + Amazon PDPs
-    // when `RAPIDAPI_KEY` is set. All other URLs still load via full HTML scrape (+ Puppeteer fallback).
+    // Shared pipeline with generate: short-link resolve; RapidAPI-first for Etsy, Amazon PDPs,
+    // and Walmart product/affiliate links when `RAPIDAPI_KEY` is set.
     const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, null, null);
 
     const hasScrapeContent =
