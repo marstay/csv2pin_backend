@@ -23,6 +23,7 @@ import {
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
+import { analyzeWinningProduct, normalizeAmazonProduct } from './winningProductFinder.js';
 import {
   sendPaymentFailedEmail,
   sendUpgradeNudgeEmail,
@@ -9926,6 +9927,150 @@ app.post('/api/urltopin/product-info', requireUser, async (req, res) => {
   }
 });
 
+const winningProductAnalyzeTimestamps = new Map(); // userId -> number[]
+
+async function fetchUserProductPinStats(userId, asin) {
+  const uid = String(userId || '').trim();
+  const id = String(asin || '').trim().toUpperCase();
+  if (!uid || !id) {
+    return { pinsCreated: 0, pinsPosted: 0, impressions: 0, outboundClicks: 0, saves: 0 };
+  }
+  try {
+    const { count: historyCount, error: historyError } = await supabaseAdmin
+      .from('urltopin_history')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', uid)
+      .or(`source_url.ilike.%${id}%,pin_link.ilike.%${id}%`);
+
+    const { data: pinRows, error: pinsError } = await supabaseAdmin
+      .from('scheduled_pins')
+      .select('status, impressions, outbound_clicks, saves, pinterest_pin_id')
+      .eq('user_id', uid)
+      .ilike('link', `%${id}%`);
+
+    if (historyError) console.warn('winning-product history count:', historyError.message || historyError);
+    if (pinsError) console.warn('winning-product pin stats:', pinsError.message || pinsError);
+
+    const rows = Array.isArray(pinRows) ? pinRows : [];
+    const posted = rows.filter((p) => p.status === 'posted' || p.pinterest_pin_id);
+    const totals = posted.reduce(
+      (acc, p) => ({
+        impressions: acc.impressions + (Number(p.impressions) || 0),
+        outboundClicks: acc.outboundClicks + (Number(p.outbound_clicks) || 0),
+        saves: acc.saves + (Number(p.saves) || 0),
+      }),
+      { impressions: 0, outboundClicks: 0, saves: 0 }
+    );
+
+    return {
+      pinsCreated: Number(historyCount) || rows.length || 0,
+      pinsPosted: posted.length,
+      ...totals,
+    };
+  } catch (e) {
+    console.warn('winning-product pin stats:', e?.message || e);
+    return { pinsCreated: 0, pinsPosted: 0, impressions: 0, outboundClicks: 0, saves: 0 };
+  }
+}
+
+/**
+ * Winning Product Finder — score an Amazon product's Pinterest opportunity before pin creation.
+ * Body: { url: string }
+ */
+async function buildWinningProductReport(rawUrl, { userId = null } = {}) {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) {
+    const err = new Error('Paste an Amazon product URL.');
+    err.status = 400;
+    throw err;
+  }
+
+  let effectiveUrl = trimmed;
+  try {
+    const expanded = await resolveOutboundUrlForUrlToPin(trimmed);
+    if (expanded) effectiveUrl = expanded;
+  } catch {
+    /* keep raw */
+  }
+
+  const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, null);
+  if (!isAmazonProductPageForNanoReference(amazonCtxUrl)) {
+    const err = new Error('Supported: Amazon product URLs (including amzn.to links).');
+    err.status = 400;
+    throw err;
+  }
+
+  const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
+  if (!asin) {
+    const err = new Error('Could not extract an Amazon ASIN from that URL.');
+    err.status = 400;
+    throw err;
+  }
+
+  const rapid = await fetchAmazonProductDataViaRapidApi({
+    asin,
+    marketplace: resolveRapidApiAmazonMarketplaceFromHost(new URL(amazonCtxUrl).hostname),
+    language: 'en',
+  });
+  if (!rapid) {
+    const err = new Error('Could not fetch product data from Amazon. Check the link and try again.');
+    err.status = 502;
+    throw err;
+  }
+
+  const product = normalizeAmazonProduct(rapid, amazonCtxUrl);
+  if (!product) {
+    const err = new Error('Amazon returned incomplete product data for this link.');
+    err.status = 502;
+    throw err;
+  }
+
+  const uid = userId ? String(userId).trim() : '';
+  const userPinHistory = uid ? await fetchUserProductPinStats(uid, asin) : { pinsCreated: 0 };
+  const getPinterestAccessToken = uid
+    ? async () => getPinterestAccessTokenForUser(uid, null)
+    : getTrendsPinterestAccessToken;
+
+  const report = await analyzeWinningProduct(product, {
+    getPinterestAccessToken,
+    userPinHistory,
+  });
+
+  return { ok: true, ...report };
+}
+
+app.post('/api/urltopin/winning-product-analyze', requireUser, async (req, res) => {
+  try {
+    const uid = String(req.user?.id || '').trim();
+    const now = Date.now();
+    const recent = (winningProductAnalyzeTimestamps.get(uid) || []).filter((t) => now - t < 60_000);
+    if (recent.length >= 12) {
+      return res.status(429).json({ error: 'Too many analyses. Please wait a minute and try again.' });
+    }
+    recent.push(now);
+    winningProductAnalyzeTimestamps.set(uid, recent);
+
+    const report = await buildWinningProductReport(req.body?.url, { userId: uid });
+    return res.json(report);
+  } catch (err) {
+    console.error('winning-product-analyze error:', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Analysis failed.' });
+  }
+});
+
+app.post('/api/tools/pin-worth-checker', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'pin-worth-checker', { windowMs: 60_000, max: 12 })) {
+      return res.status(429).json({ error: 'Too many checks. Please wait a minute and try again.' });
+    }
+    const report = await buildWinningProductReport(req.body?.url);
+    return res.json(report);
+  } catch (err) {
+    console.error('pin-worth-checker tool error:', err);
+    return res.status(err.status || 500).json({ error: err.message || 'Analysis failed.' });
+  }
+});
+
 /**
  * Build a single multi-product affiliate pin: a roundup / gift-guide grid, or an A-vs-B comparison.
  * Body: { mode:'roundup'|'comparison', headline, link, items:[{title,imageUrl,link}], brand, outputLanguage }
@@ -13525,24 +13670,37 @@ function extractAccountId(req) {
 }
 
 async function getPinterestAccessTokenForUser(userId, accountId) {
-  if (!accountId) {
-    // Fallback to single-token in profiles for backwards compatibility
-    const { data: profile } = await supabaseAdmin
-    .from('profiles')
-    .select('pinterest_access_token')
-      .eq('id', userId)
-    .single();
-    return profile?.pinterest_access_token || null;
+  if (accountId) {
+    const { data: account } = await supabaseAdmin
+      .from('pinterest_accounts')
+      .select('id, access_token, refresh_token, token_expires_at')
+      .eq('id', accountId)
+      .eq('user_id', userId)
+      .single();
+    if (!account) return null;
+    const { accessToken } = await ensureValidPinterestAccessToken(account);
+    return accessToken || null;
   }
-  const { data: account } = await supabaseAdmin
+
+  const { data: accounts } = await supabaseAdmin
     .from('pinterest_accounts')
     .select('id, access_token, refresh_token, token_expires_at')
-    .eq('id', accountId)
     .eq('user_id', userId)
+    .not('access_token', 'is', null)
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  if (accounts?.[0]) {
+    const { accessToken } = await ensureValidPinterestAccessToken(accounts[0]);
+    if (accessToken) return accessToken;
+  }
+
+  // Legacy single-token on profiles
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('pinterest_access_token')
+    .eq('id', userId)
     .single();
-  if (!account) return null;
-  const { accessToken } = await ensureValidPinterestAccessToken(account);
-  return accessToken || null;
+  return profile?.pinterest_access_token || null;
 }
 
 /** Pinterest GET /v5/boards is paginated; first page alone misses boards when user has > page_size. */

@@ -147,6 +147,70 @@ function buildBlogAngles(keyword) {
   return [...new Set(variants.map((q) => q.trim()).filter(Boolean))].slice(0, maxAngles);
 }
 
+function parseTrendRows(rows, { trendType, region, seen, out }) {
+  for (const row of rows) {
+    const keyword = String(row?.keyword || '').trim();
+    if (!keyword) continue;
+    const key = keyword.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const category = classifyPinterestKeywordCategory(keyword);
+    out.push({
+      keyword,
+      category,
+      trendType,
+      region,
+      pctGrowthWow: row?.pct_growth_wow ?? null,
+      pctGrowthMom: row?.pct_growth_mom ?? null,
+      pctGrowthYoy: row?.pct_growth_yoy ?? null,
+      timeSeries: row?.time_series && typeof row.time_series === 'object' ? row.time_series : null,
+      badge: pickBadgeFromMetrics({
+        trendType,
+        pctGrowthWow: row?.pct_growth_wow,
+        pctGrowthMom: row?.pct_growth_mom,
+      }),
+    });
+  }
+}
+
+async function fetchTrendTypeBatch({
+  accessToken,
+  region,
+  trendType,
+  limit,
+  includeKeywords,
+  seen,
+  out,
+}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  for (const kw of includeKeywords || []) {
+    params.append('include_keywords', kw);
+  }
+  const url =
+    `https://api.pinterest.com/v5/trends/keywords/${encodeURIComponent(region)}/top/` +
+    `${encodeURIComponent(trendType)}?${params}`;
+
+  const resp = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    },
+    25000
+  );
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    console.warn('Pinterest trends API:', trendType, resp.status, body.slice(0, 240));
+    return false;
+  }
+  const json = await resp.json().catch(() => null);
+  const rows = Array.isArray(json?.trends) ? json.trends : [];
+  parseTrendRows(rows, { trendType, region, seen, out });
+  return true;
+}
+
 export async function fetchPinterestKeywordTrends({
   getAccessToken,
   region = 'US',
@@ -162,56 +226,68 @@ export async function fetchPinterestKeywordTrends({
   const seen = new Set();
 
   for (const trendType of trendTypes) {
-    const url =
-      `https://api.pinterest.com/v5/trends/keywords/${encodeURIComponent(reg)}/top/` +
-      `${encodeURIComponent(trendType)}?limit=${limit}`;
     try {
-      const resp = await fetchWithTimeout(
-        url,
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            Accept: 'application/json',
-          },
-        },
-        25000
-      );
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => '');
-        console.warn('Pinterest trends API:', trendType, resp.status, body.slice(0, 240));
-        continue;
-      }
-      const json = await resp.json().catch(() => null);
-      const rows = Array.isArray(json?.trends) ? json.trends : [];
-      for (const row of rows) {
-        const keyword = String(row?.keyword || '').trim();
-        if (!keyword) continue;
-        const key = keyword.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const category = classifyPinterestKeywordCategory(keyword);
-        out.push({
-          keyword,
-          category,
-          trendType,
-          region: reg,
-          pctGrowthWow: row?.pct_growth_wow ?? null,
-          pctGrowthMom: row?.pct_growth_mom ?? null,
-          pctGrowthYoy: row?.pct_growth_yoy ?? null,
-          timeSeries: row?.time_series && typeof row.time_series === 'object' ? row.time_series : null,
-          badge: pickBadgeFromMetrics({
-            trendType,
-            pctGrowthWow: row?.pct_growth_wow,
-            pctGrowthMom: row?.pct_growth_mom,
-          }),
-        });
-      }
+      await fetchTrendTypeBatch({
+        accessToken,
+        region: reg,
+        trendType,
+        limit,
+        includeKeywords: null,
+        seen,
+        out,
+      });
     } catch (e) {
       console.warn('fetchPinterestKeywordTrends:', trendType, e?.message || e);
     }
   }
 
   return { trends: out, error: out.length ? null : 'pinterest_trends_empty' };
+}
+
+/** Query Pinterest Trends filtered to keywords related to a product (include_keywords). */
+export async function fetchPinterestTrendsForProductSeeds(seeds, {
+  getAccessToken,
+  region = 'US',
+  trendTypes = PINTEREST_TREND_TYPES,
+  limitPerType = 12,
+} = {}) {
+  const accessToken = typeof getAccessToken === 'function' ? await getAccessToken() : null;
+  if (!accessToken) return { trends: [], error: 'pinterest_token_missing', targeted: true };
+
+  const keywords = [...new Set(
+    (seeds || [])
+      .map((s) => String(s || '').trim().toLowerCase())
+      .filter((s) => s.length >= 3)
+  )].slice(0, 5);
+  if (!keywords.length) return { trends: [], error: 'no_seeds', targeted: true };
+
+  const reg = String(region || 'US').trim().toUpperCase();
+  const limit = Math.max(1, Math.min(50, Number(limitPerType) || 12));
+  const out = [];
+  const seen = new Set();
+
+  for (const trendType of trendTypes) {
+    try {
+      await fetchTrendTypeBatch({
+        accessToken,
+        region: reg,
+        trendType,
+        limit,
+        includeKeywords: keywords,
+        seen,
+        out,
+      });
+    } catch (e) {
+      console.warn('fetchPinterestTrendsForProductSeeds:', trendType, e?.message || e);
+    }
+  }
+
+  return {
+    trends: out,
+    error: out.length ? null : 'pinterest_trends_no_match',
+    targeted: true,
+    queriedKeywords: keywords,
+  };
 }
 
 export function pinterestSignalsToTrendSeeds(signals) {
