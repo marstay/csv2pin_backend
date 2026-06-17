@@ -6224,6 +6224,46 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
   return null;
 }
 
+/** Download a provider temp URL (e.g. Kie tempfile.aiquickdraw.com) into Supabase ai-images. */
+async function persistProviderImageUrlToAiImages(sourceUrl, fileStem, logLabel = '') {
+  if (!sourceUrl || !fileStem) return sourceUrl || '';
+  try {
+    const imageRes = await fetch(sourceUrl);
+    if (!imageRes.ok) {
+      console.warn(
+        'persistProviderImageUrlToAiImages: fetch failed' +
+          (logLabel ? ` (${logLabel})` : '') +
+          ` status=${imageRes.status}`
+      );
+      return sourceUrl;
+    }
+    const buffer = Buffer.from(await imageRes.arrayBuffer());
+    const fileExt = (sourceUrl.split('.').pop() || 'png').split('?')[0] || 'png';
+    const fileName = `${fileStem}.${fileExt}`;
+    const { error: uploadError } = await supabaseAdmin.storage.from('ai-images').upload(fileName, buffer, {
+      contentType: imageRes.headers.get('content-type') || 'image/png',
+      upsert: true,
+    });
+    if (uploadError) {
+      console.warn(
+        'persistProviderImageUrlToAiImages: upload error' +
+          (logLabel ? ` (${logLabel})` : '') +
+          ':',
+        uploadError.message || uploadError
+      );
+      return sourceUrl;
+    }
+    const { data: publicUrlData } = supabaseAdmin.storage.from('ai-images').getPublicUrl(fileName);
+    return publicUrlData?.publicUrl || sourceUrl;
+  } catch (e) {
+    console.warn(
+      'persistProviderImageUrlToAiImages' + (logLabel ? ` (${logLabel})` : '') + ':',
+      e.message || e
+    );
+    return sourceUrl;
+  }
+}
+
 async function withSoftTimeout(promise, timeoutMs) {
   const ms = Number(timeoutMs);
   if (!Number.isFinite(ms) || ms <= 0) return await promise;
@@ -9601,6 +9641,12 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       await applyPinQuotaDelta(req.user.id, { aiDelta: -1 }, req);
       return res.status(500).json({ error: 'Failed to generate image with the provided text' });
     }
+
+    imageUrl = await persistProviderImageUrlToAiImages(
+      imageUrl,
+      `urltopin-regen-${req.user.id}-${Date.now()}-${Math.floor(Math.random() * 10000)}-${styleId}`,
+      'regenerate-image-with-text'
+    );
 
     return res.json({
       imageUrl,
