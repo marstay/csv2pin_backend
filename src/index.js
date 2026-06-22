@@ -2301,6 +2301,32 @@ function buildLinkDisplayLabelFromUrl(urlString, maxLen = 80) {
   }
 }
 
+function isEcommerceProductPath(pathname) {
+  return /\/products?\//i.test(String(pathname || ''));
+}
+
+/**
+ * Shopify/WooCommerce handles often end with -2, -7, etc. when the base handle was taken.
+ * Strip those so "mary-jane-delfina-7" → "mary-jane-delfina" (not "mary jane delfina 7" on pins).
+ */
+function cleanProductSlugHandleForKeyword(slug) {
+  let s = String(slug || '').trim();
+  if (!s) return s;
+  const parts = s.split('-').filter(Boolean);
+  if (parts.length >= 4 && /^\d{1,3}$/.test(parts[parts.length - 1])) {
+    parts.pop();
+    return parts.join('-');
+  }
+  if (parts.length >= 3 && /^\d{1,3}$/.test(parts[parts.length - 1])) {
+    const n = parseInt(parts[parts.length - 1], 10);
+    if (n >= 2 && n <= 99) {
+      parts.pop();
+      return parts.join('-');
+    }
+  }
+  return s;
+}
+
 /**
  * Keyword from URL path for prompts — skip shorteners and opaque slug segments (e.g. asdf123).
  * Amazon: prefer product slug before /dp/ASIN; never use trailing ref=… segments.
@@ -2331,8 +2357,17 @@ function deriveKeywordFromArticleUrl(urlString) {
       if (/^B[0-9A-Z]{9}$/i.test(last) || /^[0-9A-Z]{10}$/i.test(last)) return '';
     }
 
-    const last = parts[parts.length - 1] || '';
+    let last = parts[parts.length - 1] || '';
     if (!last) return '';
+
+    if (isEcommerceProductPath(u.pathname || '')) {
+      const prodIdx = parts.findIndex((p) => /^products?$/i.test(p));
+      if (prodIdx >= 0 && parts[prodIdx + 1]) {
+        last = cleanProductSlugHandleForKeyword(parts[prodIdx + 1]);
+      } else {
+        last = cleanProductSlugHandleForKeyword(last);
+      }
+    }
 
     if (
       parts.length >= 1 &&
@@ -4870,7 +4905,13 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     const meaningfulTitle = titleLooksMeaningfulForKeywordSuppression(base.title);
     const wantNonEnglish = !!(outputLanguage && outputLanguage !== 'auto' && outputLanguage !== 'en');
     const nonLatinTitle = titleHasNonLatinScript(base.title);
-    if (!isAmazon && meaningfulTitle && (wantNonEnglish || nonLatinTitle) && looksLikeLatinSlugKeyword(base.keyword)) {
+    const isProductPath = isEcommerceProductPath(u.pathname || '');
+    if (
+      !isAmazon &&
+      meaningfulTitle &&
+      (isProductPath ||
+        ((wantNonEnglish || nonLatinTitle) && looksLikeLatinSlugKeyword(base.keyword)))
+    ) {
       base.keyword = '';
     }
   } catch {
