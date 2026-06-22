@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-22T08:32:33.830Z",
+  "generatedAt": "2026-06-22T09:12:37.480Z",
   "season": "Summer",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -305,10 +305,22 @@
       },
       "suggestions": [
         {
+          "id": "B0GXFSSWGD",
+          "title": "4th of July Press on Nails Blue Bow Almond Fake Nails with White French Tip Red Stripe Full Cover Glue on Nails Patrioti",
+          "url": "https://www.amazon.com/dp/B0GXFSSWGD",
+          "imageUrl": "https://m.media-amazon.com/images/I/71CtMKUoDHL._AC_UL320_.jpg"
+        },
+        {
           "id": "B0F9TDY6B7",
           "title": "4th Of July French Tip Press On Nails Short Almond Fake Nails Independence Day False Nails Press Ons With Star Design Nu",
           "url": "https://www.amazon.com/dp/B0F9TDY6B7",
           "imageUrl": "https://m.media-amazon.com/images/I/71VR9iD36DL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G2G1VDJ3",
+          "title": "4th of July Press on Nails Short Oval Cute Fake Nails Press ons with Bow Star Stripe Designs, Reusable Nude Stick on Nai",
+          "url": "https://www.amazon.com/dp/B0G2G1VDJ3",
+          "imageUrl": "https://m.media-amazon.com/images/I/61lTU-9KENL._AC_UL320_.jpg"
         },
         {
           "id": "B0GX58NSGT",
@@ -317,22 +329,10 @@
           "imageUrl": "https://m.media-amazon.com/images/I/71VR9iD36DL._AC_UL320_.jpg"
         },
         {
-          "id": "B0GSFW51W5",
-          "title": "30 Sheets 4th of July Nail Stickers for Nail Art Independence Day Nails Art Stickers 3D Self Adhesive American Flag Star",
-          "url": "https://www.amazon.com/dp/B0GSFW51W5",
-          "imageUrl": "https://m.media-amazon.com/images/I/816nU21exRL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GT7G7LX3",
-          "title": "24Pcs 4th of July Press on Nails Short Square Fake Nails with Star Designs Patriotic False Nail for Women Stripe Acrylic",
-          "url": "https://www.amazon.com/dp/B0GT7G7LX3",
-          "imageUrl": "https://m.media-amazon.com/images/I/71jupxKbokL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GV3Y2ZL8",
-          "title": "4th of July Press on Nails Medium Oval Fake Nails French Tip Glue on Nail with Star | Polka Dot | Bow Designs Independen",
-          "url": "https://www.amazon.com/dp/B0GV3Y2ZL8",
-          "imageUrl": "https://m.media-amazon.com/images/I/71tLK4qb8fL._AC_UL320_.jpg"
+          "id": "B0GXW3P8RH",
+          "title": "4th of July Press on Nails Short Square Nude Pink French Fake Nails Glitter Red White Blue Star Design Independence Day ",
+          "url": "https://www.amazon.com/dp/B0GXW3P8RH",
+          "imageUrl": "https://m.media-amazon.com/images/I/71qOyc93A5L._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"
@@ -527,64 +527,28 @@
       },
       "suggestions": [
         {
-          "id": "B0G8GBV2SK",
-          "title": "4th of July Press on Nails Short Oval - Red White & Blue French Tip with Stripes, Stars & Bow, Full Cover Glossy Fake Na",
-          "url": "https://www.amazon.com/dp/B0G8GBV2SK",
-          "imageUrl": "https://m.media-amazon.com/images/I/61lTU-9KENL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "simple fourth of july nails",
+          "url": "https://www.amazon.com/s?k=simple%20fourth%20of%20july%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0F9TDY6B7",
-          "title": "4th Of July French Tip Press On Nails Short Almond Fake Nails Independence Day False Nails Press Ons With Star Design Nu",
-          "url": "https://www.amazon.com/dp/B0F9TDY6B7",
-          "imageUrl": "https://m.media-amazon.com/images/I/71VR9iD36DL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "simple fourth of july nails gifts",
+          "url": "https://www.amazon.com/s?k=simple%20fourth%20of%20july%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GSY3L9VW",
-          "title": "4th of July Press on Nails Short Square Fake Nails Red Blue White False Nail Full Cover Stars Glue on Nails Independence",
-          "url": "https://www.amazon.com/dp/B0GSY3L9VW",
-          "imageUrl": "https://m.media-amazon.com/images/I/61fqr5DgmsL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best simple fourth of july nails",
+          "url": "https://www.amazon.com/s?k=best%20simple%20fourth%20of%20july%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0F1FR6ZF4",
-          "title": "24Pcs 4th of July Press on Nails Medium Square Acrylic Nails Cute Fake Nails with Red White Stripes Star Designs Gloss G",
-          "url": "https://www.amazon.com/dp/B0F1FR6ZF4",
-          "imageUrl": "https://m.media-amazon.com/images/I/61ozoY3RE2L._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GVST1YSW",
-          "title": "24Pcs Patriotic 4th of July Press on Nails Short Almond Independence Day Fake Nails with Bow Stripe America Flag Design ",
-          "url": "https://www.amazon.com/dp/B0GVST1YSW",
-          "imageUrl": "https://m.media-amazon.com/images/I/71q53DMC1FL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GSFW51W5",
-          "title": "30 Sheets 4th of July Nail Stickers for Nail Art Independence Day Nails Art Stickers 3D Self Adhesive American Flag Star",
-          "url": "https://www.amazon.com/dp/B0GSFW51W5",
-          "imageUrl": "https://m.media-amazon.com/images/I/816nU21exRL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0G8GBV2SK",
-          "title": "4th of July Press on Nails Short Oval - Red White & Blue French Tip with Stripes, Stars & Bow, Full Cover Glossy Fake Na",
-          "url": "https://www.amazon.com/dp/B0G8GBV2SK",
-          "imageUrl": "https://m.media-amazon.com/images/I/61lTU-9KENL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0D6VC89MY",
-          "title": "24Pcs 4th of July Press on Nails Short Square French Tip Fake Nails Independence False Nails with American Flag Star Gli",
-          "url": "https://www.amazon.com/dp/B0D6VC89MY",
-          "imageUrl": "https://m.media-amazon.com/images/I/71VIRY8Gi+L._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GVDV17M9",
-          "title": "4th of July Nails 24Pcs Fourth of July Short Press On Nails Almond Fake Nail with Red and White Striped Stars Design, Ac",
-          "url": "https://www.amazon.com/dp/B0GVDV17M9",
-          "imageUrl": "https://m.media-amazon.com/images/I/61LxVv1uiNL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F23D2673",
-          "title": "4th of July Nails - Fourth of July Press On Nails Short Square Fake Nail with American Flag Glitter Design, Acrylic Arti",
-          "url": "https://www.amazon.com/dp/B0F23D2673",
-          "imageUrl": "https://m.media-amazon.com/images/I/61oJ3lYWWAL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "simple fourth of july nails ideas",
+          "url": "https://www.amazon.com/s?k=simple%20fourth%20of%20july%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"

@@ -3454,6 +3454,158 @@ function replaceInfographicStyleIdForAmazonNanoRefs(styleId, hasReferenceImages)
   return AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[0];
 }
 
+/** Storage path prefix for anonymous free-preview reference image mirrors (no auth). */
+const PREVIEW_ANON_STORAGE_USER_ID = 'preview-anonymous';
+
+function appendNanoBananaReferencePromptSuffix(imagePrompt, referenceSource) {
+  if (!imagePrompt || !referenceSource) return imagePrompt;
+  if (referenceSource === 'amazon_product') {
+    return (
+      `${imagePrompt} ` +
+      promptTier(
+        'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
+        'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.'
+      )
+    );
+  }
+  if (referenceSource === 'walmart_product') {
+    return (
+      `${imagePrompt} ` +
+      promptTier(
+        'Attached reference image(s) show the real product from the Walmart listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
+        'Reference: use attached Walmart product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.'
+      )
+    );
+  }
+  if (referenceSource === 'etsy_product') {
+    return (
+      `${imagePrompt} ` +
+      promptTier(
+        'Attached reference image(s) are from the Etsy listing (product photos). Use them as the primary hero subject: preserve jewelry/product shape, materials, colors, and overall look. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+        'Reference: use attached Etsy listing photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.'
+      )
+    );
+  }
+  return (
+    `${imagePrompt} ` +
+    promptTier(
+      'Attached reference image(s) come from the source page (hero or content photos). Use them as the primary visual subject when helpful: preserve recognizable subjects, colors, and composition; do not paste URL text or watermarks as new text. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
+      'Reference: prefer attached page photos as the hero when they are strong; keep headline/sub/footer as specified.'
+    )
+  );
+}
+
+/**
+ * Product / page reference images for Nano Banana (generate + free preview).
+ * @returns {{ images: string[], source: string|null }}
+ */
+async function harvestNanoBananaReferenceImagesForUrlToPin({
+  userId,
+  workingUrl,
+  base,
+  usePageReferenceImages = true,
+}) {
+  const result = { images: [], source: null };
+  if (!userId || process.env.USE_DUMMY_IMAGES === 'true') return result;
+
+  const amazonCtxUrl = pickAmazonContextUrl(workingUrl, base?.canonicalUrl);
+  const walmartCtxUrl = pickWalmartContextUrl(workingUrl, base?.canonicalUrl);
+  const refHtmlUrl = amazonCtxUrl || workingUrl;
+  const amazonRapid = base?.amazon_rapidapi_data || null;
+  let walmartRapid = base?.walmart_rapidapi_data || null;
+
+  const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
+  if (rapidEtsyUrls.length > 0) {
+    try {
+      result.images = await mirrorGenericPageImageUrlsForNanoBanana(rapidEtsyUrls.slice(0, 3), userId);
+      if (result.images.length > 0) result.source = 'etsy_product';
+    } catch (e) {
+      console.warn('harvestNanoBananaReferenceImagesForUrlToPin Etsy RapidAPI:', e.message || e);
+    }
+  }
+  if (result.images.length === 0) {
+    const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
+    if (etsyThumb) {
+      try {
+        result.images = await mirrorGenericPageImageUrlsForNanoBanana([etsyThumb], userId);
+        if (result.images.length > 0) result.source = 'page';
+      } catch (e) {
+        console.warn('harvestNanoBananaReferenceImagesForUrlToPin Etsy oEmbed:', e.message || e);
+      }
+    }
+  }
+
+  if (
+    result.images.length === 0 &&
+    process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
+    isAmazonProductPageForNanoReference(amazonCtxUrl)
+  ) {
+    try {
+      if (amazonRapid && Array.isArray(amazonRapid.images) && amazonRapid.images.length > 0) {
+        const candidates = amazonRapid.images
+          .map((im) => (im && typeof im === 'object' ? im.hi_res || im.image || im.large || '' : ''))
+          .filter(Boolean);
+        if (candidates.length > 0) {
+          result.images = await mirrorAmazonImageUrlsForNanoBanana(candidates, userId);
+          if (result.images.length > 0) result.source = 'amazon_product';
+        }
+      }
+      if (result.images.length === 0) {
+        const azHtml = await fetchArticleHtml(amazonCtxUrl);
+        let candidates = extractAmazonProductImageUrlsFromHtml(azHtml, amazonCtxUrl);
+        if (candidates.length === 0 || detectAmazonBotOrConsentPage(azHtml)) {
+          const widgetImg = await fetchAmazonAsinWidgetImageUrl(amazonCtxUrl);
+          if (widgetImg) candidates = [widgetImg];
+        }
+        if (candidates.length > 0) {
+          result.images = await mirrorAmazonImageUrlsForNanoBanana(candidates, userId);
+          if (result.images.length > 0) result.source = 'amazon_product';
+        }
+      }
+    } catch (e) {
+      console.warn('harvestNanoBananaReferenceImagesForUrlToPin Amazon:', e.message || e);
+    }
+  }
+
+  if (
+    result.images.length === 0 &&
+    process.env.URLTOPIN_WALMART_PRODUCT_IMAGES !== '0' &&
+    isWalmartProductPageForNanoReference(walmartCtxUrl)
+  ) {
+    try {
+      const harvested = await harvestWalmartReferenceImages(walmartCtxUrl, userId, walmartRapid);
+      result.images = harvested.images;
+      if (harvested.images.length > 0) result.source = 'walmart_product';
+    } catch (e) {
+      console.warn('harvestNanoBananaReferenceImagesForUrlToPin Walmart:', e.message || e);
+    }
+  }
+
+  if (
+    result.images.length === 0 &&
+    usePageReferenceImages &&
+    process.env.URLTOPIN_PAGE_REFERENCE_IMAGES !== '0'
+  ) {
+    try {
+      let pageHtml = '';
+      if (!isEtsyListingPageUrl(refHtmlUrl)) {
+        pageHtml = await fetchArticleHtml(refHtmlUrl);
+      }
+      if (pageHtml && pageHtml.length > 200) {
+        const candidates = extractGenericPageImageUrlsFromHtml(pageHtml, refHtmlUrl);
+        if (candidates.length > 0) {
+          result.images = await mirrorGenericPageImageUrlsForNanoBanana(candidates, userId);
+          if (result.images.length > 0) result.source = 'page';
+        }
+      }
+    } catch (e) {
+      console.warn('harvestNanoBananaReferenceImagesForUrlToPin page refs:', e.message || e);
+    }
+  }
+
+  return result;
+}
+
 function isAllowedAmazonCdnImageUrl(urlString) {
   try {
     const u = new URL(urlString);
@@ -7892,7 +8044,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
       return res.status(429).json({
         error: 'preview_limit_reached',
         message:
-          'You’ve used your free preview pin. Sign up free to generate the full set — up to 10 pins per URL, no watermark, with download and scheduling.',
+          'You’ve used your free preview pin. Sign up free to generate the full set — up to 10 pins per URL, no watermark, with download. Schedule to Pinterest unlocks on paid plans.',
       });
     }
 
@@ -7915,9 +8067,18 @@ app.post('/api/urltopin/preview', async (req, res) => {
     }
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
 
+    let workingUrl = rawUrl;
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+      if (expanded) workingUrl = expanded;
+    } catch {
+      /* ignore */
+    }
+
     // 3. Scrape (same pipeline as /scrape and /generate).
     const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, articleData || null, {
       outputLanguage,
+      preResolvedUrl: workingUrl,
     });
     const hasScrapeContent =
       (base.title && String(base.title).trim().length >= 3) ||
@@ -7935,11 +8096,22 @@ app.post('/api/urltopin/preview', async (req, res) => {
     let contentProfile = await enrichContentProfile(base, openai);
     contentProfile = mergeProductAffiliateLandingIntoProfile(contentProfile, base);
     const plan = planStrategies(contentProfile, 1);
-    const p = plan && plan[0];
-    if (!p) {
+    const p0 = plan && plan[0];
+    if (!p0) {
       if (consumedGlobal) refundGlobalFreePreview();
       return res.status(502).json({ error: 'plan_failed', message: 'Could not plan a pin for this page.' });
     }
+
+    const refHarvest = await harvestNanoBananaReferenceImagesForUrlToPin({
+      userId: PREVIEW_ANON_STORAGE_USER_ID,
+      workingUrl,
+      base,
+    });
+    const layoutId = replaceInfographicStyleIdForAmazonNanoRefs(
+      p0.layoutId,
+      refHarvest.images.length > 0
+    );
+    const p = { ...p0, layoutId };
 
     // 5. Metadata for the single pin (mirrors the strategic path in /generate).
     const keyword = base.keyword || '';
@@ -7970,7 +8142,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
       source: domain,
     };
 
-    // 6. Build the image prompt and generate ONE image (no reference images, no brand).
+    // 6. Build the image prompt and generate ONE image (product refs when available).
     let imagePrompt = buildOverlayImagePrompt({
       styleId: p.layoutId,
       topic,
@@ -7982,7 +8154,8 @@ app.post('/api/urltopin/preview', async (req, res) => {
       stepCount: meta.step_count ?? null,
       niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
     });
-    imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, rawUrl);
+    imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, workingUrl);
+    imagePrompt = appendNanoBananaReferencePromptSuffix(imagePrompt, refHarvest.source);
 
     let rawImageUrl = '';
     if (process.env.USE_DUMMY_IMAGES === 'true') {
@@ -7992,9 +8165,10 @@ app.post('/api/urltopin/preview', async (req, res) => {
         30_000,
         parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000
       );
+      const nanoOpts = refHarvest.images.length ? { imageInput: refHarvest.images } : {};
       rawImageUrl =
         (await withSoftTimeout(
-          generateImageWithNanoBanana(imagePrompt, `preview-${p.layoutId}`, {}),
+          generateImageWithNanoBanana(imagePrompt, `preview-${p.layoutId}`, nanoOpts),
           providerSoftTimeoutMs
         )) || '';
     }

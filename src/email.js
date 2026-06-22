@@ -180,14 +180,29 @@ export function renderUpgradeNudgeEmail({ currentPlan, used, limit, reason } = {
   const url = cur === 'free' ? PRICING_URL : UPGRADE_URL;
 
   const atLimit = reason === 'limit_reached';
-  const heading = atLimit ? `You're out of pins for this month` : `You're running low on pins`;
+  const isFreeLifetime = cur === 'free';
+  const heading = atLimit
+    ? isFreeLifetime
+      ? `You've used all your free AI pins`
+      : `You're out of pins for this month`
+    : isFreeLifetime
+      ? `You're running low on free AI pins`
+      : `You're running low on pins`;
   const subject = atLimit
-    ? `You've hit your ${curLabel} pin limit — upgrade for more`
-    : `You're almost out of pins this month`;
+    ? isFreeLifetime
+      ? `You've hit your ${curLabel} AI pin limit — upgrade for more`
+      : `You've hit your ${curLabel} pin limit — upgrade for more`
+    : isFreeLifetime
+      ? `You're almost out of free AI pins`
+      : `You're almost out of pins this month`;
 
   const opening = atLimit
-    ? `You've used all <strong>${limit}</strong> AI pins on your ${curLabel} plan this month. Nice work — that means it's driving real output for you.`
-    : `You've used <strong>${used}</strong> of your <strong>${limit}</strong> AI pins this month on your ${curLabel} plan — you're getting close to the limit.`;
+    ? isFreeLifetime
+      ? `You've used all <strong>${limit}</strong> AI pins on your ${curLabel} plan (lifetime allowance). Nice work — that means it's driving real output for you.`
+      : `You've used all <strong>${limit}</strong> AI pins on your ${curLabel} plan this month. Nice work — that means it's driving real output for you.`
+    : isFreeLifetime
+      ? `You've used <strong>${used}</strong> of your <strong>${limit}</strong> AI pins on your ${curLabel} plan — you're getting close to your lifetime limit.`
+      : `You've used <strong>${used}</strong> of your <strong>${limit}</strong> AI pins this month on your ${curLabel} plan — you're getting close to the limit.`;
 
   const pitch = `Upgrade to <strong>${nextLabel}</strong> for <strong>${nextLimit} pins/month</strong>${multiple && multiple >= 1.5 ? ` (${multiple}× more)` : ''} at $${nextPrice}/mo. Your current usage carries over — you'll be able to keep creating right away.`;
 
