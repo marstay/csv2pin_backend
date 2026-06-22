@@ -2199,10 +2199,28 @@ const AFFILIATE_TRACKING_HOST_EXACT = new Set([
   'linkst.walmart.com',
 ]);
 
+function isCreatorAffiliatePlatformRedirectHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  // ShopMy quick links (go.shopmy.us/p-…) → retailer destination
+  if (h === 'go.shopmy.us' || h === 'shopmy.us' || h.endsWith('.shopmy.us')) return true;
+  // Mavely SmartLinks
+  if (h === 'mavely.app' || h.endsWith('.mavely.app')) return true;
+  if (h === 'mavely.app.link' || h.endsWith('.mavely.app.link')) return true;
+  return false;
+}
+
+function isBenableHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h === 'benable.com' || h.endsWith('.benable.com');
+}
+
 function isAffiliateTrackingRedirectHost(host) {
   const h = normalizeUrlHostname(host);
   if (!h) return false;
   if (AFFILIATE_TRACKING_HOST_EXACT.has(h)) return true;
+  if (isCreatorAffiliatePlatformRedirectHost(h)) return true;
   if (h.endsWith('.hop.clickbank.net')) return true;
   if (h.endsWith('.sjv.io')) return true;
   if (h.endsWith('.ojrq.net')) return true;
@@ -2653,6 +2671,17 @@ async function maybeShortenPageTitleForUrlToPin(urlString, title, openaiClient, 
 }
 
 /**
+ * Prefer any gate that requires a manual pin-footer line (original URL wins ties).
+ * @returns {{ requiresManualBrandOrCta: boolean, brandingGateReason: string|null, brandingGateMessage: string|null }}
+ */
+function mergeBrandingGates(...gates) {
+  for (const g of gates) {
+    if (g?.requiresManualBrandOrCta) return g;
+  }
+  return { requiresManualBrandOrCta: false, brandingGateReason: null, brandingGateMessage: null };
+}
+
+/**
  * Short links, Amazon store/product/affiliate URLs: pin footer should be the user's brand/CTA, not the raw URL host.
  * @returns {{ requiresManualBrandOrCta: boolean, brandingGateReason: string|null, brandingGateMessage: string|null }}
  */
@@ -2679,12 +2708,30 @@ function assessUrlBrandingGate(urlString) {
       };
     }
 
+    if (isCreatorAffiliatePlatformRedirectHost(host)) {
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: 'creator_affiliate_link',
+        brandingGateMessage:
+          'This looks like a ShopMy or Mavely affiliate link. Pins should show your brand in the footer, not the network name. Enter your brand name or CTA in Pin footer (required) below (e.g. your site name or “Shop my picks”).',
+      };
+    }
+
+    if (isBenableHost(host)) {
+      return {
+        requiresManualBrandOrCta: true,
+        brandingGateReason: 'benable_list',
+        brandingGateMessage:
+          'This looks like a Benable list link. Pins should show your brand in the footer, not “Benable.” Enter your brand name or CTA in Pin footer (required) below, and use this Benable URL as the pin destination.',
+      };
+    }
+
     if (isAffiliateTrackingRedirectHost(host)) {
       return {
         requiresManualBrandOrCta: true,
         brandingGateReason: 'affiliate_tracking',
         brandingGateMessage:
-          'This looks like an affiliate or network tracking link (not your own site). Pins should show your brand or CTA in the footer, not the tracking URL. Before generating, open Pin look & brand and add your brand name or CTA.',
+          'This looks like an affiliate or network tracking link (not your own site). Pins should show your brand or CTA in the footer, not the tracking URL. Enter your brand name or CTA in Pin footer (required) below.',
       };
     }
 
@@ -2749,8 +2796,8 @@ function assessUrlBrandingGate(urlString) {
       const reason = hasAffiliate || productish ? 'amazon_product_affiliate' : 'amazon_store';
       const msg =
         reason === 'amazon_product_affiliate'
-          ? 'This looks like an Amazon product or affiliate link. Pins should show your brand in the footer, not Amazon. Before generating, open Pin look & brand and add your brand name or CTA (e.g. your site name).'
-          : 'This looks like an Amazon page. Before generating pins, add your brand name or CTA so the footer represents you, not the store.';
+          ? 'This looks like an Amazon product or affiliate link. Pins should show your brand in the footer, not Amazon. Enter your brand name or CTA in Pin footer (required) below (e.g. your site name).'
+          : 'This looks like an Amazon page. Enter your brand name or CTA in Pin footer (required) below so the footer represents you, not the store.';
 
       return {
         requiresManualBrandOrCta: true,
@@ -4310,6 +4357,7 @@ function shouldResolveOutboundUrlForUrlToPin(hostname) {
   if (!h) return false;
   if (isPinterestOutboundHost(h)) return false;
   if (isLikelyUrlShortenerHost(h)) return true;
+  if (isCreatorAffiliatePlatformRedirectHost(h)) return true;
   if (isAffiliateTrackingRedirectHost(h)) return true;
   return false;
 }
@@ -4705,7 +4753,8 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   const derivedKw = deriveKeywordFromArticleUrl(workingUrl);
   base.linkDisplay = derivedDisplay || base.linkDisplay || '';
   base.keyword = derivedKw;
-  Object.assign(base, assessUrlBrandingGate(workingUrl));
+  const rawInputUrl = String(url || '').trim();
+  Object.assign(base, mergeBrandingGates(assessUrlBrandingGate(rawInputUrl), assessUrlBrandingGate(workingUrl)));
 
   if (amazonRapidEarly && amazonRapidTitleOk) {
     const t = String(amazonRapidEarly.title || '').trim();
