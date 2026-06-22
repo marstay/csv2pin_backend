@@ -5040,6 +5040,33 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
     }
   }
 
+  const resolvedHref = (() => {
+    try {
+      return current.href;
+    } catch {
+      return raw;
+    }
+  })();
+
+  if (
+    shouldTryPuppeteerAffiliateUrlResolve(raw, bestPdpUrl || resolvedHref)
+  ) {
+    try {
+      const puFinal = await resolveFinalUrlViaPuppeteer(raw);
+      if (puFinal && puFinal !== raw) {
+        console.log(
+          `resolveOutboundUrl: Puppeteer affiliate resolve ${String(raw).slice(0, 72)} → ${puFinal.slice(0, 96)}`
+        );
+        if (isProductDetailPageUrl(puFinal)) return puFinal;
+        if (!bestPdpUrl && !isCreatorAffiliatePlatformRedirectHost(new URL(puFinal).hostname)) {
+          return puFinal;
+        }
+      }
+    } catch (e) {
+      console.warn('resolveOutboundUrl Puppeteer affiliate resolve:', e.message || e);
+    }
+  }
+
   if (bestPdpUrl) return bestPdpUrl;
 
   try {
@@ -5139,6 +5166,115 @@ async function fetchArticleHtmlViaPuppeteer(pageUrl) {
       }
     }
   }
+}
+
+/**
+ * Mavely / ShopMy hops often 403 server fetch but redirect in a real browser.
+ * Returns the final URL after redirects (not HTML).
+ */
+async function resolveFinalUrlViaPuppeteer(startUrl, maxGotoMs = 35000) {
+  if (process.env.DISABLE_URLTOPIN_PUPPETEER === '1') return null;
+  const start = String(startUrl || '').trim();
+  if (!start) return null;
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      timeout: 60000,
+    });
+    const page = await browser.newPage();
+    await page.setUserAgent(URL_SCRAPE_HEADERS['User-Agent']);
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': URL_SCRAPE_HEADERS['Accept-Language'],
+    });
+    await page.goto(start, { waitUntil: 'networkidle2', timeout: maxGotoMs });
+    await new Promise((r) => setTimeout(r, 1500));
+    const finalUrl = String(page.url() || '').trim();
+    if (!finalUrl || finalUrl === 'about:blank') return null;
+    return finalUrl;
+  } catch (e) {
+    console.warn('resolveFinalUrlViaPuppeteer:', e.message || e);
+    return null;
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function shouldTryPuppeteerAffiliateUrlResolve(rawUrl, resolvedUrl) {
+  try {
+    const raw = new URL(String(rawUrl || '').trim());
+    if (!shouldResolveOutboundUrlForUrlToPin(raw.hostname)) return false;
+    if (isProductDetailPageUrl(resolvedUrl)) return false;
+    const resolved = String(resolvedUrl || '').trim();
+    if (!resolved) return true;
+    if (isCreatorAffiliatePlatformRedirectHost(new URL(resolved).hostname)) return true;
+    if (isMerchantNonPdpLandingUrl(resolved)) return true;
+    return resolved === raw.href;
+  } catch {
+    return false;
+  }
+}
+
+/** Minimal metadata so Mavely/ShopMy links can proceed to generate (brand footer still required). */
+function applyAffiliateHopScrapeFallback(rawInputUrl, workingUrl, base) {
+  const landing = detectProductAffiliateLandingFromUrls(rawInputUrl, workingUrl);
+  if (!landing.creatorAffiliateLanding && !landing.amazonLanding && !landing.walmartLanding) {
+    try {
+      const rawHost = new URL(String(rawInputUrl || '').trim()).hostname;
+      if (!shouldResolveOutboundUrlForUrlToPin(rawHost)) return false;
+    } catch {
+      return false;
+    }
+  }
+  const gate = mergeBrandingGates(
+    assessUrlBrandingGate(rawInputUrl),
+    assessUrlBrandingGate(workingUrl)
+  );
+  if (!gate.requiresManualBrandOrCta) return false;
+
+  const titleOk = base.title && String(base.title).trim().length >= 3;
+  const descOk = base.description && String(base.description).trim().length >= 20;
+  if (titleOk || descOk) return false;
+
+  let title = 'Affiliate product link';
+  try {
+    const wu = new URL(String(workingUrl || '').trim());
+    const host = normalizeUrlHostname(wu.hostname);
+    if (isKnownAffiliateDestinationMerchantHost(wu.hostname)) {
+      if (isAmazonRelatedHost(wu.hostname)) title = 'Amazon product';
+      else if (isWalmartRelatedHost(wu.hostname)) title = 'Walmart product';
+      else if (isTemuRelatedHost(wu.hostname)) title = 'Temu product';
+      else if (isTargetRelatedHost(wu.hostname)) title = 'Target product';
+      else if (isEtsyHost(wu.hostname)) title = 'Etsy listing';
+      else title = `Product on ${host}`;
+    }
+  } catch {
+    /* keep default */
+  }
+
+  base.title = title;
+  if (!base.description || String(base.description).trim().length < 20) {
+    base.description =
+      'Add your brand in Pin footer (required), then generate pins. We use your affiliate link as the pin destination.';
+  }
+  Object.assign(base, landing);
+  Object.assign(base, gate);
+  base.affiliateHopScrapeFallback = true;
+  return true;
+}
+
+function hasUrlToPinScrapeContent(base) {
+  return (
+    (base.title && String(base.title).trim().length >= 3) ||
+    (base.description && String(base.description).trim().length >= 20)
+  );
 }
 
 /** When RapidAPI returns a usable listing, skip slow HTML + Puppeteer for Etsy PDPs. */
@@ -5396,6 +5532,10 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   }
 
   Object.assign(base, detectProductAffiliateLandingFromUrls(rawInputUrl, workingUrl, base.canonicalUrl));
+
+  if (!hasUrlToPinScrapeContent(base)) {
+    applyAffiliateHopScrapeFallback(rawInputUrl, workingUrl, base);
+  }
 
   return { base, articleSummary };
 }
@@ -8223,14 +8363,18 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     // and Walmart product/affiliate links when `RAPIDAPI_KEY` is set.
     const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, null, null);
 
-    const hasScrapeContent =
-      (base.title && String(base.title).trim().length >= 3) ||
-      (base.description && String(base.description).trim().length >= 20);
-
-    if (!hasScrapeContent) {
+    if (!hasUrlToPinScrapeContent(base)) {
+      let affiliateHop = false;
+      try {
+        const h = new URL(rawUrl).hostname;
+        affiliateHop = shouldResolveOutboundUrlForUrlToPin(h);
+      } catch {
+        /* ignore */
+      }
       return res.status(502).json({
-        error:
-          'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
+        error: affiliateHop
+          ? 'Could not read the product page behind this affiliate link (Mavely/ShopMy often block automated access). Add your brand in Pin footer (required), then try Generate — we follow the link in a browser when generating. Or paste the direct store product URL.'
+          : 'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
       });
     }
 
@@ -8249,6 +8393,7 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (base.walmartLanding) meta.walmartLanding = true;
     if (base.creatorAffiliateLanding) meta.creatorAffiliateLanding = true;
     if (base.etsyLanding) meta.etsyLanding = true;
+    if (base.affiliateHopScrapeFallback) meta.affiliateHopScrapeFallback = true;
     if (articleSummary && String(articleSummary).trim().length > 0) {
       meta.articleSummary = articleSummary;
     }
