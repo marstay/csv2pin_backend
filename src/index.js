@@ -1627,6 +1627,34 @@ function normalizeManualProductOverride(raw) {
   return { title, description, imageUrls };
 }
 
+/** Direct store PDP URL for title/images when the pin link stays on Mavely/ShopMy/Benable. */
+function normalizeProductPageUrlOverride(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    const host = u.hostname;
+    if (
+      isAffiliateTrackingRedirectHost(host) ||
+      isCreatorAffiliatePlatformRedirectHost(host) ||
+      isBenableHost(host) ||
+      isLikelyUrlShortenerHost(host)
+    ) {
+      return null;
+    }
+    return u.href;
+  } catch {
+    return null;
+  }
+}
+
+function isAffiliatePlatformPinDestinationHost(hostname) {
+  const h = normalizeUrlHostname(hostname);
+  if (!h) return false;
+  return isCreatorAffiliatePlatformRedirectHost(h) || isBenableHost(h);
+}
+
 /**
  * @param {string} userId
  * @param {{ aiDelta?: number, userPhotoDelta?: number }} deltas, positive consume, negative refund
@@ -2328,6 +2356,37 @@ function cleanProductSlugHandleForKeyword(slug) {
   return s;
 }
 
+/** Target TCIN, Walmart item id, Temu goods id, ASIN-like tokens — not usable pin keywords. */
+function isOpaqueMerchantProductIdSegment(seg) {
+  const s = String(seg || '').trim();
+  if (!s || s === '-') return true;
+  if (/^A-\d{5,}$/i.test(s)) return true;
+  if (/^A\d{5,}$/i.test(s)) return true;
+  if (/^\d{5,15}$/.test(s)) return true;
+  if (/^g-\d{5,}$/i.test(s)) return true;
+  if (/^B[0-9A-Z]{9}$/i.test(s)) return true;
+  return false;
+}
+
+function slugSegmentToKeyword(slug) {
+  let s = cleanProductSlugHandleForKeyword(String(slug || '').trim());
+  s = s.replace(/-g-\d{5,}$/i, '');
+  return s
+    .replace(/[-_]/g, ' ')
+    .replace(/\.[a-zA-Z0-9]+$/, '')
+    .trim();
+}
+
+function sanitizeDerivedKeyword(keyword) {
+  const k = String(keyword || '').trim();
+  if (!k || k.length < 3) return '';
+  if (/^ref\s*=/i.test(k) || /\bsspa\b/i.test(k)) return '';
+  if (/^A\s*-?\s*\d{5,}$/i.test(k)) return '';
+  if (/^g\s*-?\s*\d{5,}$/i.test(k)) return '';
+  if (/^\d{5,15}$/.test(k.replace(/\s/g, ''))) return '';
+  return k;
+}
+
 /**
  * Keyword from URL path for prompts — skip shorteners and opaque slug segments (e.g. asdf123).
  * Amazon: prefer product slug before /dp/ASIN; never use trailing ref=… segments.
@@ -2342,15 +2401,45 @@ function deriveKeywordFromArticleUrl(urlString) {
     let parts = pathSegmentsStripTracking((u.pathname || '').split('/').filter(Boolean));
     if (parts.length === 0) return '';
 
+    if (isTargetRelatedHost(host)) {
+      const pIdx = parts.findIndex((p) => p === 'p');
+      if (pIdx >= 0) {
+        for (let i = pIdx + 1; i < parts.length; i++) {
+          const seg = parts[i];
+          if (!seg || seg === '-' || isOpaqueMerchantProductIdSegment(seg)) continue;
+          const kw = sanitizeDerivedKeyword(slugSegmentToKeyword(seg));
+          if (kw.length >= 3) return kw;
+        }
+      }
+      return '';
+    }
+
+    if (isTemuRelatedHost(host)) {
+      let seg = parts[parts.length - 1] || '';
+      if (/^goods\.html$/i.test(seg)) return '';
+      seg = seg.replace(/\.html$/i, '');
+      if (!seg || isOpaqueMerchantProductIdSegment(seg)) return '';
+      const kw = sanitizeDerivedKeyword(slugSegmentToKeyword(seg));
+      return kw.length >= 3 ? kw : '';
+    }
+
+    if (isWalmartRelatedHost(host)) {
+      const ipIdx = parts.findIndex((p) => p === 'ip');
+      if (ipIdx >= 0 && parts[ipIdx + 1]) {
+        const slug = parts[ipIdx + 1];
+        if (isOpaqueMerchantProductIdSegment(slug)) return '';
+        const kw = sanitizeDerivedKeyword(slugSegmentToKeyword(slug));
+        return kw.length >= 3 ? kw : '';
+      }
+      return '';
+    }
+
     if (isAmazonRelatedHost(host)) {
       const dpIdx = parts.findIndex((p) => p === 'dp');
       if (dpIdx > 0) {
         const slug = parts[dpIdx - 1];
         if (slug && !/^dp$/i.test(slug)) {
-          let keyword = slug
-            .replace(/[-_]/g, ' ')
-            .replace(/\.[a-zA-Z0-9]+$/, '')
-            .trim();
+          let keyword = sanitizeDerivedKeyword(slugSegmentToKeyword(slug));
           if (keyword.length >= 3) return keyword;
         }
       }
@@ -2360,6 +2449,18 @@ function deriveKeywordFromArticleUrl(urlString) {
 
     let last = parts[parts.length - 1] || '';
     if (!last) return '';
+
+    if (isOpaqueMerchantProductIdSegment(last)) {
+      let found = '';
+      for (let i = parts.length - 2; i >= 0; i--) {
+        const seg = parts[i];
+        if (!seg || seg === '-' || isOpaqueMerchantProductIdSegment(seg)) continue;
+        found = seg;
+        break;
+      }
+      if (!found) return '';
+      last = found;
+    }
 
     if (isEcommerceProductPath(u.pathname || '')) {
       const prodIdx = parts.findIndex((p) => /^products?$/i.test(p));
@@ -2378,12 +2479,8 @@ function deriveKeywordFromArticleUrl(urlString) {
       return '';
     }
 
-    let keyword = last
-      .replace(/[-_]/g, ' ')
-      .replace(/\.[a-zA-Z0-9]+$/, '')
-      .trim();
+    let keyword = sanitizeDerivedKeyword(slugSegmentToKeyword(last));
     if (keyword.length < 3) return '';
-    if (/^ref\s*=/i.test(keyword) || /\bsspa\b/i.test(keyword)) return '';
     return keyword;
   } catch {
     return '';
@@ -5048,7 +5145,9 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
     }
   })();
 
+  const puppeteerAffiliateResolveEnabled = process.env.URLTOPIN_PUPPETEER_AFFILIATE_RESOLVE === '1';
   if (
+    puppeteerAffiliateResolveEnabled &&
     shouldTryPuppeteerAffiliateUrlResolve(raw, bestPdpUrl || resolvedHref)
   ) {
     try {
@@ -5356,10 +5455,13 @@ async function tryWalmartRapidPrefetchForUrl(workingUrl, originalUrl = '') {
  */
 async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
   const fast = !!opts?.fast;
+  const productPageOverride = normalizeProductPageUrlOverride(opts?.productPageUrl);
   const preResolved = String(opts?.preResolvedUrl || '').trim();
   const outputLanguage = String(opts?.outputLanguage || '').trim().toLowerCase();
   let workingUrl = String(url || '').trim();
-  if (preResolved) {
+  if (productPageOverride) {
+    workingUrl = productPageOverride;
+  } else if (preResolved) {
     workingUrl = preResolved;
   } else {
     try {
@@ -5490,7 +5592,8 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     const meaningfulTitle = titleLooksMeaningfulForKeywordSuppression(base.title);
     const wantNonEnglish = !!(outputLanguage && outputLanguage !== 'auto' && outputLanguage !== 'en');
     const nonLatinTitle = titleHasNonLatinScript(base.title);
-    const isProductPath = isEcommerceProductPath(u.pathname || '');
+    const isProductPath =
+      isEcommerceProductPath(u.pathname || '') || isProductDetailPageUrl(workingUrl);
     if (
       !isAmazon &&
       meaningfulTitle &&
@@ -5535,6 +5638,11 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
 
   if (!hasUrlToPinScrapeContent(base)) {
     applyAffiliateHopScrapeFallback(rawInputUrl, workingUrl, base);
+  }
+
+  if (productPageOverride) {
+    base.productPageUrl = productPageOverride;
+    base.pinDestinationUrl = rawInputUrl;
   }
 
   return { base, articleSummary };
@@ -8355,25 +8463,27 @@ app.post('/api/tools/pinterest-hashtag-generator', async (req, res) => {
 
 app.post('/api/urltopin/scrape', async (req, res) => {
   try {
-    const { url, enrich } = req.body || {};
+    const { url, enrich, productPageUrl: rawProductPageUrl } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url' });
 
     const rawUrl = String(url || '').trim();
+    const productPageUrl = normalizeProductPageUrlOverride(rawProductPageUrl);
     // Shared pipeline with generate: short-link resolve; RapidAPI-first for Etsy, Amazon PDPs,
     // and Walmart product/affiliate links when `RAPIDAPI_KEY` is set.
-    const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, null, null);
+    const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, null, { productPageUrl });
 
     if (!hasUrlToPinScrapeContent(base)) {
       let affiliateHop = false;
       try {
         const h = new URL(rawUrl).hostname;
-        affiliateHop = shouldResolveOutboundUrlForUrlToPin(h);
+        affiliateHop =
+          shouldResolveOutboundUrlForUrlToPin(h) || isAffiliatePlatformPinDestinationHost(h);
       } catch {
         /* ignore */
       }
       return res.status(502).json({
         error: affiliateHop
-          ? 'Could not read the product page behind this affiliate link (Mavely/ShopMy often block automated access). Add your brand in Pin footer (required), then try Generate — we follow the link in a browser when generating. Or paste the direct store product URL.'
+          ? 'Could not read the product page behind this affiliate link (Mavely/ShopMy/Benable block automated access). Paste the direct Temu/Amazon/store product URL in Product page URL — your affiliate link still goes on the pin. Add your brand in Pin footer (required).'
           : 'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
       });
     }
@@ -8536,23 +8646,31 @@ app.post('/api/urltopin/preview', async (req, res) => {
       consumedGlobal = true;
     }
 
-    const { url, articleData, outputLanguage: rawOutputLanguage, brand } = req.body || {};
+    const { url, articleData, outputLanguage: rawOutputLanguage, brand, productPageUrl: rawProductPageUrl } = req.body || {};
     const rawUrl = String(url || '').trim();
     if (!rawUrl) {
       if (consumedGlobal) refundGlobalFreePreview();
       return res.status(400).json({ error: 'Missing url' });
     }
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
+    const productPageUrl = normalizeProductPageUrlOverride(rawProductPageUrl);
 
     let workingUrl = rawUrl;
-    try {
-      const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
-      if (expanded) workingUrl = expanded;
-    } catch {
-      /* ignore */
+    if (productPageUrl) {
+      workingUrl = productPageUrl;
+    } else {
+      try {
+        const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
+        if (expanded) workingUrl = expanded;
+      } catch {
+        /* ignore */
+      }
     }
 
-    const brandingGate = assessUrlBrandingGate(workingUrl);
+    const brandingGate = mergeBrandingGates(
+      assessUrlBrandingGate(rawUrl),
+      assessUrlBrandingGate(workingUrl)
+    );
     const brandName = String(brand?.brandName || '').trim() || null;
     if (brandingGate.requiresManualBrandOrCta && !brandName) {
       if (consumedGlobal) refundGlobalFreePreview();
@@ -8565,7 +8683,8 @@ app.post('/api/urltopin/preview', async (req, res) => {
     // 3. Scrape (same pipeline as /scrape and /generate).
     const { base, articleSummary } = await fetchArticleBaseAndSummary(rawUrl, articleData || null, {
       outputLanguage,
-      preResolvedUrl: workingUrl,
+      preResolvedUrl: productPageUrl ? '' : workingUrl,
+      productPageUrl,
     });
     const hasScrapeContent =
       (base.title && String(base.title).trim().length >= 3) ||
@@ -8722,16 +8841,21 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
       outputLanguage: rawOutputLanguage,
       winnerContext: rawWinnerContext,
       manualProduct: rawManualProduct,
+      productPageUrl: rawProductPageUrl,
     } = req.body || {};
     if (!url) {
       return res.status(400).json({ error: 'Missing url' });
     }
     const winnerContext = normalizeWinnerContext(rawWinnerContext);
     const manualProduct = normalizeManualProductOverride(rawManualProduct);
+    const productPageUrl = normalizeProductPageUrlOverride(rawProductPageUrl);
     const requestedCount = Number.parseInt(rawPinsPerUrl ?? rawCount ?? 10, 10);
     const count = [2, 3, 5, 10].includes(requestedCount) ? requestedCount : 10;
     const outputLanguage = String(rawOutputLanguage || '').trim().toLowerCase();
-    const { base } = await fetchArticleBaseAndSummary(url, articleData || null, { outputLanguage });
+    const { base } = await fetchArticleBaseAndSummary(url, articleData || null, {
+      outputLanguage,
+      productPageUrl,
+    });
     if (manualProduct?.title) {
       base.title = manualProduct.title;
       if (manualProduct.description) base.description = manualProduct.description.slice(0, 450);
@@ -8777,9 +8901,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       metadataOnly: rawMetadataOnly,
       winnerContext: rawWinnerContext,
       manualProduct: rawManualProduct,
+      productPageUrl: rawProductPageUrl,
     } = req.body || {};
     const winnerContext = normalizeWinnerContext(rawWinnerContext);
     const manualProduct = normalizeManualProductOverride(rawManualProduct);
+    const productPageUrl = normalizeProductPageUrlOverride(rawProductPageUrl);
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
@@ -8806,7 +8932,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     const rawUrl = String(url || '').trim();
     let effectiveUrl = rawUrl;
-    if (rawUrl) {
+    if (productPageUrl) {
+      effectiveUrl = productPageUrl;
+    } else if (rawUrl) {
       try {
         const expanded = await resolveOutboundUrlForUrlToPin(rawUrl);
         if (expanded) effectiveUrl = expanded;
@@ -8826,7 +8954,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       }
     } else if (isStrategic) {
       const fetched = await fetchArticleBaseAndSummary(rawUrl, articleData, {
-        preResolvedUrl: effectiveUrl,
+        preResolvedUrl: productPageUrl ? '' : effectiveUrl,
+        productPageUrl,
         outputLanguage,
       });
       const { base } = fetched;
@@ -8845,7 +8974,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
     }
 
-    const brandingGate = assessUrlBrandingGate(effectiveUrl);
+    const brandingGate = mergeBrandingGates(
+      assessUrlBrandingGate(rawUrl),
+      assessUrlBrandingGate(effectiveUrl)
+    );
     if (brandingGate.requiresManualBrandOrCta && !String(brand?.brandName || '').trim()) {
       return res.status(400).json({
         error: 'branding_required',
@@ -8858,7 +8990,8 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       req._fetchedArticle ||
       (await fetchArticleBaseAndSummary(rawUrl, articleData, {
         ...(fastForFanOut ? { fast: true } : {}),
-        preResolvedUrl: effectiveUrl,
+        preResolvedUrl: productPageUrl ? '' : effectiveUrl,
+        productPageUrl,
         outputLanguage,
       }));
     const base = fetchedBase.base;
