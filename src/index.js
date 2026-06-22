@@ -4655,6 +4655,96 @@ function shouldResolveOutboundUrlForUrlToPin(hostname) {
   return false;
 }
 
+function isTemuRelatedHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h === 'temu.com' || h.endsWith('.temu.com');
+}
+
+function isTargetRelatedHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h === 'target.com' || h.endsWith('.target.com');
+}
+
+/** Merchant sites affiliate hops often land on before we have a product detail page. */
+function isKnownAffiliateDestinationMerchantHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return (
+    isAmazonRelatedHost(h) ||
+    isWalmartRelatedHost(h) ||
+    isEtsyHost(h) ||
+    isTemuRelatedHost(h) ||
+    isTargetRelatedHost(h)
+  );
+}
+
+/**
+ * True when the URL looks like a product detail page (not store home / tracking landing).
+ * Used after affiliate redirect expansion so scrape + page refs target real products.
+ */
+function isProductDetailPageUrl(urlString) {
+  const raw = String(urlString || '').trim();
+  if (!raw) return false;
+  try {
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    const host = u.hostname;
+    const path = u.pathname || '';
+
+    if (isAmazonRelatedHost(host)) {
+      return isAmazonProductPageForNanoReference(raw) || !!extractAmazonAsinFromUrl(raw);
+    }
+    if (isWalmartRelatedHost(host)) {
+      return isWalmartProductPageForNanoReference(raw);
+    }
+    if (isEtsyHost(host)) {
+      return isEtsyListingPageUrl(raw);
+    }
+    if (isTemuRelatedHost(host)) {
+      if (/\/-g-\d{5,}/i.test(path) || /-g-\d{5,}\.html/i.test(path)) return true;
+      if (/\/goods\.html/i.test(path) && u.searchParams.get('goods_id')) return true;
+      const segs = path.split('/').filter(Boolean);
+      if (segs.length >= 2 && /^[a-z0-9][-a-z0-9._]*-g-\d{5,}/i.test(segs[segs.length - 1])) return true;
+      return false;
+    }
+    if (isTargetRelatedHost(host)) {
+      if (/\/p\//i.test(path)) return true;
+      if (/\/-\/A-\d+/i.test(path) || /\/A-\d+/i.test(path)) return true;
+      return false;
+    }
+    if (isKnownAffiliateDestinationMerchantHost(host)) {
+      return false;
+    }
+    return isEcommerceProductPath(path);
+  } catch {
+    return false;
+  }
+}
+
+/** Merchant host but homepage, category hub, or tracking landing — not a PDP. */
+function isMerchantNonPdpLandingUrl(urlString) {
+  try {
+    const u = new URL(String(urlString || '').trim());
+    if (!isKnownAffiliateDestinationMerchantHost(u.hostname)) return false;
+    return !isProductDetailPageUrl(urlString);
+  } catch {
+    return false;
+  }
+}
+
+function shouldKeepResolvingOutboundUrl(urlString) {
+  if (isProductDetailPageUrl(urlString)) return false;
+  try {
+    const u = new URL(String(urlString || '').trim());
+    if (shouldResolveOutboundUrlForUrlToPin(u.hostname)) return true;
+    if (isMerchantNonPdpLandingUrl(urlString)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function extractMetaRefreshTargetFromHtml(html) {
   const s = String(html || '');
   if (!s) return '';
@@ -4669,9 +4759,124 @@ function extractMetaRefreshTargetFromHtml(html) {
   return urlPart.replace(/^url=/i, '').trim();
 }
 
+/** Canonical / og:url from interstitial or merchant landing HTML. */
+function extractCanonicalOrOgUrlFromHtml(html, pageUrl) {
+  const s = String(html || '');
+  if (!s) return '';
+  const patterns = [
+    /<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["'][^>]*>/i,
+    /<link[^>]+href=["']([^"']+)["'][^>]*rel=["']canonical["'][^>]*>/i,
+    /<meta[^>]+property=["']og:url["'][^>]*content=["']([^"']+)["'][^>]*>/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:url["'][^>]*>/i,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m && m[1]) {
+      try {
+        const abs = new URL(m[1].trim(), pageUrl).href;
+        assertSafePublicHttpUrl(new URL(abs));
+        return abs;
+      } catch {
+        /* try next */
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * When expansion stops on temu.com/?… or target.com/ (not a PDP), follow redirects /
+ * parse canonical / meta refresh once more before accepting the landing URL.
+ */
+async function tryDeepenMerchantLandingUrl(pageUrlString, timeoutMs, headers) {
+  const start = String(pageUrlString || '').trim();
+  if (!start || !isMerchantNonPdpLandingUrl(start)) return null;
+
+  let current;
+  try {
+    current = new URL(start);
+    assertSafePublicHttpUrl(current);
+  } catch {
+    return null;
+  }
+
+  const maxFollow = 5;
+  let lastHtml = '';
+
+  for (let i = 0; i < maxFollow; i++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    let resp;
+    try {
+      resp = await fetch(current.href, {
+        method: 'GET',
+        redirect: 'manual',
+        headers,
+        signal: ctrl.signal,
+      });
+    } catch {
+      clearTimeout(t);
+      break;
+    } finally {
+      clearTimeout(t);
+    }
+
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get('location') || resp.headers.get('Location');
+      if (!loc) break;
+      try {
+        current = new URL(loc, current.href);
+        assertSafePublicHttpUrl(current);
+      } catch {
+        break;
+      }
+      if (isProductDetailPageUrl(current.href)) return current.href;
+      continue;
+    }
+
+    if (!resp.ok) break;
+
+    try {
+      const buf = await resp.arrayBuffer();
+      lastHtml = Buffer.from(buf).slice(0, 65536).toString('utf8');
+    } catch {
+      lastHtml = '';
+    }
+
+    if (isProductDetailPageUrl(current.href)) return current.href;
+
+    const metaRefresh = extractMetaRefreshTargetFromHtml(lastHtml);
+    if (metaRefresh) {
+      try {
+        const next = new URL(metaRefresh, current.href);
+        assertSafePublicHttpUrl(next);
+        current = next;
+        if (isProductDetailPageUrl(current.href)) return current.href;
+        continue;
+      } catch {
+        /* fall through */
+      }
+    }
+
+    const canonical = extractCanonicalOrOgUrlFromHtml(lastHtml, current.href);
+    if (canonical && canonical !== current.href) {
+      try {
+        current = new URL(canonical);
+        assertSafePublicHttpUrl(current);
+        if (isProductDetailPageUrl(current.href)) return current.href;
+      } catch {
+        /* ignore */
+      }
+    }
+    break;
+  }
+
+  return isProductDetailPageUrl(current.href) ? current.href : null;
+}
+
 /**
  * Expand short / affiliate redirect URLs to a final http(s) destination (bounded hops).
- * Used so Amazon ASIN extraction, Etsy oEmbed, and branding gates see the real merchant URL.
+ * Prefers a product detail page (PDP) over merchant home / tracking landings.
  */
 async function resolveOutboundUrlForUrlToPin(rawUrlString) {
   const raw = String(rawUrlString || '').trim();
@@ -4682,7 +4887,9 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
   } catch {
     return raw;
   }
-  if (!shouldResolveOutboundUrlForUrlToPin(current.hostname)) return raw;
+  if (!shouldKeepResolvingOutboundUrl(current.href) && !shouldResolveOutboundUrlForUrlToPin(current.hostname)) {
+    return raw;
+  }
 
   const maxHops = 6;
   const timeoutMs = 9000;
@@ -4697,7 +4904,17 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
     return raw;
   }
 
+  let bestPdpUrl = isProductDetailPageUrl(current.href) ? current.href : null;
+
   for (let hop = 0; hop < maxHops; hop++) {
+    if (isProductDetailPageUrl(current.href)) {
+      bestPdpUrl = current.href;
+      break;
+    }
+    if (!shouldKeepResolvingOutboundUrl(current.href)) {
+      break;
+    }
+
     let headResp = null;
     try {
       const ctrl = new AbortController();
@@ -4723,23 +4940,19 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
         try {
           next = new URL(loc, current.href);
         } catch {
-          return raw;
+          return bestPdpUrl || raw;
         }
         try {
           assertSafePublicHttpUrl(next);
         } catch {
-          return raw;
+          return bestPdpUrl || raw;
         }
         current = next;
+        if (isProductDetailPageUrl(current.href)) bestPdpUrl = current.href;
         continue;
       }
     }
 
-    if (!shouldResolveOutboundUrlForUrlToPin(current.hostname)) {
-      break;
-    }
-
-    // Some networks block HEAD; others return 200 HTML interstitials that need a small GET body (meta refresh).
     if (hop < maxHops - 1) {
       const ctrl2 = new AbortController();
       const t2 = setTimeout(() => ctrl2.abort(), timeoutMs);
@@ -4772,6 +4985,7 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
             break;
           }
           current = next2;
+          if (isProductDetailPageUrl(current.href)) bestPdpUrl = current.href;
           continue;
         }
       }
@@ -4779,22 +4993,33 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
         try {
           const buf = await resp2.arrayBuffer();
           const slice = Buffer.from(buf).slice(0, 65536).toString('utf8');
+          let advanced = false;
           const target = extractMetaRefreshTargetFromHtml(slice);
           if (target) {
-            let next3;
             try {
-              next3 = new URL(target, current.href);
-            } catch {
-              break;
-            }
-            try {
+              const next3 = new URL(target, current.href);
               assertSafePublicHttpUrl(next3);
+              current = next3;
+              advanced = true;
+              if (isProductDetailPageUrl(current.href)) bestPdpUrl = current.href;
             } catch {
-              break;
+              /* ignore */
             }
-            current = next3;
-            continue;
           }
+          if (!advanced) {
+            const canonical = extractCanonicalOrOgUrlFromHtml(slice, current.href);
+            if (canonical && canonical !== current.href) {
+              try {
+                current = new URL(canonical);
+                assertSafePublicHttpUrl(current);
+                advanced = true;
+                if (isProductDetailPageUrl(current.href)) bestPdpUrl = current.href;
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+          if (advanced) continue;
         } catch {
           /* ignore */
         }
@@ -4803,6 +5028,19 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
 
     break;
   }
+
+  if (!bestPdpUrl && isMerchantNonPdpLandingUrl(current.href)) {
+    try {
+      const deepened = await tryDeepenMerchantLandingUrl(current.href, timeoutMs, headers);
+      if (deepened && isProductDetailPageUrl(deepened)) {
+        bestPdpUrl = deepened;
+      }
+    } catch (e) {
+      console.warn('resolveOutboundUrl tryDeepenMerchantLandingUrl:', e.message || e);
+    }
+  }
+
+  if (bestPdpUrl) return bestPdpUrl;
 
   try {
     return current.href;
