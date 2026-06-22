@@ -2208,6 +2208,7 @@ function isCreatorAffiliatePlatformRedirectHost(host) {
   // Mavely SmartLinks
   if (h === 'mavely.app' || h.endsWith('.mavely.app')) return true;
   if (h === 'mavely.app.link' || h.endsWith('.mavely.app.link')) return true;
+  if (h === 'mavelyinfluencer.com' || h.endsWith('.mavelyinfluencer.com')) return true;
   return false;
 }
 
@@ -3457,6 +3458,42 @@ function replaceInfographicStyleIdForAmazonNanoRefs(styleId, hasReferenceImages)
 /** Storage path prefix for anonymous free-preview reference image mirrors (no auth). */
 const PREVIEW_ANON_STORAGE_USER_ID = 'preview-anonymous';
 
+/** Reuse mirrored ref images across strategic_single fan-out (same URL, many pins). */
+const NANO_REF_HARVEST_CACHE_TTL_MS = Math.max(
+  60_000,
+  parseInt(process.env.URLTOPIN_REF_HARVEST_CACHE_TTL_MS || '600000', 10) || 600000
+);
+const nanoRefHarvestCache = new Map();
+
+function nanoRefHarvestCacheKey(userId, url, manualProduct) {
+  const manualSig =
+    manualProduct?.imageUrls?.length > 0 ? manualProduct.imageUrls.slice(0, 3).join('|') : '';
+  return `${String(userId || '')}::${String(url || '').trim().toLowerCase()}::${manualSig}`;
+}
+
+function getNanoRefHarvestFromCache(key) {
+  const hit = nanoRefHarvestCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    nanoRefHarvestCache.delete(key);
+    return null;
+  }
+  return { images: [...hit.images], source: hit.source };
+}
+
+function setNanoRefHarvestCache(key, images, source) {
+  if (!key || !Array.isArray(images) || images.length === 0) return;
+  nanoRefHarvestCache.set(key, {
+    images: [...images],
+    source: source || null,
+    expiresAt: Date.now() + NANO_REF_HARVEST_CACHE_TTL_MS,
+  });
+  if (nanoRefHarvestCache.size > 200) {
+    const oldest = nanoRefHarvestCache.keys().next().value;
+    if (oldest) nanoRefHarvestCache.delete(oldest);
+  }
+}
+
 function appendNanoBananaReferencePromptSuffix(imagePrompt, referenceSource) {
   if (!imagePrompt || !referenceSource) return imagePrompt;
   if (referenceSource === 'amazon_product') {
@@ -3504,11 +3541,20 @@ async function harvestNanoBananaReferenceImagesForUrlToPin({
   workingUrl,
   base,
   usePageReferenceImages = true,
+  manualProduct = null,
 }) {
   const result = { images: [], source: null };
   if (!userId || process.env.USE_DUMMY_IMAGES === 'true') return result;
 
   const amazonCtxUrl = pickAmazonContextUrl(workingUrl, base?.canonicalUrl);
+  const refCacheKey = nanoRefHarvestCacheKey(userId, amazonCtxUrl || workingUrl, manualProduct);
+  const cached = getNanoRefHarvestFromCache(refCacheKey);
+  if (cached) {
+    console.log(
+      `urltopin: Nano Banana reference images (cached): ${cached.images.length} (${String(amazonCtxUrl || workingUrl).slice(0, 96)})`
+    );
+    return { images: cached.images, source: cached.source };
+  }
   const walmartCtxUrl = pickWalmartContextUrl(workingUrl, base?.canonicalUrl);
   const refHtmlUrl = amazonCtxUrl || workingUrl;
   const amazonRapid = base?.amazon_rapidapi_data || null;
@@ -3603,6 +3649,9 @@ async function harvestNanoBananaReferenceImagesForUrlToPin({
     }
   }
 
+  if (result.images.length > 0) {
+    setNanoRefHarvestCache(refCacheKey, result.images, result.source);
+  }
   return result;
 }
 
@@ -4770,13 +4819,17 @@ async function resolveOutboundUrlForUrlToPin(rawUrlString) {
 async function fetchArticleHtml(url) {
   let hostIsAmazon = false;
   let hostIsWalmart = false;
+  let skipPuppeteerFallback = false;
   try {
     const u = new URL(String(url || '').trim());
     hostIsAmazon = isAmazonRelatedHost(u.hostname);
     hostIsWalmart = isWalmartRelatedHost(u.hostname);
+    skipPuppeteerFallback =
+      isAffiliateTrackingRedirectHost(u.hostname) || isCreatorAffiliatePlatformRedirectHost(u.hostname);
   } catch {
     hostIsAmazon = false;
     hostIsWalmart = false;
+    skipPuppeteerFallback = false;
   }
 
   try {
@@ -4796,7 +4849,10 @@ async function fetchArticleHtml(url) {
     if (hostIsAmazon || hostIsWalmart) {
       return '';
     }
-    if (status === 403 || status === 401 || status === 503 || status === 429) {
+    if (
+      !skipPuppeteerFallback &&
+      (status === 403 || status === 401 || status === 503 || status === 429)
+    ) {
       const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
       if (puppetHtml) return puppetHtml;
     }
@@ -4804,6 +4860,9 @@ async function fetchArticleHtml(url) {
   } catch (e) {
     console.warn('fetchArticleHtml error:', e.message || e);
     if (hostIsAmazon || hostIsWalmart) {
+      return '';
+    }
+    if (skipPuppeteerFallback) {
       return '';
     }
     const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
@@ -6334,7 +6393,42 @@ function isNanoBananaStateInProgress(stateNorm) {
   return NANO_BANANA_IN_PROGRESS_STATES.has(stateNorm);
 }
 
+const NANO_BANANA_MAX_CONCURRENT = Math.max(
+  1,
+  parseInt(process.env.NANO_BANANA_MAX_CONCURRENT || '3', 10) || 3
+);
+let nanoBananaSlotsInUse = 0;
+const nanoBananaSlotWaiters = [];
+
+function acquireNanoBananaSlot() {
+  if (nanoBananaSlotsInUse < NANO_BANANA_MAX_CONCURRENT) {
+    nanoBananaSlotsInUse += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    nanoBananaSlotWaiters.push(() => {
+      nanoBananaSlotsInUse += 1;
+      resolve();
+    });
+  });
+}
+
+function releaseNanoBananaSlot() {
+  nanoBananaSlotsInUse = Math.max(0, nanoBananaSlotsInUse - 1);
+  const next = nanoBananaSlotWaiters.shift();
+  if (next) next();
+}
+
 async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) {
+  await acquireNanoBananaSlot();
+  try {
+    return await generateImageWithNanoBananaInner(prompt, logLabel, options);
+  } finally {
+    releaseNanoBananaSlot();
+  }
+}
+
+async function generateImageWithNanoBananaInner(prompt, logLabel = '', options = {}) {
   if (!NANO_BANANA_API_URL || !NANO_BANANA_API_KEY) {
     console.warn('Nano Banana 2 API not configured (NANO_BANANA_API_URL / NANO_BANANA_API_KEY missing)');
     return null;
@@ -8514,7 +8608,22 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     let nanoBananaReferenceInputs = [];
     let nanoBananaReferenceSource = null;
     const refHtmlUrl = amazonCtxUrl || effectiveUrl;
+    const refHarvestCacheKey = nanoRefHarvestCacheKey(
+      req.user.id,
+      amazonCtxUrl || effectiveUrl,
+      manualProduct
+    );
     if (!metadataOnly && !useTextBased && !useUserComposite) {
+      const cachedRefs = getNanoRefHarvestFromCache(refHarvestCacheKey);
+      if (cachedRefs) {
+        nanoBananaReferenceInputs = cachedRefs.images;
+        nanoBananaReferenceSource = cachedRefs.source;
+        console.log(
+          `urltopin: Nano Banana reference images (cached): ${cachedRefs.images.length} (${String(refHtmlUrl).slice(0, 96)})`
+        );
+      }
+    }
+    if (!metadataOnly && !useTextBased && !useUserComposite && nanoBananaReferenceInputs.length === 0) {
       // Etsy: prefer RapidAPI listing images for Nano Banana; fallback to oEmbed thumbnail.
       const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
       if (rapidEtsyUrls.length > 0) {
@@ -8686,6 +8795,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     }
 
     if (nanoBananaReferenceInputs.length > 0) {
+      setNanoRefHarvestCache(refHarvestCacheKey, nanoBananaReferenceInputs, nanoBananaReferenceSource);
       const remapped = remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, req._strategicPlan || null);
       effectiveStyles = remapped.styles;
       if (remapped.plan) req._strategicPlan = remapped.plan;
