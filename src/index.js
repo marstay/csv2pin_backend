@@ -8059,7 +8059,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
       consumedGlobal = true;
     }
 
-    const { url, articleData, outputLanguage: rawOutputLanguage } = req.body || {};
+    const { url, articleData, outputLanguage: rawOutputLanguage, brand } = req.body || {};
     const rawUrl = String(url || '').trim();
     if (!rawUrl) {
       if (consumedGlobal) refundGlobalFreePreview();
@@ -8073,6 +8073,16 @@ app.post('/api/urltopin/preview', async (req, res) => {
       if (expanded) workingUrl = expanded;
     } catch {
       /* ignore */
+    }
+
+    const brandingGate = assessUrlBrandingGate(workingUrl);
+    const brandName = String(brand?.brandName || '').trim() || null;
+    if (brandingGate.requiresManualBrandOrCta && !brandName) {
+      if (consumedGlobal) refundGlobalFreePreview();
+      return res.status(400).json({
+        error: 'branding_required',
+        ...brandingGate,
+      });
     }
 
     // 3. Scrape (same pipeline as /scrape and /generate).
@@ -8136,10 +8146,11 @@ app.post('/api/urltopin/preview', async (req, res) => {
 
     const topic = contentProfile?.topic || base.title || keyword || 'this topic';
     const domain = base.domain || '';
+    const pinFooterSourceLine = brandName || domain;
     const overlayText = {
       headline: meta.overlay_headline || topic,
       subheadline: meta.overlay_subheadline || '',
-      source: domain,
+      source: pinFooterSourceLine,
     };
 
     // 6. Build the image prompt and generate ONE image (product refs when available).
@@ -8150,7 +8161,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
       keyword,
       year: new Date().getFullYear(),
       overlayText,
-      brand: null,
+      brand: brandName ? { brandName } : null,
       stepCount: meta.step_count ?? null,
       niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
     });
