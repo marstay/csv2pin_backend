@@ -19,6 +19,7 @@ import {
   rankPins,
   getStrategyReason,
   PIN_COPY_ANTI_CLICHE_INSTRUCTION,
+  usesProductAffiliatePinMix,
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
@@ -2682,6 +2683,66 @@ function mergeBrandingGates(...gates) {
 }
 
 /**
+ * Product / affiliate landing URLs: Amazon, Walmart, ShopMy/Mavely, Benable.
+ * Drives amazon_affiliate pin strategy mix (list/value/lifestyle — not curiosity-heavy infographics).
+ * @param {...string} urlStrings raw input, resolved working URL, canonical, etc.
+ * @returns {{ amazonLanding: boolean, walmartLanding: boolean, creatorAffiliateLanding: boolean, etsyLanding: boolean }}
+ */
+function detectProductAffiliateLandingFromUrls(...urlStrings) {
+  const out = {
+    amazonLanding: false,
+    walmartLanding: false,
+    creatorAffiliateLanding: false,
+    etsyLanding: false,
+  };
+  for (const raw of urlStrings) {
+    const s = String(raw || '').trim();
+    if (!s) continue;
+    try {
+      const u = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`);
+      const h = u.hostname;
+      if (isAmazonRelatedHost(h)) out.amazonLanding = true;
+      else if (isWalmartRelatedHost(h)) out.walmartLanding = true;
+      else if (isCreatorAffiliatePlatformRedirectHost(h) || isBenableHost(h)) {
+        out.creatorAffiliateLanding = true;
+      } else if (isEtsyHost(h)) {
+        out.etsyLanding = true;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return out;
+}
+
+/** Merge landing flags from base scrape or detectProductAffiliateLandingFromUrls into content profile. */
+function mergeProductAffiliateLandingIntoProfile(profile, landingSource) {
+  if (!profile || typeof profile !== 'object') profile = {};
+  const landing =
+    landingSource && typeof landingSource === 'object'
+      ? {
+          amazonLanding: !!landingSource.amazonLanding,
+          walmartLanding: !!landingSource.walmartLanding,
+          creatorAffiliateLanding: !!landingSource.creatorAffiliateLanding,
+          etsyLanding: !!landingSource.etsyLanding,
+        }
+      : {
+          amazonLanding: false,
+          walmartLanding: false,
+          creatorAffiliateLanding: false,
+          etsyLanding: false,
+        };
+  return {
+    ...profile,
+    amazonLanding: profile.amazonLanding === true || landing.amazonLanding,
+    walmartLanding: profile.walmartLanding === true || landing.walmartLanding,
+    creatorAffiliateLanding:
+      profile.creatorAffiliateLanding === true || landing.creatorAffiliateLanding,
+    etsyLanding: profile.etsyLanding === true || landing.etsyLanding,
+  };
+}
+
+/**
  * Short links, Amazon store/product/affiliate URLs: pin footer should be the user's brand/CTA, not the raw URL host.
  * @returns {{ requiresManualBrandOrCta: boolean, brandingGateReason: string|null, brandingGateMessage: string|null }}
  */
@@ -2736,15 +2797,11 @@ function assessUrlBrandingGate(urlString) {
     }
 
     if (isEtsyHost(host)) {
-      // Etsy shop/product pages should not show Etsy as the footer; require creator brand/CTA.
-      const isShop = /^\/shop\/[^/]+/i.test(path);
-      const isListing = /^\/listing\/\d+/i.test(path);
-      const reason = isShop || isListing ? 'marketplace' : 'marketplace';
       return {
         requiresManualBrandOrCta: true,
-        brandingGateReason: reason,
+        brandingGateReason: 'marketplace',
         brandingGateMessage:
-          'This looks like an Etsy shop/product link. Pins should show your brand or CTA in the footer, not Etsy. Before generating, open Pin look & brand and add your brand name or CTA.',
+          'This looks like an Etsy shop or listing link. Pins should show your shop or brand in the footer, not “Etsy.” Enter your brand name or CTA in Pin footer (required) below (e.g. your shop name).',
       };
     }
 
@@ -4847,6 +4904,8 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     const rs = buildAmazonRapidApiSummary(amazonRapidEarly);
     if (rs) articleSummary = rs.slice(0, 1200);
   }
+
+  Object.assign(base, detectProductAffiliateLandingFromUrls(rawInputUrl, workingUrl, base.canonicalUrl));
 
   return { base, articleSummary };
 }
@@ -7661,6 +7720,10 @@ app.post('/api/urltopin/scrape', async (req, res) => {
       brandingGateReason: base.brandingGateReason ?? null,
       brandingGateMessage: base.brandingGateMessage ?? null,
     };
+    if (base.amazonLanding) meta.amazonLanding = true;
+    if (base.walmartLanding) meta.walmartLanding = true;
+    if (base.creatorAffiliateLanding) meta.creatorAffiliateLanding = true;
+    if (base.etsyLanding) meta.etsyLanding = true;
     if (articleSummary && String(articleSummary).trim().length > 0) {
       meta.articleSummary = articleSummary;
     }
@@ -7829,17 +7892,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
 
     // 4. Enrich + plan exactly ONE strategy.
     let contentProfile = await enrichContentProfile(base, openai);
-    try {
-      const abs = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
-      const ctxHost = new URL(abs).hostname;
-      if (isAmazonRelatedHost(ctxHost)) {
-        contentProfile = { ...contentProfile, amazonLanding: true };
-      } else if (isWalmartRelatedHost(ctxHost)) {
-        contentProfile = { ...contentProfile, walmartLanding: true };
-      }
-    } catch {
-      /* ignore invalid url */
-    }
+    contentProfile = mergeProductAffiliateLandingIntoProfile(contentProfile, base);
     const plan = planStrategies(contentProfile, 1);
     const p = plan && plan[0];
     if (!p) {
@@ -7886,10 +7939,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
       overlayText,
       brand: null,
       stepCount: meta.step_count ?? null,
-      niche:
-        contentProfile?.amazonLanding === true || contentProfile?.walmartLanding === true
-          ? 'amazon_affiliate'
-          : contentProfile?.niche || null,
+      niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
     });
     imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, rawUrl);
 
@@ -7985,18 +8035,7 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
       base.amazon_blocked = false;
     }
     let contentProfile = await enrichContentProfile(base, openai, winnerContext);
-    try {
-      const rawU = String(url || '').trim();
-      const abs = /^https?:\/\//i.test(rawU) ? rawU : `https://${rawU}`;
-      const ctxHost = new URL(abs).hostname;
-      if (isAmazonRelatedHost(ctxHost)) {
-        contentProfile = { ...contentProfile, amazonLanding: true };
-      } else if (isWalmartRelatedHost(ctxHost)) {
-        contentProfile = { ...contentProfile, walmartLanding: true };
-      }
-    } catch {
-      /* ignore invalid url */
-    }
+    contentProfile = mergeProductAffiliateLandingIntoProfile(contentProfile, base);
     const plan = planStrategies(contentProfile, count, winnerContext);
     const strategyCounts = {};
     plan.forEach((p) => { strategyCounts[p.strategy] = (strategyCounts[p.strategy] || 0) + 1; });
@@ -8089,17 +8128,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       });
       const { base } = fetched;
       let contentProfile = await enrichContentProfile(base, openai, winnerContext);
-      try {
-        const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
-        const ctxHost = new URL(abs).hostname;
-        if (isAmazonRelatedHost(ctxHost)) {
-          contentProfile = { ...contentProfile, amazonLanding: true };
-        } else if (isWalmartRelatedHost(ctxHost)) {
-          contentProfile = { ...contentProfile, walmartLanding: true };
-        }
-      } catch {
-        /* ignore */
-      }
+      contentProfile = mergeProductAffiliateLandingIntoProfile(contentProfile, base);
       const plan = planStrategies(contentProfile, Math.min(count || 10, 10), winnerContext);
       effectiveStyles = plan.map((p) => p.layoutId);
       req._strategicPlan = plan;
@@ -8496,10 +8525,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     const contentProfile = req._contentProfile || null;
     const niche = contentProfile?.niche || null;
-    const nicheForVisualHints =
-      contentProfile?.amazonLanding === true || contentProfile?.walmartLanding === true
-        ? 'amazon_affiliate'
-        : niche;
+    const nicheForVisualHints = usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : niche;
     const stylePrompts = [];
     let strategicMetadataByIndex = [];
     let keyIdeas = [];
@@ -8731,10 +8757,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         overlayText: overlayTextForPrompt,
         brand: brandForPrompt,
         stepCount: meta.step_count ?? null,
-        niche:
-          contentProfile?.amazonLanding === true || contentProfile?.walmartLanding === true
-            ? 'amazon_affiliate'
-            : contentProfile?.niche || null,
+        niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
       });
       if (useTextBased) {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
@@ -9554,14 +9577,9 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     );
 
     let regenNicheHint = null;
-    try {
-      const abs = /^https?:\/\//i.test(effectiveUrl) ? effectiveUrl : `https://${effectiveUrl}`;
-      const ctxHost = new URL(abs).hostname;
-      if (isAmazonRelatedHost(ctxHost) || isWalmartRelatedHost(ctxHost)) {
-        regenNicheHint = 'amazon_affiliate';
-      }
-    } catch {
-      /* ignore */
+    const regenLanding = detectProductAffiliateLandingFromUrls(rawUrl, effectiveUrl, base?.canonicalUrl);
+    if (usesProductAffiliatePinMix(regenLanding)) {
+      regenNicheHint = 'amazon_affiliate';
     }
 
     let imagePrompt = buildOverlayImagePrompt({

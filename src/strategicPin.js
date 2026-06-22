@@ -267,11 +267,19 @@ const CLONE_WINNER_MIX = {
  * @param {Object} contentProfile - from enrichContentProfile
  * @returns {Object} strategy mix { curiosity_hook: n, list_value: n, ... }
  */
+function usesProductAffiliatePinMix(contentProfile) {
+  return !!(
+    contentProfile?.amazonLanding === true ||
+    contentProfile?.walmartLanding === true ||
+    contentProfile?.creatorAffiliateLanding === true ||
+    contentProfile?.etsyLanding === true
+  );
+}
+
 function getWeightedMix(contentProfile) {
-  const base =
-    contentProfile?.amazonLanding === true
-      ? NICHE_MIXES.amazon_affiliate
-      : NICHE_MIXES[contentProfile.niche] || NICHE_MIXES.default;
+  const base = usesProductAffiliatePinMix(contentProfile)
+    ? NICHE_MIXES.amazon_affiliate
+    : NICHE_MIXES[contentProfile.niche] || NICHE_MIXES.default;
   const mix = { ...base };
   const ct = contentProfile.content_type || 'informational';
   const emotional = contentProfile.emotional_intensity || 'medium';
@@ -355,10 +363,9 @@ function layoutsForStrategy(strategy, cloneMode = false) {
  * Strategy mix for clone-winner flow: no list_value; boost hooks that match the winner.
  */
 function getCloneWinnerMix(contentProfile, winnerContext) {
-  const base =
-    contentProfile?.amazonLanding === true
-      ? { ...CLONE_WINNER_MIX.amazon }
-      : { ...CLONE_WINNER_MIX.default };
+  const base = usesProductAffiliatePinMix(contentProfile)
+    ? { ...CLONE_WINNER_MIX.amazon }
+    : { ...CLONE_WINNER_MIX.default };
   const mix = { ...base };
   const wc = normalizeWinnerContext(winnerContext);
   if (!wc) return mix;
@@ -965,6 +972,7 @@ export {
   extractArticleKeyIdeas,
   pickAngle,
   getHookType,
+  usesProductAffiliatePinMix,
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
   NICHE_MIXES,
