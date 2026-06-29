@@ -26,6 +26,20 @@ import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
 import { analyzeWinningProduct, normalizeAmazonProduct } from './winningProductFinder.js';
 import {
+  createAffiliateProductPage,
+  generateAffiliateProductPageContent,
+  getAffiliateProductPageBySlug,
+  getAffiliateProductPageStats,
+  incrementAffiliateProductPageViews,
+  incrementAffiliateProductPageOutboundClicks,
+  deleteAffiliateProductPage,
+  listAffiliateProductPagesByUserId,
+  updateAffiliateProductPageByUser,
+  claimAffiliateProductPage,
+  sanitizeAffiliateProductPageForPublic,
+  tryResolveUrlToPinHostedProductPage,
+} from './affiliateProductPages.js';
+import {
   sendPaymentFailedEmail,
   sendUpgradeNudgeEmail,
   nextPlanFor,
@@ -3643,7 +3657,31 @@ async function harvestNanoBananaReferenceImagesForUrlToPin({
   const result = { images: [], source: null };
   if (!userId || process.env.USE_DUMMY_IMAGES === 'true') return result;
 
-  const amazonCtxUrl = pickAmazonContextUrl(workingUrl, base?.canonicalUrl);
+  const hostedImages = Array.isArray(base?.affiliateHostedProductPageImageUrls)
+    ? base.affiliateHostedProductPageImageUrls.filter(Boolean)
+    : [];
+  if (hostedImages.length > 0) {
+    const refCacheKey = nanoRefHarvestCacheKey(userId, workingUrl, manualProduct);
+    try {
+      const underlying = String(base?.underlyingProductUrl || '').trim();
+      if (underlying && isAmazonProductPageForNanoReference(underlying)) {
+        result.images = await mirrorAmazonImageUrlsForNanoBanana(hostedImages.slice(0, 3), userId);
+        if (result.images.length > 0) result.source = 'amazon_product';
+      } else {
+        result.images = await mirrorGenericPageImageUrlsForNanoBanana(hostedImages.slice(0, 3), userId);
+        if (result.images.length > 0) result.source = 'page';
+      }
+      if (result.images.length > 0) {
+        setNanoRefHarvestCache(refCacheKey, result.images, result.source);
+        return result;
+      }
+    } catch (e) {
+      console.warn('harvestNanoBananaReferenceImagesForUrlToPin hosted page:', e.message || e);
+    }
+  }
+
+  const productRefUrl = String(base?.underlyingProductUrl || workingUrl || '').trim();
+  const amazonCtxUrl = pickAmazonContextUrl(productRefUrl, base?.canonicalUrl);
   const refCacheKey = nanoRefHarvestCacheKey(userId, amazonCtxUrl || workingUrl, manualProduct);
   const cached = getNanoRefHarvestFromCache(refCacheKey);
   if (cached) {
@@ -3652,8 +3690,8 @@ async function harvestNanoBananaReferenceImagesForUrlToPin({
     );
     return { images: cached.images, source: cached.source };
   }
-  const walmartCtxUrl = pickWalmartContextUrl(workingUrl, base?.canonicalUrl);
-  const refHtmlUrl = amazonCtxUrl || workingUrl;
+  const walmartCtxUrl = pickWalmartContextUrl(productRefUrl, base?.canonicalUrl);
+  const refHtmlUrl = amazonCtxUrl || productRefUrl || workingUrl;
   const amazonRapid = base?.amazon_rapidapi_data || null;
   let walmartRapid = base?.walmart_rapidapi_data || null;
 
@@ -5471,6 +5509,26 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
       console.warn('fetchArticleBaseAndSummary resolveOutboundUrl error:', e.message || e);
     }
   }
+
+  // Hosted affiliate product pages are client-rendered — load product copy from our store, not HTML scrape.
+  for (const candidate of [workingUrl, String(url || '').trim()]) {
+    if (!candidate) continue;
+    const hosted = await tryResolveUrlToPinHostedProductPage(candidate);
+    if (hosted) {
+      const rawInputUrl = String(url || '').trim();
+      Object.assign(
+        hosted.base,
+        detectProductAffiliateLandingFromUrls(hosted.base.underlyingProductUrl, candidate)
+      );
+      Object.assign(
+        hosted.base,
+        mergeBrandingGates(assessUrlBrandingGate(rawInputUrl), assessUrlBrandingGate(hosted.base.underlyingProductUrl))
+      );
+      hosted.base.pinDestinationUrl = rawInputUrl || candidate;
+      return hosted;
+    }
+  }
+
   const hasClientMeta =
     clientArticleData &&
     typeof clientArticleData === 'object' &&
@@ -8503,6 +8561,8 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (base.walmartLanding) meta.walmartLanding = true;
     if (base.creatorAffiliateLanding) meta.creatorAffiliateLanding = true;
     if (base.etsyLanding) meta.etsyLanding = true;
+    if (base.affiliateHostedProductPage) meta.affiliateHostedProductPage = true;
+    if (base.underlyingProductUrl) meta.underlyingProductUrl = base.underlyingProductUrl;
     if (base.affiliateHopScrapeFallback) meta.affiliateHopScrapeFallback = true;
     if (articleSummary && String(articleSummary).trim().length > 0) {
       meta.articleSummary = articleSummary;
@@ -8997,8 +9057,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const base = fetchedBase.base;
     let articleSummary = fetchedBase.articleSummary;
 
+    const productContextUrl = base?.underlyingProductUrl || effectiveUrl;
+
     // Amazon: if scraping is blocked, try paid product-data API BEFORE spending quota / Nano Banana.
-    const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base.canonicalUrl);
+    const amazonCtxUrl = pickAmazonContextUrl(productContextUrl, base.canonicalUrl);
     let amazonRapid = base.amazon_rapidapi_data || null;
     if (base?.amazon_blocked && isAmazonProductPageForNanoReference(amazonCtxUrl)) {
       const asin = extractAmazonAsinFromUrl(amazonCtxUrl);
@@ -9053,7 +9115,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     // Walmart: blocks bots aggressively, so when scraping returns a bot/empty title,
     // recover the product title/description (and reuse images) from RapidAPI before spending quota.
-    const walmartCtxUrl = pickWalmartContextUrl(effectiveUrl, base.canonicalUrl);
+    const walmartCtxUrl = pickWalmartContextUrl(productContextUrl, base.canonicalUrl);
     let walmartRapid = base.walmart_rapidapi_data || null;
     if (
       isWalmartProductPageForNanoReference(walmartCtxUrl) &&
@@ -10670,6 +10732,21 @@ async function requireUser(req, res, next) {
   next();
 }
 
+async function attachOptionalUser(req, res, next) {
+  req.user = null;
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return next();
+  const token = authHeader.split(' ')[1];
+  if (!token) return next();
+  try {
+    const { data: { user }, error } = await supabaseAuthGetUser(token);
+    if (!error && user) req.user = user;
+  } catch {
+    /* ignore optional auth failures */
+  }
+  next();
+}
+
 // List templates for current user
 app.get('/api/custom-templates', requireUser, async (req, res) => {
   try {
@@ -11033,6 +11110,312 @@ app.post('/api/tools/pin-worth-checker', async (req, res) => {
   } catch (err) {
     console.error('pin-worth-checker tool error:', err);
     return res.status(err.status || 500).json({ error: err.message || 'Analysis failed.' });
+  }
+});
+
+function uniqAffiliateProductImageUrls(urls, max = 6) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of urls) {
+    const u = String(raw || '').trim();
+    if (!u || seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function mapAmazonRapidApiImageUrls(amazonRapid) {
+  if (!amazonRapid || !Array.isArray(amazonRapid.images)) return [];
+  return amazonRapid.images
+    .map((im) =>
+      im && typeof im === 'object' ? String(im.hi_res || im.large || im.image || '').trim() : String(im || '').trim()
+    )
+    .filter(Boolean);
+}
+
+/** Collect merchant product photos for affiliate bridge pages (direct CDN URLs, no Supabase mirror). */
+async function collectAffiliateProductPageImageUrls(base, productUrl) {
+  const url = String(productUrl || '').trim();
+  const candidates = [];
+
+  const amazonRapid = base?.amazon_rapidapi_data;
+  if (amazonRapid) candidates.push(...mapAmazonRapidApiImageUrls(amazonRapid));
+
+  const walmartRapid = base?.walmart_rapidapi_data;
+  if (walmartRapid && Array.isArray(walmartRapid.images)) {
+    candidates.push(...walmartRapid.images.map((u) => String(u || '').trim()).filter(Boolean));
+  }
+
+  if (Array.isArray(base?.etsy_rapidapi_image_urls)) {
+    candidates.push(...base.etsy_rapidapi_image_urls);
+  }
+  if (base?.etsy_oembed_thumbnail) {
+    candidates.push(String(base.etsy_oembed_thumbnail).trim());
+  }
+
+  if (candidates.length === 0 && url) {
+    try {
+      const html = await fetchArticleHtml(url);
+      if (base?.amazonLanding || isAmazonProductPageForNanoReference(url)) {
+        let amazonUrls = extractAmazonProductImageUrlsFromHtml(html, url);
+        if (amazonUrls.length === 0 || detectAmazonBotOrConsentPage(html)) {
+          const widgetImg = await fetchAmazonAsinWidgetImageUrl(url);
+          if (widgetImg) amazonUrls = [widgetImg];
+        }
+        candidates.push(...amazonUrls);
+      } else if (base?.walmartLanding || isWalmartProductPageForNanoReference(url)) {
+        candidates.push(...extractWalmartProductImageUrlsFromHtml(html, url));
+      } else {
+        candidates.push(...extractGenericPageImageUrlsFromHtml(html, url));
+      }
+    } catch {
+      /* optional */
+    }
+  }
+
+  return uniqAffiliateProductImageUrls(candidates, 6);
+}
+
+function shouldStoreAffiliateBuyUrl(buyUrl, resolvedProductUrl) {
+  const buy = String(buyUrl || '').trim();
+  const resolved = String(resolvedProductUrl || '').trim();
+  if (!buy) return false;
+  try {
+    const u = new URL(/^https?:\/\//i.test(buy) ? buy : `https://${buy}`);
+    if (/[?&]tag=/i.test(u.search)) return true;
+    const h = normalizeUrlHostname(u.hostname);
+    if (
+      isLikelyUrlShortenerHost(h) ||
+      isAffiliateTrackingRedirectHost(h) ||
+      isCreatorAffiliatePlatformRedirectHost(h)
+    ) {
+      return true;
+    }
+    if (!resolved) return true;
+    return u.href.replace(/\/$/, '') !== resolved.replace(/\/$/, '');
+  } catch {
+    return buy !== resolved;
+  }
+}
+
+app.post('/api/tools/affiliate-product-page/generate', attachOptionalUser, async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'affiliate-product-page', { windowMs: 60 * 60_000, max: 8 })) {
+      return res.status(429).json({ error: 'Too many pages generated. Please wait an hour and try again.' });
+    }
+    const rawUrl = String(req.body?.url || req.body?.productUrl || req.body?.affiliateUrl || '').trim();
+    if (!rawUrl) {
+      return res.status(400).json({ error: 'Paste a product or affiliate URL (Amazon, Etsy, Shopify, Walmart, etc.).' });
+    }
+
+    let buyUrl = rawUrl;
+    try {
+      const u = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+      buyUrl = u.toString();
+    } catch {
+      return res.status(400).json({ error: 'That does not look like a valid URL.' });
+    }
+
+    let effectiveUrl = buyUrl;
+    try {
+      const expanded = await resolveOutboundUrlForUrlToPin(buyUrl);
+      if (expanded) effectiveUrl = expanded;
+    } catch {
+      /* keep raw */
+    }
+
+    const { base, articleSummary } = await fetchArticleBaseAndSummary(buyUrl, null, {
+      preResolvedUrl: effectiveUrl,
+    });
+    if (!hasUrlToPinScrapeContent(base)) {
+      return res.status(502).json({
+        error:
+          'We could not read this product page. Try a direct Amazon, Etsy, Shopify, or Walmart product link.',
+      });
+    }
+
+    const imageUrls = await collectAffiliateProductPageImageUrls(base, effectiveUrl);
+    const imageUrl = imageUrls[0] || '';
+    const storeAffiliateBuyUrl = shouldStoreAffiliateBuyUrl(buyUrl, effectiveUrl);
+
+    const merchantFlags = {
+      amazonLanding: !!base.amazonLanding,
+      etsyLanding: !!base.etsyLanding,
+      walmartLanding: !!base.walmartLanding,
+    };
+    const merchant = base.amazonLanding
+      ? 'amazon'
+      : base.etsyLanding
+        ? 'etsy'
+        : base.walmartLanding
+          ? 'walmart'
+          : /shopify/i.test(String(base.domain || ''))
+            ? 'shopify'
+            : 'other';
+
+    const aiContent = await generateAffiliateProductPageContent(openai, {
+      title: base.title,
+      description: base.description,
+      domain: base.domain,
+      articleSummary,
+      merchant,
+    });
+    aiContent.imageUrls = imageUrls;
+    aiContent.imageUrl = imageUrl;
+
+    const page = await createAffiliateProductPage({
+      productUrl: effectiveUrl,
+      affiliateUrl: storeAffiliateBuyUrl ? buyUrl : null,
+      scrapeMeta: {
+        title: base.title,
+        description: base.description,
+        domain: base.domain,
+        imageUrl,
+        imageUrls,
+        ...merchantFlags,
+      },
+      aiContent,
+      userId: req.user?.id || null,
+    });
+    const origin = String(process.env.PUBLIC_APP_ORIGIN || 'https://url2pin.com').replace(/\/$/, '');
+    return res.json({
+      ok: true,
+      slug: page.slug,
+      pageUrl: `${origin}/page/${page.slug}`,
+      page,
+    });
+  } catch (err) {
+    console.error('affiliate-product-page generate error:', err);
+    return res.status(500).json({ error: err.message || 'Could not generate product page.' });
+  }
+});
+
+app.get('/api/tools/affiliate-product-page/:slug', async (req, res) => {
+  try {
+    const slug = String(req.params?.slug || '').trim().toLowerCase();
+    if (!slug || slug === '_') return res.status(400).json({ error: 'Missing page slug.' });
+    let page = await getAffiliateProductPageBySlug(slug);
+    if (!page) return res.status(404).json({ error: 'Product page not found.' });
+    page = await incrementAffiliateProductPageViews(slug);
+    return res.json({ ok: true, page: sanitizeAffiliateProductPageForPublic(page) });
+  } catch (err) {
+    console.error('affiliate-product-page fetch error:', err);
+    return res.status(500).json({ error: err.message || 'Could not load product page.' });
+  }
+});
+
+app.post('/api/tools/affiliate-product-page/:slug/outbound-click', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'affiliate-product-page-click', { windowMs: 60_000, max: 30 })) {
+      return res.status(429).json({ error: 'Too many requests.' });
+    }
+    const slug = String(req.params?.slug || '').trim().toLowerCase();
+    if (!slug || slug === '_') return res.status(400).json({ error: 'Missing page slug.' });
+    const page = await incrementAffiliateProductPageOutboundClicks(slug);
+    if (!page) return res.status(404).json({ error: 'Product page not found.' });
+    return res.json({ ok: true, outboundClicks: Number(page.outboundClicks) || 0 });
+  } catch (err) {
+    console.error('affiliate-product-page outbound-click error:', err);
+    return res.status(500).json({ error: err.message || 'Could not record click.' });
+  }
+});
+
+app.post('/api/tools/affiliate-product-page/:slug/stats', async (req, res) => {
+  try {
+    const slug = String(req.params?.slug || '').trim().toLowerCase();
+    const manageToken = String(req.body?.manageToken || '').trim();
+    if (!slug || !manageToken) return res.status(400).json({ error: 'Missing slug or manage token.' });
+    const stats = await getAffiliateProductPageStats(slug, manageToken);
+    if (!stats) return res.status(403).json({ error: 'Invalid manage token or page not found.' });
+    return res.json({ ok: true, stats });
+  } catch (err) {
+    console.error('affiliate-product-page stats error:', err);
+    return res.status(500).json({ error: err.message || 'Could not load stats.' });
+  }
+});
+
+app.delete('/api/tools/affiliate-product-page/:slug', async (req, res) => {
+  try {
+    const slug = String(req.params?.slug || '').trim().toLowerCase();
+    const manageToken = String(req.body?.manageToken || '').trim();
+    if (!slug || !manageToken) return res.status(400).json({ error: 'Missing slug or manage token.' });
+    const deleted = await deleteAffiliateProductPage(slug, { manageToken });
+    if (!deleted) return res.status(403).json({ error: 'Invalid manage token or page not found.' });
+    return res.json({ ok: true, deleted: true });
+  } catch (err) {
+    console.error('affiliate-product-page delete error:', err);
+    return res.status(500).json({ error: err.message || 'Could not delete page.' });
+  }
+});
+
+app.get('/api/account/affiliate-product-pages', requireUser, async (req, res) => {
+  try {
+    const pages = await listAffiliateProductPagesByUserId(req.user.id);
+    const origin = String(process.env.PUBLIC_APP_ORIGIN || 'https://url2pin.com').replace(/\/$/, '');
+    return res.json({
+      ok: true,
+      pages: pages.map((p) => ({
+        ...p,
+        pageUrl: `${origin}/page/${p.slug}`,
+      })),
+    });
+  } catch (err) {
+    console.error('account affiliate-product-pages list error:', err);
+    return res.status(500).json({ error: err.message || 'Could not load product pages.' });
+  }
+});
+
+app.patch('/api/account/affiliate-product-pages/:slug', requireUser, async (req, res) => {
+  try {
+    const slug = String(req.params?.slug || '').trim().toLowerCase();
+    if (!slug || slug === '_') return res.status(400).json({ error: 'Missing page slug.' });
+    const page = await updateAffiliateProductPageByUser(slug, req.user.id, req.body || {});
+    if (!page) return res.status(404).json({ error: 'Product page not found.' });
+    const origin = String(process.env.PUBLIC_APP_ORIGIN || 'https://url2pin.com').replace(/\/$/, '');
+    return res.json({
+      ok: true,
+      page: sanitizeAffiliateProductPageForPublic(page),
+      pageUrl: `${origin}/page/${page.slug}`,
+    });
+  } catch (err) {
+    console.error('account affiliate-product-pages patch error:', err);
+    return res.status(500).json({ error: err.message || 'Could not update product page.' });
+  }
+});
+
+app.delete('/api/account/affiliate-product-pages/:slug', requireUser, async (req, res) => {
+  try {
+    const slug = String(req.params?.slug || '').trim().toLowerCase();
+    if (!slug || slug === '_') return res.status(400).json({ error: 'Missing page slug.' });
+    const deleted = await deleteAffiliateProductPage(slug, { userId: req.user.id });
+    if (!deleted) return res.status(404).json({ error: 'Product page not found.' });
+    return res.json({ ok: true, deleted: true });
+  } catch (err) {
+    console.error('account affiliate-product-pages delete error:', err);
+    return res.status(500).json({ error: err.message || 'Could not delete page.' });
+  }
+});
+
+app.post('/api/account/affiliate-product-pages/claim', requireUser, async (req, res) => {
+  try {
+    const slug = String(req.body?.slug || '').trim().toLowerCase();
+    const manageToken = String(req.body?.manageToken || '').trim();
+    if (!slug || !manageToken) {
+      return res.status(400).json({ error: 'Missing slug or manage token.' });
+    }
+    const page = await claimAffiliateProductPage(slug, manageToken, req.user.id);
+    if (!page) return res.status(403).json({ error: 'Invalid token or page already claimed by another account.' });
+    const origin = String(process.env.PUBLIC_APP_ORIGIN || 'https://url2pin.com').replace(/\/$/, '');
+    return res.json({
+      ok: true,
+      page: sanitizeAffiliateProductPageForPublic(page),
+      pageUrl: `${origin}/page/${page.slug}`,
+    });
+  } catch (err) {
+    console.error('account affiliate-product-pages claim error:', err);
+    return res.status(500).json({ error: err.message || 'Could not claim product page.' });
   }
 });
 
