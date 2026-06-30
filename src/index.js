@@ -454,8 +454,44 @@ function pinUsageResetAtIso(sub, planType) {
 function pinUsageResetPolicy(sub, planType) {
   const pt = String(planType || sub?.plan_type || 'free').trim().toLowerCase();
   if (pt === 'free') return 'lifetime';
-  if (!sub) return 'calendar_month';
+  if (!sub) return 'billing_period';
   return normalizeBillingInterval(sub.billing_interval) === 'year' ? 'calendar_month' : 'billing_period';
+}
+
+function pinLimitAllowanceLabel(kind, limit, policy) {
+  const noun = kind === 'user_photo' ? 'own-photo pins' : 'AI image pins';
+  if (policy === 'lifetime') return `${limit} ${noun} total (lifetime)`;
+  if (policy === 'calendar_month') return `${limit} ${noun} per month`;
+  return `${limit} ${noun} per billing period`;
+}
+
+function pinLimitUsageLabel(policy) {
+  if (policy === 'lifetime') return 'used (lifetime)';
+  if (policy === 'calendar_month') return 'used this month';
+  return 'used this billing period';
+}
+
+function buildPinLimitReachedMessage(usageResult, { kind = 'ai', delta = 1 } = {}) {
+  const policy = usageResult?.pinsResetPolicy || pinUsageResetPolicy(null, usageResult?.planType);
+  if (kind === 'user_photo') {
+    const allowance = pinLimitAllowanceLabel('user_photo', usageResult.planUserPhotoPinsLimit, policy);
+    const usage = pinLimitUsageLabel(policy);
+    const used = usageResult.currentUserPhotoPinsUsed ?? 0;
+    if (delta > 1) {
+      return `Your plan includes ${allowance}. You have ${usage} ${used}, so creating ${delta} more would exceed your limit.`;
+    }
+    return `Your plan includes ${allowance}. You have ${usage} ${used}, so one more would exceed your limit.`;
+  }
+  const allowance = pinLimitAllowanceLabel('ai', usageResult.planPinsLimit, policy);
+  const usage = pinLimitUsageLabel(policy);
+  const used = usageResult.currentUsed ?? 0;
+  if (delta > 1) {
+    return `Your plan includes ${allowance}. You have ${usage} ${used}, so generating ${delta} more would exceed your limit.`;
+  }
+  if (policy === 'lifetime') {
+    return `Your plan includes ${allowance}. You have ${usage} ${used}.`;
+  }
+  return `Your plan includes ${allowance}. You have ${usage} ${used}, so generating one more would exceed your limit.`;
 }
 
 async function fetchPinUsageRow(userId, bucketKey) {
@@ -491,6 +527,7 @@ function effectivePinUsageFromRow(row, baselineAi = 0, baselineUserPhoto = 0) {
 /**
  * One-time lazy migration: copy effective usage from legacy calendar-month bucket into the
  * billing-period bucket so existing subscribers keep their remaining quota after deploy.
+ * If the billing-period row already exists, never re-sync from legacy (prevents re-inflation).
  */
 async function migrateLegacyPinUsageIfNeeded(userId, sub, planType) {
   if (!sub || !userId || String(planType || 'free').trim().toLowerCase() === 'free') return;
@@ -500,29 +537,55 @@ async function migrateLegacyPinUsageIfNeeded(userId, sub, planType) {
 
   const baselineAi = Math.max(0, Number(sub.usage_baseline_pins_used ?? 0) || 0);
   const baselineUserPhoto = Math.max(0, Number(sub.usage_baseline_user_photo_pins_used ?? 0) || 0);
+  const newRow = await fetchPinUsageRow(userId, newBucket);
+  const needsBaselineReset = baselineAi > 0 || baselineUserPhoto > 0;
+
+  if (newRow) {
+    if (!needsBaselineReset) return;
+    const usageNowIso = new Date().toISOString();
+    await supabaseAdmin
+      .from('billing_subscriptions')
+      .update({
+        usage_baseline_pins_used: 0,
+        usage_baseline_user_photo_pins_used: 0,
+        updated_at: usageNowIso,
+      })
+      .eq('id', sub.id)
+      .eq('user_id', userId);
+    sub.usage_baseline_pins_used = 0;
+    sub.usage_baseline_user_photo_pins_used = 0;
+    return;
+  }
+
   const legacyRow = await fetchPinUsageRow(userId, legacyBucket);
-  if (!legacyRow) return;
+  if (!legacyRow) {
+    if (!needsBaselineReset) return;
+    const usageNowIso = new Date().toISOString();
+    await supabaseAdmin
+      .from('billing_subscriptions')
+      .update({
+        usage_baseline_pins_used: 0,
+        usage_baseline_user_photo_pins_used: 0,
+        updated_at: usageNowIso,
+      })
+      .eq('id', sub.id)
+      .eq('user_id', userId);
+    sub.usage_baseline_pins_used = 0;
+    sub.usage_baseline_user_photo_pins_used = 0;
+    return;
+  }
 
   const effective = effectivePinUsageFromRow(legacyRow, baselineAi, baselineUserPhoto);
-  if (effective.ai === 0 && effective.userPhoto === 0) return;
-
-  const newRow = await fetchPinUsageRow(userId, newBucket);
-  const newAi = newRow?.pins_used ?? 0;
-  const newUserPhoto = newRow?.user_photo_pins_used ?? 0;
-  const seedAi = Math.max(newAi, effective.ai);
-  const seedUserPhoto = Math.max(newUserPhoto, effective.userPhoto);
-  const needsSeed = seedAi > newAi || seedUserPhoto > newUserPhoto;
-  const needsBaselineReset = baselineAi > 0 || baselineUserPhoto > 0;
-  if (!needsSeed && !needsBaselineReset) return;
+  if (effective.ai === 0 && effective.userPhoto === 0 && !needsBaselineReset) return;
 
   const usageNowIso = new Date().toISOString();
-  if (needsSeed) {
+  if (effective.ai > 0 || effective.userPhoto > 0) {
     const { error: upsertError } = await supabaseAdmin.from('pin_usage').upsert(
       {
         user_id: userId,
         year_month: newBucket,
-        pins_used: seedAi,
-        user_photo_pins_used: seedUserPhoto,
+        pins_used: effective.ai,
+        user_photo_pins_used: effective.userPhoto,
         updated_at: usageNowIso,
       },
       { onConflict: 'user_id,year_month' }
@@ -1849,6 +1912,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
   const run = async () => {
     const sub = await getActiveSubscriptionForUser(userId);
     const planType = sub?.plan_type || 'free';
+    const pinsResetPolicy = pinUsageResetPolicy(sub, planType);
     if (sub) await migrateLegacyPinUsageIfNeeded(userId, sub, planType);
     const usageBucket = pinUsageBucketKey(sub, planType);
     const planPinsLimit = unlimitedPins ? LOCALHOST_DEV_UNLIMITED_PINS : planAiPinsLimit(sub);
@@ -1880,6 +1944,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
         return {
           allowed: false,
           planType,
+          pinsResetPolicy,
           planPinsLimit,
           planUserPhotoPinsLimit,
           limitKind: 'invalid_delta',
@@ -1903,6 +1968,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
           allowed: false,
           limitKind: 'ai',
           planType,
+          pinsResetPolicy,
           planPinsLimit,
           planUserPhotoPinsLimit,
           currentUsed: effectiveCurrentAi,
@@ -1916,6 +1982,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
           allowed: false,
           limitKind: 'user_photo',
           planType,
+          pinsResetPolicy,
           planPinsLimit,
           planUserPhotoPinsLimit,
           currentUsed: effectiveCurrentAi,
@@ -1947,6 +2014,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
       return {
         allowed: true,
         planType,
+        pinsResetPolicy,
         planPinsLimit,
         planUserPhotoPinsLimit,
         previousUsed: effectiveCurrentAi,
@@ -1959,6 +2027,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
       return {
         allowed: true,
         planType,
+        pinsResetPolicy,
         planPinsLimit,
         planUserPhotoPinsLimit,
         previousUsed: 0,
@@ -9306,13 +9375,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       if (usageResult.limitKind === 'user_photo') {
         return res.status(402).json({
           error: 'user_photo_pin_limit_reached',
-          message: `Your plan allows ${usageResult.planUserPhotoPinsLimit} own-photo pins per month. You have used ${usageResult.currentUserPhotoPinsUsed}, so creating ${userPhotoPins} more would exceed that limit.`,
+          message: buildPinLimitReachedMessage(usageResult, { kind: 'user_photo', delta: userPhotoPins }),
           details: usageResult,
         });
       }
       return res.status(402).json({
         error: 'pin_limit_reached',
-        message: `Your current plan allows ${usageResult.planPinsLimit} AI image pins per month. You have already used ${usageResult.currentUsed} this month, so generating ${aiPins} more would exceed your limit.`,
+        message: buildPinLimitReachedMessage(usageResult, { kind: 'ai', delta: aiPins }),
         details: usageResult,
       });
     }
@@ -10449,7 +10518,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       if (!userQuota.allowed) {
         return res.status(402).json({
           error: 'user_photo_pin_limit_reached',
-          message: `Your plan allows ${userQuota.planUserPhotoPinsLimit} own-photo pins per month. You have used ${userQuota.currentUserPhotoPinsUsed}, so one more would exceed that limit.`,
+          message: buildPinLimitReachedMessage(userQuota, { kind: 'user_photo', delta: 1 }),
           details: userQuota,
         });
       }
@@ -10658,7 +10727,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       if (!userQuota.allowed) {
         return res.status(402).json({
           error: 'user_photo_pin_limit_reached',
-          message: `Your plan allows ${userQuota.planUserPhotoPinsLimit} own-photo pins per month. You have used ${userQuota.currentUserPhotoPinsUsed}, so one more would exceed that limit.`,
+          message: buildPinLimitReachedMessage(userQuota, { kind: 'user_photo', delta: 1 }),
           details: userQuota,
         });
       }
@@ -10693,7 +10762,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     if (!aiQuota.allowed) {
       return res.status(402).json({
         error: 'pin_limit_reached',
-        message: `Your current plan allows ${aiQuota.planPinsLimit} AI image pins per month. You have already used ${aiQuota.currentUsed} this month, so generating one more would exceed your limit.`,
+        message: buildPinLimitReachedMessage(aiQuota, { kind: 'ai', delta: 1 }),
         details: aiQuota,
       });
     }
@@ -11610,7 +11679,7 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     if (!usageResult.allowed) {
       return res.status(402).json({
         error: 'pin_limit_reached',
-        message: `Your current plan allows ${usageResult.planPinsLimit} AI image pins per month. You have already used ${usageResult.currentUsed} this month.`,
+        message: buildPinLimitReachedMessage(usageResult, { kind: 'ai', delta: 1 }),
         details: usageResult,
       });
     }

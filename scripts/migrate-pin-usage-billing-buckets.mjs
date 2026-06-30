@@ -104,9 +104,9 @@ async function main() {
     const newRow = await fetchPinRow(sub.user_id, newBucket);
     const newAi = newRow?.pins_used ?? 0;
     const newPhoto = newRow?.user_photo_pins_used ?? 0;
-    const seedAi = Math.max(newAi, effectiveAi);
-    const seedPhoto = Math.max(newPhoto, effectivePhoto);
-    const needsSeed = seedAi > newAi || seedPhoto > newPhoto;
+    const seedAi = newAi > 0 ? newAi : effectiveAi;
+    const seedPhoto = newPhoto > 0 ? newPhoto : effectivePhoto;
+    const needsSeed = newAi === 0 && newPhoto === 0 && (effectiveAi > 0 || effectivePhoto > 0);
     const needsBaselineReset = baselineAi > 0 || baselinePhoto > 0;
 
     if (!needsSeed && !needsBaselineReset) {
