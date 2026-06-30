@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-29T21:51:23.775Z",
+  "generatedAt": "2026-06-30T11:15:30.712Z",
   "season": "Summer",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -122,7 +122,7 @@
       "title": "Simple Fourth Of July Nails",
       "badge": "seasonal",
       "season": "Seasonal",
-      "overview": "Pinterest US searches for “simple fourth of july nails” are up (200% week-over-week, 3500% month-over-month, -6% year-over-year) in Pinterest’s seasonal trends feed.",
+      "overview": "Pinterest US searches for “simple fourth of july nails” are up (200% week-over-week, 3000% month-over-month, -7% year-over-year) in Pinterest’s seasonal trends feed.",
       "pinterestAngle": "Search demand is rising on Pinterest now — pins that match “simple fourth of july nails” can ride current discovery.",
       "audience": "Amazon affiliates who can match pins to buyer-intent products for this search theme.",
       "productSearchQueries": [
@@ -139,8 +139,8 @@
         "trendType": "seasonal",
         "keyword": "simple fourth of july nails",
         "pctGrowthWow": 200,
-        "pctGrowthMom": 3500,
-        "pctGrowthYoy": -6,
+        "pctGrowthMom": 3000,
+        "pctGrowthYoy": -7,
         "timeSeries": {
           "2025-07-02": 100,
           "2025-07-09": 21,
@@ -193,7 +193,7 @@
           "2026-06-03": 3,
           "2026-06-10": 5,
           "2026-06-17": 15,
-          "2026-06-24": 52
+          "2026-06-24": 51
         }
       },
       "suggestions": [
@@ -306,64 +306,28 @@
       },
       "suggestions": [
         {
-          "id": "B0GZMXMV1N",
-          "title": "4th of July Press on Nails Short Square Fake Nails Red White Blue False Nails with Star Stripes Designs Silver Glitter N",
-          "url": "https://www.amazon.com/dp/B0GZMXMV1N",
-          "imageUrl": "https://m.media-amazon.com/images/I/61hntvXz0wL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "short fourth of july nails",
+          "url": "https://www.amazon.com/s?k=short%20fourth%20of%20july%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0DYJH8RV7",
-          "title": "4th of July Press on Nails Short Almond Fake Nails with Star Designs White Blue Red French Tip Glue on Nails Press ons I",
-          "url": "https://www.amazon.com/dp/B0DYJH8RV7",
-          "imageUrl": "https://m.media-amazon.com/images/I/713dKadhmIL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "short fourth of july nails gifts",
+          "url": "https://www.amazon.com/s?k=short%20fourth%20of%20july%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GST8Y6CH",
-          "title": "4th of July Nails - Fourth of July Press On Nails Short Square Fake Nail with American Flag Design, Red and Blue Five-Po",
-          "url": "https://www.amazon.com/dp/B0GST8Y6CH",
-          "imageUrl": "https://m.media-amazon.com/images/I/61-QTFBlQVL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best short fourth of july nails",
+          "url": "https://www.amazon.com/s?k=best%20short%20fourth%20of%20july%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GRMVBMYM",
-          "title": "24Pcs 4th of July Press on Nails Short Oval Independence Day Fake Nails Red Blue Plaid French Tip Glue on Nails with Pat",
-          "url": "https://www.amazon.com/dp/B0GRMVBMYM",
-          "imageUrl": "https://m.media-amazon.com/images/I/611qBSsJCDL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GTVFX3TB",
-          "title": "4th of July Press on Nails Short Square Fake Nails with Red White Blue Grid Stars Silver Glitter Designs Glossy Nails Pr",
-          "url": "https://www.amazon.com/dp/B0GTVFX3TB",
-          "imageUrl": "https://m.media-amazon.com/images/I/71DyRfZMbsL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GTVFX3TB",
-          "title": "4th of July Press on Nails Short Square Fake Nails with Red White Blue Grid Stars Silver Glitter Designs Glossy Nails Pr",
-          "url": "https://www.amazon.com/dp/B0GTVFX3TB",
-          "imageUrl": "https://m.media-amazon.com/images/I/71DyRfZMbsL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GZMXMV1N",
-          "title": "4th of July Press on Nails Short Square Fake Nails Red White Blue False Nails with Star Stripes Designs Silver Glitter N",
-          "url": "https://www.amazon.com/dp/B0GZMXMV1N",
-          "imageUrl": "https://m.media-amazon.com/images/I/61hntvXz0wL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GVFJD844",
-          "title": "4th of July Press on Nails Short Square Fourth of July Fake Nails with Stars Stripes Designs Red White Blue Independence",
-          "url": "https://www.amazon.com/dp/B0GVFJD844",
-          "imageUrl": "https://m.media-amazon.com/images/I/71kRBrXLvrL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GVSGCQ2S",
-          "title": "4th of July Press on Nails Short Oval Fake Nails with Glitter Star Design Glossy Blue Red White Nails Press on USA Flag ",
-          "url": "https://www.amazon.com/dp/B0GVSGCQ2S",
-          "imageUrl": "https://m.media-amazon.com/images/I/71URVaKitjL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GSQSLXLR",
-          "title": "4th of July Press on Nails Short Square Fake Nails Patriotic Nails Press ons with American Flag Stars & Stripes Design,R",
-          "url": "https://www.amazon.com/dp/B0GSQSLXLR",
-          "imageUrl": "https://m.media-amazon.com/images/I/615lgVSSCgL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "short fourth of july nails ideas",
+          "url": "https://www.amazon.com/s?k=short%20fourth%20of%20july%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -666,28 +630,64 @@
       },
       "suggestions": [
         {
-          "id": "amazon-search-0",
-          "title": "4th nails",
-          "url": "https://www.amazon.com/s?k=4th%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GXBVRVGK",
+          "title": "4th of July Press on Nails Patriotic Short Square False Nails American Flag Fireworks Chrome Electroplating Red White Bl",
+          "url": "https://www.amazon.com/dp/B0GXBVRVGK",
+          "imageUrl": "https://m.media-amazon.com/images/I/71EF7ClztIL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-1",
-          "title": "4th nails gifts",
-          "url": "https://www.amazon.com/s?k=4th%20nails%20gifts",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0DYNB824Y",
+          "title": "Independence Day Press on Nails Medium Square Fake Nails Patriotic Flag Pattern False Nails Full Cover Glossy Stick on N",
+          "url": "https://www.amazon.com/dp/B0DYNB824Y",
+          "imageUrl": "https://m.media-amazon.com/images/I/71byHmpX0wL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-2",
-          "title": "best 4th nails",
-          "url": "https://www.amazon.com/s?k=best%204th%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GWJ1K2NP",
+          "title": "4th of July Press on Nails 24 Pcs - Medium Almond Red White Blue French Tip Fake Nails with Star Stripe & Bow Design Glo",
+          "url": "https://www.amazon.com/dp/B0GWJ1K2NP",
+          "imageUrl": "https://m.media-amazon.com/images/I/71W8BaJPLNL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-3",
-          "title": "4th nails ideas",
-          "url": "https://www.amazon.com/s?k=4th%20nails%20ideas",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GX984CXL",
+          "title": "Independence Day Press on Nails Short Square Fake Nails Star & Stripe Pattern False Nails Full Cover Glossy Stick on Nai",
+          "url": "https://www.amazon.com/dp/B0GX984CXL",
+          "imageUrl": "https://m.media-amazon.com/images/I/71kv3rZM0pL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GV3FS443",
+          "title": "4th of July Nails - Fourth of July Short Press On Nails Almond Fake Nail with American Flag Glitter Design, 24Pcs Red an",
+          "url": "https://www.amazon.com/dp/B0GV3FS443",
+          "imageUrl": "https://m.media-amazon.com/images/I/71PesDa1cgL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F66FNTLG",
+          "title": "24pcs 4th of July Press on Nails Short Square American Flag Fake Nails with Glitter Designs Independence Day Fireworks S",
+          "url": "https://www.amazon.com/dp/B0F66FNTLG",
+          "imageUrl": "https://m.media-amazon.com/images/I/81KAkXHATWL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GYCRDYP3",
+          "title": "52pcs 4th of July Nail Files Bulk - Patriotic American Flag Emery Boards for Independence Day Party Favors Gifts for Wom",
+          "url": "https://www.amazon.com/dp/B0GYCRDYP3",
+          "imageUrl": "https://m.media-amazon.com/images/I/81Hl4voEnBL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F3JBQHMZ",
+          "title": "60 Pack 4th of July Patriotic Nail Files Gifts for Women American Flag Independence Day Red White and Blue Pattern Emery",
+          "url": "https://www.amazon.com/dp/B0F3JBQHMZ",
+          "imageUrl": "https://m.media-amazon.com/images/I/81XvX2bTZJL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0D7VCHVTT",
+          "title": "Nail Tech Gifts for Women, Thank You Gifts for Nail Tech, Manicurist Birthday Appreciation Gifts, Inspirational Sign for",
+          "url": "https://www.amazon.com/dp/B0D7VCHVTT",
+          "imageUrl": "https://m.media-amazon.com/images/I/71e5Y3sfQfL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G8H3MGT8",
+          "title": "Beetles 4th of July Nails Gel Nail Polish Kit with U V Light, 6 Colors Red White Blue Independence Day Nail Gift Set, HE",
+          "url": "https://www.amazon.com/dp/B0G8H3MGT8",
+          "imageUrl": "https://m.media-amazon.com/images/I/811Dfblx0nL._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"
@@ -698,7 +698,7 @@
       "title": "Red 4th Of July Nails",
       "badge": "seasonal",
       "season": "Seasonal",
-      "overview": "Pinterest US searches for “red 4th of july nails” are up (200% week-over-week, 2500% month-over-month, 80% year-over-year) in Pinterest’s seasonal trends feed.",
+      "overview": "Pinterest US searches for “red 4th of july nails” are up (200% week-over-week, 2500% month-over-month, 70% year-over-year) in Pinterest’s seasonal trends feed.",
       "pinterestAngle": "Search demand is rising on Pinterest now — pins that match “red 4th of july nails” can ride current discovery.",
       "audience": "Amazon affiliates who can match pins to buyer-intent products for this search theme.",
       "productSearchQueries": [
@@ -716,7 +716,7 @@
         "keyword": "red 4th of july nails",
         "pctGrowthWow": 200,
         "pctGrowthMom": 2500,
-        "pctGrowthYoy": 80,
+        "pctGrowthYoy": 70,
         "timeSeries": {
           "2025-07-02": 100,
           "2025-07-09": 24,

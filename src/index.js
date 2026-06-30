@@ -412,10 +412,154 @@ function currentYearMonthDate() {
   return monthStartUtc.toISOString().slice(0, 10); // 'YYYY-MM-DD'
 }
 
-function pinUsageBucketForPlan(planType) {
-  const pt = String(planType || 'free').trim().toLowerCase();
+function nextCalendarMonthStartUtc() {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+  return next.toISOString().slice(0, 10);
+}
+
+function isoDateToBucketKey(isoOrDate) {
+  if (!isoOrDate) return null;
+  const s = String(isoOrDate).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Pin usage bucket key stored in pin_usage.year_month.
+ * - free: single lifetime bucket
+ * - paid monthly: current billing period start (resets on renewal)
+ * - paid annual: calendar month UTC (monthly pin refresh within yearly billing)
+ */
+function pinUsageBucketKey(sub, planType) {
+  const pt = String(planType || sub?.plan_type || 'free').trim().toLowerCase();
   if (pt === 'free') return FREE_LIFETIME_YEAR_MONTH;
-  return currentYearMonthDate();
+  if (!sub) return currentYearMonthDate();
+  const interval = normalizeBillingInterval(sub.billing_interval);
+  if (interval === 'year') return currentYearMonthDate();
+  return isoDateToBucketKey(sub.current_period_start) || currentYearMonthDate();
+}
+
+function pinUsageResetAtIso(sub, planType) {
+  const pt = String(planType || sub?.plan_type || 'free').trim().toLowerCase();
+  if (pt === 'free') return null;
+  if (!sub) return null;
+  const interval = normalizeBillingInterval(sub.billing_interval);
+  if (interval === 'year') return `${nextCalendarMonthStartUtc()}T00:00:00.000Z`;
+  return sub.current_period_end || null;
+}
+
+function pinUsageResetPolicy(sub, planType) {
+  const pt = String(planType || sub?.plan_type || 'free').trim().toLowerCase();
+  if (pt === 'free') return 'lifetime';
+  if (!sub) return 'calendar_month';
+  return normalizeBillingInterval(sub.billing_interval) === 'year' ? 'calendar_month' : 'billing_period';
+}
+
+async function fetchPinUsageRow(userId, bucketKey) {
+  try {
+    const { data: usageRows, error } = await supabaseAdmin
+      .from('pin_usage')
+      .select('pins_used, user_photo_pins_used')
+      .eq('user_id', userId)
+      .eq('year_month', bucketKey)
+      .limit(1);
+    if (error) {
+      console.warn('pin_usage fetch error:', error.message || error);
+      return null;
+    }
+    return usageRows && usageRows.length ? usageRows[0] : null;
+  } catch (e) {
+    console.warn('pin_usage fetch unexpected error:', e.message || e);
+    return null;
+  }
+}
+
+function effectivePinUsageFromRow(row, baselineAi = 0, baselineUserPhoto = 0) {
+  const rawAi = row?.pins_used ?? 0;
+  const rawUserPhoto = row?.user_photo_pins_used ?? 0;
+  return {
+    ai: Math.max(0, rawAi - baselineAi),
+    userPhoto: Math.max(0, rawUserPhoto - baselineUserPhoto),
+    rawAi,
+    rawUserPhoto,
+  };
+}
+
+/**
+ * One-time lazy migration: copy effective usage from legacy calendar-month bucket into the
+ * billing-period bucket so existing subscribers keep their remaining quota after deploy.
+ */
+async function migrateLegacyPinUsageIfNeeded(userId, sub, planType) {
+  if (!sub || !userId || String(planType || 'free').trim().toLowerCase() === 'free') return;
+  const newBucket = pinUsageBucketKey(sub, planType);
+  const legacyBucket = currentYearMonthDate();
+  if (newBucket === legacyBucket) return;
+
+  const baselineAi = Math.max(0, Number(sub.usage_baseline_pins_used ?? 0) || 0);
+  const baselineUserPhoto = Math.max(0, Number(sub.usage_baseline_user_photo_pins_used ?? 0) || 0);
+  const legacyRow = await fetchPinUsageRow(userId, legacyBucket);
+  if (!legacyRow) return;
+
+  const effective = effectivePinUsageFromRow(legacyRow, baselineAi, baselineUserPhoto);
+  if (effective.ai === 0 && effective.userPhoto === 0) return;
+
+  const newRow = await fetchPinUsageRow(userId, newBucket);
+  const newAi = newRow?.pins_used ?? 0;
+  const newUserPhoto = newRow?.user_photo_pins_used ?? 0;
+  const seedAi = Math.max(newAi, effective.ai);
+  const seedUserPhoto = Math.max(newUserPhoto, effective.userPhoto);
+  const needsSeed = seedAi > newAi || seedUserPhoto > newUserPhoto;
+  const needsBaselineReset = baselineAi > 0 || baselineUserPhoto > 0;
+  if (!needsSeed && !needsBaselineReset) return;
+
+  const usageNowIso = new Date().toISOString();
+  if (needsSeed) {
+    const { error: upsertError } = await supabaseAdmin.from('pin_usage').upsert(
+      {
+        user_id: userId,
+        year_month: newBucket,
+        pins_used: seedAi,
+        user_photo_pins_used: seedUserPhoto,
+        updated_at: usageNowIso,
+      },
+      { onConflict: 'user_id,year_month' }
+    );
+    if (upsertError) {
+      console.warn('migrateLegacyPinUsageIfNeeded upsert error:', upsertError.message || upsertError);
+      return;
+    }
+  }
+  if (needsBaselineReset) {
+    await supabaseAdmin
+      .from('billing_subscriptions')
+      .update({
+        usage_baseline_pins_used: 0,
+        usage_baseline_user_photo_pins_used: 0,
+        updated_at: usageNowIso,
+      })
+      .eq('id', sub.id)
+      .eq('user_id', userId);
+    sub.usage_baseline_pins_used = 0;
+    sub.usage_baseline_user_photo_pins_used = 0;
+  }
+}
+
+async function getEffectivePinUsageForSubscription(userId, sub, planType) {
+  if (!userId) return { ai: 0, userPhoto: 0, rawAi: 0, rawUserPhoto: 0 };
+  const pt = String(planType || sub?.plan_type || 'free').trim().toLowerCase();
+  if (pt === 'free') {
+    const row = await fetchPinUsageRow(userId, FREE_LIFETIME_YEAR_MONTH);
+    return effectivePinUsageFromRow(row, 0, 0);
+  }
+  if (sub) await migrateLegacyPinUsageIfNeeded(userId, sub, pt);
+  const bucket = pinUsageBucketKey(sub, pt);
+  const baselineAi = Math.max(0, Number(sub?.usage_baseline_pins_used ?? 0) || 0);
+  const baselineUserPhoto = Math.max(0, Number(sub?.usage_baseline_user_photo_pins_used ?? 0) || 0);
+  const row = await fetchPinUsageRow(userId, bucket);
+  return effectivePinUsageFromRow(row, baselineAi, baselineUserPhoto);
 }
 
 async function getActiveSubscriptionForUser(userId) {
@@ -623,24 +767,34 @@ async function applyPlanActivationForUser(
     previousActiveDodoSubscriptionIds = [];
   }
 
-  // Baseline current usage so upgrades/renewals don't "steal" allowance from earlier periods.
-  const yearMonth = currentYearMonthDate();
-  let baselineAi = 0;
-  let baselineUserPhoto = 0;
+  // Baseline current usage so upgrades don't steal allowance from the active period.
+  let previousActiveSub = null;
   try {
-    const { data: usageRows } = await supabaseAdmin
-      .from('pin_usage')
-      .select('pins_used, user_photo_pins_used')
+    const { data: activeRows } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select(
+        'id, plan_type, billing_interval, current_period_start, current_period_end, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
+      )
       .eq('user_id', userId)
-      .eq('year_month', yearMonth)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
       .limit(1);
-    const row = usageRows && usageRows.length ? usageRows[0] : null;
-    baselineAi = Math.max(0, Number(row?.pins_used ?? 0) || 0);
-    baselineUserPhoto = Math.max(0, Number(row?.user_photo_pins_used ?? 0) || 0);
+    previousActiveSub = activeRows && activeRows.length ? activeRows[0] : null;
   } catch {
-    baselineAi = 0;
-    baselineUserPhoto = 0;
+    previousActiveSub = null;
   }
+
+  const effectiveUsage = previousActiveSub
+    ? await getEffectivePinUsageForSubscription(userId, previousActiveSub, previousActiveSub.plan_type)
+    : { ai: 0, userPhoto: 0 };
+
+  const newBucketStub = {
+    billing_interval: billingInterval,
+    current_period_start: periodStart,
+    status: 'active',
+    plan_type: planType,
+  };
+  const newBucket = pinUsageBucketKey(newBucketStub, planType);
 
   await supabaseAdmin
     .from('billing_subscriptions')
@@ -661,12 +815,27 @@ async function applyPlanActivationForUser(
       cancel_at_period_end: false,
       cancelled_at: null,
       dodo_subscription_id: dodoSubscriptionId,
-      usage_baseline_pins_used: baselineAi,
-      usage_baseline_user_photo_pins_used: baselineUserPhoto,
+      usage_baseline_pins_used: 0,
+      usage_baseline_user_photo_pins_used: 0,
     });
 
   if (insertError) {
     return { ok: false, error: insertError.message || String(insertError) };
+  }
+
+  const usageNowIso = now.toISOString();
+  const { error: seedError } = await supabaseAdmin.from('pin_usage').upsert(
+    {
+      user_id: userId,
+      year_month: newBucket,
+      pins_used: effectiveUsage.ai,
+      user_photo_pins_used: effectiveUsage.userPhoto,
+      updated_at: usageNowIso,
+    },
+    { onConflict: 'user_id,year_month' }
+  );
+  if (seedError) {
+    console.warn('applyPlanActivationForUser seed usage error:', seedError.message || seedError);
   }
 
   // If we have a new subscription id, schedule cancellation of any previous active Dodo subscriptions
@@ -1680,7 +1849,8 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
   const run = async () => {
     const sub = await getActiveSubscriptionForUser(userId);
     const planType = sub?.plan_type || 'free';
-    const yearMonth = pinUsageBucketForPlan(planType);
+    if (sub) await migrateLegacyPinUsageIfNeeded(userId, sub, planType);
+    const usageBucket = pinUsageBucketKey(sub, planType);
     const planPinsLimit = unlimitedPins ? LOCALHOST_DEV_UNLIMITED_PINS : planAiPinsLimit(sub);
     const planUserPhotoPinsLimit = unlimitedPins
       ? LOCALHOST_DEV_UNLIMITED_PINS
@@ -1689,18 +1859,8 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
     const baselineUserPhoto = Math.max(0, Number(sub?.usage_baseline_user_photo_pins_used ?? 0) || 0);
 
     try {
-      const { data: usageRows, error: usageError } = await supabaseAdmin
-        .from('pin_usage')
-        .select('pins_used, user_photo_pins_used')
-        .eq('user_id', userId)
-        .eq('year_month', yearMonth)
-        .limit(1);
+      const row = await fetchPinUsageRow(userId, usageBucket);
 
-      if (usageError) {
-        console.warn('pin_usage fetch error:', usageError.message || usageError);
-      }
-
-      const row = usageRows && usageRows.length ? usageRows[0] : null;
       const currentAi = row?.pins_used ?? 0;
       const currentUserPhoto = row?.user_photo_pins_used ?? 0;
 
@@ -1736,7 +1896,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
             used: effectiveCurrentAi,
             limit: planPinsLimit,
             reason: 'limit_reached',
-            yearMonth,
+            yearMonth: usageBucket,
           });
         }
         return {
@@ -1772,7 +1932,7 @@ async function applyPinQuotaDelta(userId, { aiDelta = 0, userPhotoDelta = 0 }, r
       const { error: upsertError } = await supabaseAdmin.from('pin_usage').upsert(
         {
           user_id: userId,
-          year_month: yearMonth,
+          year_month: usageBucket,
           pins_used: newAi,
           user_photo_pins_used: newUserPhoto,
           updated_at: usageNowIso,
@@ -1879,14 +2039,17 @@ async function recordMetadataUsage(userId, calls = 1) {
 }
 
 async function getCurrentUsageSnapshot(userId, req = null) {
-  const yearMonth = currentYearMonthDate();
+  const metadataBucket = currentYearMonthDate();
   const localhostUnlimitedPins = isLocalhostDevBypass(req);
 
   // Subscription row for UI context (active preferred; else past_due for recovery banner)
   const subscription = (await getActiveSubscriptionForUser(userId)) || (await getLatestPastDueSubscriptionForUser(userId));
   const subscriptionActive = subscription?.status === 'active';
   const planType = subscriptionActive && subscription?.plan_type ? subscription.plan_type : 'free';
-  const pinUsageBucket = pinUsageBucketForPlan(planType);
+  if (subscriptionActive && subscription) {
+    await migrateLegacyPinUsageIfNeeded(userId, subscription, planType);
+  }
+  const pinUsageBucket = pinUsageBucketKey(subscriptionActive ? subscription : null, planType);
   const effectiveSubForLimits = subscriptionActive ? subscription : { plan_type: planType };
   const planPinsLimit = localhostUnlimitedPins
     ? LOCALHOST_DEV_UNLIMITED_PINS
@@ -1894,12 +2057,6 @@ async function getCurrentUsageSnapshot(userId, req = null) {
   const planUserPhotoPinsLimit = localhostUnlimitedPins
     ? LOCALHOST_DEV_UNLIMITED_PINS
     : resolveUserPhotoPinLimitForPlan(effectiveSubForLimits);
-  const baselineAi = subscriptionActive
-    ? Math.max(0, Number(subscription?.usage_baseline_pins_used ?? 0) || 0)
-    : 0;
-  const baselineUserPhoto = subscriptionActive
-    ? Math.max(0, Number(subscription?.usage_baseline_user_photo_pins_used ?? 0) || 0)
-    : 0;
 
   // Profile info (for email, created_at, etc.)
   const { data: profile } = await supabaseAdmin
@@ -1908,28 +2065,12 @@ async function getCurrentUsageSnapshot(userId, req = null) {
     .eq('id', userId)
     .single();
 
-  // Pin usage for current month
-  let pinsUsed = 0;
-  let userPhotoPinsUsed = 0;
-  try {
-    const { data: pinUsageRow, error: pinError } = await supabaseAdmin
-      .from('pin_usage')
-      .select('pins_used, user_photo_pins_used')
-      .eq('user_id', userId)
-      .eq('year_month', pinUsageBucket)
-      .single();
-    if (pinError) {
-      // Ignore "no rows" error, log others
-      if (pinError.code !== 'PGRST116') {
-        console.warn('pin_usage single error:', pinError.message || pinError);
-      }
-    } else if (pinUsageRow) {
-      pinsUsed = pinUsageRow.pins_used || 0;
-      userPhotoPinsUsed = pinUsageRow.user_photo_pins_used ?? 0;
-    }
-  } catch (e) {
-    console.warn('pin_usage fetch unexpected error:', e.message || e);
-  }
+  const pinUsage =
+    planType === 'free'
+      ? await getEffectivePinUsageForSubscription(userId, null, 'free')
+      : await getEffectivePinUsageForSubscription(userId, subscription, planType);
+  const effectivePinsUsed = pinUsage.ai;
+  const effectiveUserPhotoPinsUsed = pinUsage.userPhoto;
 
   // Metadata usage for current month
   let metadataCalls = 0;
@@ -1938,7 +2079,7 @@ async function getCurrentUsageSnapshot(userId, req = null) {
       .from('metadata_usage')
       .select('metadata_calls')
       .eq('user_id', userId)
-      .eq('year_month', yearMonth)
+      .eq('year_month', metadataBucket)
       .single();
     if (metaError) {
       if (metaError.code !== 'PGRST116') {
@@ -1951,8 +2092,7 @@ async function getCurrentUsageSnapshot(userId, req = null) {
     console.warn('metadata_usage fetch unexpected error:', e.message || e);
   }
   const planMetaLimit = PLAN_METADATA_LIMITS[planType] || PLAN_METADATA_LIMITS.free;
-  const effectivePinsUsed = Math.max(0, pinsUsed - baselineAi);
-  const effectiveUserPhotoPinsUsed = Math.max(0, userPhotoPinsUsed - baselineUserPhoto);
+  const resetPolicy = pinUsageResetPolicy(subscriptionActive ? subscription : null, planType);
 
   return {
     localhost_dev_unlimited_pins: localhostUnlimitedPins,
@@ -1982,7 +2122,11 @@ async function getCurrentUsageSnapshot(userId, req = null) {
       metadata_limit_per_month: planMetaLimit,
     },
     usage: {
-      year_month: yearMonth,
+      year_month: pinUsageBucket,
+      pins_reset_policy: resetPolicy,
+      pins_reset_at: pinUsageResetAtIso(subscriptionActive ? subscription : null, planType),
+      period_start: subscriptionActive ? subscription.current_period_start || null : null,
+      period_end: subscriptionActive ? subscription.current_period_end || null : null,
       pins_used: effectivePinsUsed,
       pins_remaining: Math.max(0, planPinsLimit - effectivePinsUsed),
       user_photo_pins_used: effectiveUserPhotoPinsUsed,
@@ -14286,12 +14430,19 @@ app.post('/api/dodo/webhook', async (req, res) => {
           return res.json({ ok: true, ignored: true, reason: 'subscription_already_linked_to_another_user' });
         }
         if (existing && existing.user_id === userId && existing.status === 'active' && existing.plan_type === planType) {
+          const isRenewal = eventType.includes('subscription.renewed');
           await supabaseAdmin
             .from('billing_subscriptions')
             .update({
               ...(periodStartRaw ? { current_period_start: periodStartRaw } : {}),
               ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
               billing_interval: billingInterval,
+              ...(isRenewal
+                ? {
+                    usage_baseline_pins_used: 0,
+                    usage_baseline_user_photo_pins_used: 0,
+                  }
+                : {}),
               updated_at: new Date().toISOString(),
             })
             .eq('id', existing.id)
