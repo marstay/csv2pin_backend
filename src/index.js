@@ -755,6 +755,33 @@ function inferBillingIntervalFromDodoProductId(productId) {
   return 'month';
 }
 
+async function fetchDodoProductExists(productId) {
+  const id = String(productId || '').trim();
+  if (!id || !DODO_API_KEY) return { ok: false, message: 'Missing product id or Dodo API key' };
+  try {
+    const resp = await fetch(`${DODO_BASE_URL}/products/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+    });
+    if (resp.ok) return { ok: true };
+    const json = await resp.json().catch(() => ({}));
+    const message = String(json?.message || json?.error || '').trim() || `HTTP ${resp.status}`;
+    return { ok: false, status: resp.status, message };
+  } catch (e) {
+    return { ok: false, message: e?.message || 'Dodo product lookup failed' };
+  }
+}
+
+function formatDodoCheckoutClientError(json, billingInterval) {
+  const message = String(json?.message || '').trim();
+  if (/does not exist/i.test(message)) {
+    const envHint = String(DODO_BASE_URL || '').includes('test')
+      ? ' Annual plans use live-only product IDs — switch DODO_BASE_URL to live or create matching products in Dodo test mode.'
+      : ' Verify DODO_PRODUCT_*_ANNUAL_ID env vars match products in your Dodo dashboard.';
+    return `This ${billingInterval === 'year' ? 'annual' : 'monthly'} plan is not available on the configured Dodo environment.${envHint}`;
+  }
+  return message || 'Could not start checkout. Please try again or contact support.';
+}
+
 function markPendingDodoActivationWithInterval(userId, planType, billingInterval, sessionId = null) {
   if (!userId || !planType) return;
   pendingDodoActivations.set(String(userId), {
@@ -12466,6 +12493,24 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       });
     }
 
+    const productCheck = await fetchDodoProductExists(productId);
+    if (!productCheck.ok) {
+      console.error('Dodo product missing for checkout:', {
+        planType,
+        billingInterval,
+        productId,
+        dodoBase: DODO_BASE_URL,
+        status: productCheck.status,
+        message: productCheck.message,
+      });
+      return res.status(502).json({
+        error: 'dodo_product_not_configured',
+        message: formatDodoCheckoutClientError({ message: productCheck.message }, billingInterval),
+        billingInterval,
+        planType,
+      });
+    }
+
   // Compute frontend base (strip any /app or deeper path)
   let frontendBase = process.env.FRONTEND_BASE_URL || 'http://localhost:3000';
   try {
@@ -12512,6 +12557,7 @@ app.post('/api/dodo/create-checkout-session', requireUser, async (req, res) => {
       console.error('Dodo create checkout session error:', resp.status, json);
       return res.status(500).json({
         error: 'failed_to_create_dodo_checkout',
+        message: formatDodoCheckoutClientError(json, billingInterval),
         status: resp.status,
         details: json,
       });

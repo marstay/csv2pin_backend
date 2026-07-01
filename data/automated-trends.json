@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-30T11:15:30.712Z",
+  "generatedAt": "2026-07-01T07:15:57.838Z",
   "season": "Summer",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -522,28 +522,64 @@
       },
       "suggestions": [
         {
-          "id": "amazon-search-0",
-          "title": "red fourth of july nails",
-          "url": "https://www.amazon.com/s?k=red%20fourth%20of%20july%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0DYJH8RV7",
+          "title": "4th of July Press on Nails Short Almond Fake Nails with Star Designs White Blue Red French Tip Glue on Nails Press ons I",
+          "url": "https://www.amazon.com/dp/B0DYJH8RV7",
+          "imageUrl": "https://m.media-amazon.com/images/I/713dKadhmIL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-1",
-          "title": "red fourth of july nails gifts",
-          "url": "https://www.amazon.com/s?k=red%20fourth%20of%20july%20nails%20gifts",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0DRNP6G1R",
+          "title": "6 Packs (144 Pcs) 4th of July Press on Nails, Short Square Press on Nails, Star Fake Nails Red Blue Independence Day Fal",
+          "url": "https://www.amazon.com/dp/B0DRNP6G1R",
+          "imageUrl": "https://m.media-amazon.com/images/I/71G1sMOZMrL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-2",
-          "title": "best red fourth of july nails",
-          "url": "https://www.amazon.com/s?k=best%20red%20fourth%20of%20july%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GVDV17M9",
+          "title": "4th of July Nails 24Pcs Fourth of July Short Press On Nails Almond Fake Nail with Red and White Striped Stars Design, Ac",
+          "url": "https://www.amazon.com/dp/B0GVDV17M9",
+          "imageUrl": "https://m.media-amazon.com/images/I/61LxVv1uiNL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-3",
-          "title": "red fourth of july nails ideas",
-          "url": "https://www.amazon.com/s?k=red%20fourth%20of%20july%20nails%20ideas",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GZ2FZ72X",
+          "title": "4th of July Press on Nails Red White Star Stripe Glitter Fake Nails | Short Square Red Blue Glossy Acrylic Nails Design ",
+          "url": "https://www.amazon.com/dp/B0GZ2FZ72X",
+          "imageUrl": "https://m.media-amazon.com/images/I/717zFnQhbeL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F4DGYFV6",
+          "title": "24Pcs Independence Day Press on Nails Medium Square Fake Nails Red Blue Glitter Acrylic Nails Patriotic Artificial Nails",
+          "url": "https://www.amazon.com/dp/B0F4DGYFV6",
+          "imageUrl": "https://m.media-amazon.com/images/I/71pTmuEXnGL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G2MXFKKS",
+          "title": "xo, Fetti America 250 Nail Stickers - 948 Stickers, 4 Sheet Pack | USA Nails, Patriotic, 4th of July, Red White Blue, Am",
+          "url": "https://www.amazon.com/dp/B0G2MXFKKS",
+          "imageUrl": "https://m.media-amazon.com/images/I/71asbtSkKkL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0G8GY1ZR1",
+          "title": "Beetles 4th of July Gel Nail Polish Set, 6 Colors Red White Blue Cat Eye Gel Polish Sliver Glitter Gel Polish with Magne",
+          "url": "https://www.amazon.com/dp/B0G8GY1ZR1",
+          "imageUrl": "https://m.media-amazon.com/images/I/81oiGMr6D+L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0D3VPXXS9",
+          "title": "24pcs July 4th Press-On Short Square Independence Day False Toenails American Flag Red Blue White Glitter Full Cover Acr",
+          "url": "https://www.amazon.com/dp/B0D3VPXXS9",
+          "imageUrl": "https://m.media-amazon.com/images/I/711pTiL6kBL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0D2BFFGSP",
+          "title": "24pcs July 4th Press-On Short Square False Nails Independence Day Stick-On Red Glitter French Manicure Glitter Stars Ame",
+          "url": "https://www.amazon.com/dp/B0D2BFFGSP",
+          "imageUrl": "https://m.media-amazon.com/images/I/61mwRgdMJ4L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GZ2FZ72X",
+          "title": "4th of July Press on Nails Red White Star Stripe Glitter Fake Nails | Short Square Red Blue Glossy Acrylic Nails Design ",
+          "url": "https://www.amazon.com/dp/B0GZ2FZ72X",
+          "imageUrl": "https://m.media-amazon.com/images/I/717zFnQhbeL._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"
@@ -630,64 +666,28 @@
       },
       "suggestions": [
         {
-          "id": "B0GXBVRVGK",
-          "title": "4th of July Press on Nails Patriotic Short Square False Nails American Flag Fireworks Chrome Electroplating Red White Bl",
-          "url": "https://www.amazon.com/dp/B0GXBVRVGK",
-          "imageUrl": "https://m.media-amazon.com/images/I/71EF7ClztIL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "4th nails",
+          "url": "https://www.amazon.com/s?k=4th%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0DYNB824Y",
-          "title": "Independence Day Press on Nails Medium Square Fake Nails Patriotic Flag Pattern False Nails Full Cover Glossy Stick on N",
-          "url": "https://www.amazon.com/dp/B0DYNB824Y",
-          "imageUrl": "https://m.media-amazon.com/images/I/71byHmpX0wL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "4th nails gifts",
+          "url": "https://www.amazon.com/s?k=4th%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GWJ1K2NP",
-          "title": "4th of July Press on Nails 24 Pcs - Medium Almond Red White Blue French Tip Fake Nails with Star Stripe & Bow Design Glo",
-          "url": "https://www.amazon.com/dp/B0GWJ1K2NP",
-          "imageUrl": "https://m.media-amazon.com/images/I/71W8BaJPLNL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best 4th nails",
+          "url": "https://www.amazon.com/s?k=best%204th%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GX984CXL",
-          "title": "Independence Day Press on Nails Short Square Fake Nails Star & Stripe Pattern False Nails Full Cover Glossy Stick on Nai",
-          "url": "https://www.amazon.com/dp/B0GX984CXL",
-          "imageUrl": "https://m.media-amazon.com/images/I/71kv3rZM0pL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GV3FS443",
-          "title": "4th of July Nails - Fourth of July Short Press On Nails Almond Fake Nail with American Flag Glitter Design, 24Pcs Red an",
-          "url": "https://www.amazon.com/dp/B0GV3FS443",
-          "imageUrl": "https://m.media-amazon.com/images/I/71PesDa1cgL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F66FNTLG",
-          "title": "24pcs 4th of July Press on Nails Short Square American Flag Fake Nails with Glitter Designs Independence Day Fireworks S",
-          "url": "https://www.amazon.com/dp/B0F66FNTLG",
-          "imageUrl": "https://m.media-amazon.com/images/I/81KAkXHATWL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GYCRDYP3",
-          "title": "52pcs 4th of July Nail Files Bulk - Patriotic American Flag Emery Boards for Independence Day Party Favors Gifts for Wom",
-          "url": "https://www.amazon.com/dp/B0GYCRDYP3",
-          "imageUrl": "https://m.media-amazon.com/images/I/81Hl4voEnBL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F3JBQHMZ",
-          "title": "60 Pack 4th of July Patriotic Nail Files Gifts for Women American Flag Independence Day Red White and Blue Pattern Emery",
-          "url": "https://www.amazon.com/dp/B0F3JBQHMZ",
-          "imageUrl": "https://m.media-amazon.com/images/I/81XvX2bTZJL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0D7VCHVTT",
-          "title": "Nail Tech Gifts for Women, Thank You Gifts for Nail Tech, Manicurist Birthday Appreciation Gifts, Inspirational Sign for",
-          "url": "https://www.amazon.com/dp/B0D7VCHVTT",
-          "imageUrl": "https://m.media-amazon.com/images/I/71e5Y3sfQfL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0G8H3MGT8",
-          "title": "Beetles 4th of July Nails Gel Nail Polish Kit with U V Light, 6 Colors Red White Blue Independence Day Nail Gift Set, HE",
-          "url": "https://www.amazon.com/dp/B0G8H3MGT8",
-          "imageUrl": "https://m.media-amazon.com/images/I/811Dfblx0nL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "4th nails ideas",
+          "url": "https://www.amazon.com/s?k=4th%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -1749,127 +1749,6 @@
         {
           "id": "blog-angle-5",
           "title": "Happy Fathers Day Wishes To All mistakes to avoid",
-          "url": "",
-          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
-        }
-      ],
-      "source": "pinterest_trends"
-    },
-    {
-      "slug": "fairs-reaction-pic",
-      "category": "blogging",
-      "title": "Fairs Reaction Pic",
-      "badge": "rising",
-      "overview": "Pinterest US searches for “fairs reaction pic” are up (500% week-over-week, 10001% month-over-month, 10001% year-over-year) in Pinterest’s growing trends feed.",
-      "pinterestAngle": "Search demand is rising on Pinterest now — pins that match “fairs reaction pic” can ride current discovery.",
-      "audience": "Bloggers and publishers who can publish or refresh content around this Pinterest search theme.",
-      "productSearchQueries": [],
-      "blogAngles": [
-        "Fairs Reaction Pic",
-        "Fairs Reaction Pic: ideas and inspiration",
-        "Best Fairs Reaction Pic tips",
-        "Fairs Reaction Pic for beginners",
-        "Fairs Reaction Pic checklist",
-        "Fairs Reaction Pic mistakes to avoid"
-      ],
-      "evidence": {
-        "provider": "pinterest",
-        "api": "trends/keywords/top",
-        "region": "US",
-        "trendType": "growing",
-        "keyword": "fairs reaction pic",
-        "pctGrowthWow": 500,
-        "pctGrowthMom": 10001,
-        "pctGrowthYoy": 10001,
-        "timeSeries": {
-          "2025-07-02": 0,
-          "2025-07-09": 0,
-          "2025-07-16": 0,
-          "2025-07-23": 0,
-          "2025-07-30": 0,
-          "2025-08-06": 0,
-          "2025-08-13": 0,
-          "2025-08-20": 0,
-          "2025-08-27": 0,
-          "2025-09-03": 0,
-          "2025-09-10": 0,
-          "2025-09-17": 0,
-          "2025-09-24": 0,
-          "2025-10-01": 0,
-          "2025-10-08": 0,
-          "2025-10-15": 0,
-          "2025-10-22": 0,
-          "2025-10-29": 0,
-          "2025-11-05": 0,
-          "2025-11-12": 0,
-          "2025-11-19": 0,
-          "2025-11-26": 0,
-          "2025-12-03": 0,
-          "2025-12-10": 0,
-          "2025-12-17": 0,
-          "2025-12-24": 0,
-          "2025-12-31": 0,
-          "2026-01-07": 0,
-          "2026-01-14": 0,
-          "2026-01-21": 0,
-          "2026-01-28": 0,
-          "2026-02-04": 0,
-          "2026-02-11": 0,
-          "2026-02-18": 0,
-          "2026-02-25": 0,
-          "2026-03-04": 0,
-          "2026-03-11": 0,
-          "2026-03-18": 0,
-          "2026-03-25": 0,
-          "2026-04-01": 0,
-          "2026-04-08": 0,
-          "2026-04-15": 0,
-          "2026-04-22": 0,
-          "2026-04-29": 0,
-          "2026-05-06": 0,
-          "2026-05-13": 0,
-          "2026-05-20": 0,
-          "2026-05-27": 0,
-          "2026-06-03": 0,
-          "2026-06-10": 0,
-          "2026-06-17": 17,
-          "2026-06-24": 100
-        }
-      },
-      "suggestions": [
-        {
-          "id": "blog-angle-0",
-          "title": "Fairs Reaction Pic",
-          "url": "",
-          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
-        },
-        {
-          "id": "blog-angle-1",
-          "title": "Fairs Reaction Pic: ideas and inspiration",
-          "url": "",
-          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
-        },
-        {
-          "id": "blog-angle-2",
-          "title": "Best Fairs Reaction Pic tips",
-          "url": "",
-          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
-        },
-        {
-          "id": "blog-angle-3",
-          "title": "Fairs Reaction Pic for beginners",
-          "url": "",
-          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
-        },
-        {
-          "id": "blog-angle-4",
-          "title": "Fairs Reaction Pic checklist",
-          "url": "",
-          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
-        },
-        {
-          "id": "blog-angle-5",
-          "title": "Fairs Reaction Pic mistakes to avoid",
           "url": "",
           "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
         }
@@ -3322,6 +3201,127 @@
         {
           "id": "blog-angle-5",
           "title": "Happy Father’s Day mistakes to avoid",
+          "url": "",
+          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
+        }
+      ],
+      "source": "pinterest_trends"
+    },
+    {
+      "slug": "happy-father-s-day-funny",
+      "category": "blogging",
+      "title": "Happy Father’s Day Funny",
+      "badge": "rising",
+      "overview": "Pinterest US searches for “happy father’s day funny” are up (10001% week-over-week, 10001% month-over-month, 50% year-over-year) in Pinterest’s growing trends feed.",
+      "pinterestAngle": "Search demand is rising on Pinterest now — pins that match “happy father’s day funny” can ride current discovery.",
+      "audience": "Bloggers and publishers who can publish or refresh content around this Pinterest search theme.",
+      "productSearchQueries": [],
+      "blogAngles": [
+        "Happy Father’s Day Funny",
+        "Happy Father’s Day Funny: ideas and inspiration",
+        "Best Happy Father’s Day Funny tips",
+        "Happy Father’s Day Funny for beginners",
+        "Happy Father’s Day Funny checklist",
+        "Happy Father’s Day Funny mistakes to avoid"
+      ],
+      "evidence": {
+        "provider": "pinterest",
+        "api": "trends/keywords/top",
+        "region": "US",
+        "trendType": "growing",
+        "keyword": "happy father’s day funny",
+        "pctGrowthWow": 10001,
+        "pctGrowthMom": 10001,
+        "pctGrowthYoy": 50,
+        "timeSeries": {
+          "2025-07-02": 0,
+          "2025-07-09": 0,
+          "2025-07-16": 0,
+          "2025-07-23": 0,
+          "2025-07-30": 0,
+          "2025-08-06": 0,
+          "2025-08-13": 0,
+          "2025-08-20": 0,
+          "2025-08-27": 0,
+          "2025-09-03": 0,
+          "2025-09-10": 0,
+          "2025-09-17": 0,
+          "2025-09-24": 0,
+          "2025-10-01": 0,
+          "2025-10-08": 0,
+          "2025-10-15": 0,
+          "2025-10-22": 0,
+          "2025-10-29": 0,
+          "2025-11-05": 0,
+          "2025-11-12": 0,
+          "2025-11-19": 0,
+          "2025-11-26": 0,
+          "2025-12-03": 0,
+          "2025-12-10": 0,
+          "2025-12-17": 0,
+          "2025-12-24": 0,
+          "2025-12-31": 0,
+          "2026-01-07": 0,
+          "2026-01-14": 0,
+          "2026-01-21": 0,
+          "2026-01-28": 0,
+          "2026-02-04": 0,
+          "2026-02-11": 0,
+          "2026-02-18": 0,
+          "2026-02-25": 0,
+          "2026-03-04": 0,
+          "2026-03-11": 0,
+          "2026-03-18": 0,
+          "2026-03-25": 0,
+          "2026-04-01": 0,
+          "2026-04-08": 0,
+          "2026-04-15": 0,
+          "2026-04-22": 0,
+          "2026-04-29": 0,
+          "2026-05-06": 0,
+          "2026-05-13": 0,
+          "2026-05-20": 0,
+          "2026-05-27": 0,
+          "2026-06-03": 0,
+          "2026-06-10": 0,
+          "2026-06-17": 1,
+          "2026-06-24": 100
+        }
+      },
+      "suggestions": [
+        {
+          "id": "blog-angle-0",
+          "title": "Happy Father’s Day Funny",
+          "url": "",
+          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
+        },
+        {
+          "id": "blog-angle-1",
+          "title": "Happy Father’s Day Funny: ideas and inspiration",
+          "url": "",
+          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
+        },
+        {
+          "id": "blog-angle-2",
+          "title": "Best Happy Father’s Day Funny tips",
+          "url": "",
+          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
+        },
+        {
+          "id": "blog-angle-3",
+          "title": "Happy Father’s Day Funny for beginners",
+          "url": "",
+          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
+        },
+        {
+          "id": "blog-angle-4",
+          "title": "Happy Father’s Day Funny checklist",
+          "url": "",
+          "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
+        },
+        {
+          "id": "blog-angle-5",
+          "title": "Happy Father’s Day Funny mistakes to avoid",
           "url": "",
           "note": "Publish or update a post targeting this Pinterest search theme, then paste the URL into URL2Pin."
         }
