@@ -111,6 +111,16 @@ const DEFAULT_AFFILIATE_RECURRING_MONTHS = Math.max(
   Math.floor(Number(process.env.AFFILIATE_RECURRING_MONTHS || '12') || 12)
 );
 
+/** Days to hold annual first-payment commissions (refund window). Default 7. */
+const DEFAULT_AFFILIATE_REFUND_HOLD_DAYS = Math.max(
+  0,
+  Math.floor(Number(process.env.AFFILIATE_REFUND_HOLD_DAYS || '7') || 7)
+);
+
+function affiliateRefundHoldMs() {
+  return DEFAULT_AFFILIATE_REFUND_HOLD_DAYS * 24 * 60 * 60 * 1000;
+}
+
 function getRecurringMonthsForAffiliate(affiliate) {
   const raw = affiliate?.recurring_months;
   if (raw !== null && raw !== undefined && raw !== '') {
@@ -241,9 +251,10 @@ async function affiliateCommissionWindowAllows(affiliate, referredUserId) {
   const months = getRecurringMonthsForAffiliate(affiliate);
   const { data: rows } = await supabaseAdmin
     .from('affiliate_commissions')
-    .select('id, created_at')
+    .select('id, created_at, commission_kind')
     .eq('affiliate_id', affiliate.id)
     .eq('referred_user_id', referredUserId)
+    .neq('commission_kind', 'annual_first')
     .order('created_at', { ascending: true })
     .limit(1);
   if (!rows?.length) return { ok: true, recurringMonths: months };
@@ -256,6 +267,56 @@ async function affiliateCommissionWindowAllows(affiliate, referredUserId) {
     return { ok: false, reason: 'recurring_window_expired', recurringMonths: months };
   }
   return { ok: true, recurringMonths: months };
+}
+
+async function affiliateAnnualFirstCommissionAllows(affiliate, referredUserId) {
+  const { data: rows } = await supabaseAdmin
+    .from('affiliate_commissions')
+    .select('id')
+    .eq('affiliate_id', affiliate.id)
+    .eq('referred_user_id', referredUserId)
+    .eq('commission_kind', 'annual_first')
+    .neq('status', 'void')
+    .limit(1);
+  if (rows?.length) return { ok: false, reason: 'annual_first_already_recorded' };
+  return { ok: true };
+}
+
+/** Move annual commissions past the refund hold into pending (payable). */
+async function promoteHeldAffiliateCommissions() {
+  const now = new Date().toISOString();
+  try {
+    const { error } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .update({ status: 'pending' })
+      .eq('status', 'held')
+      .lte('payable_after', now);
+    if (error) {
+      console.warn('promoteHeldAffiliateCommissions error:', error.message || error);
+    }
+  } catch (e) {
+    console.warn('promoteHeldAffiliateCommissions unexpected:', e?.message || e);
+  }
+}
+
+async function voidAffiliateCommissionsForPayment(paymentId) {
+  const pid = String(paymentId || '').trim();
+  if (!pid) return { ok: false, reason: 'missing_payment_id' };
+  try {
+    const { error } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .update({ status: 'void' })
+      .eq('payment_id', pid)
+      .in('status', ['held', 'pending', 'approved']);
+    if (error) {
+      console.warn('voidAffiliateCommissionsForPayment error:', error.message || error);
+      return { ok: false, reason: 'update_failed' };
+    }
+    return { ok: true };
+  } catch (e) {
+    console.warn('voidAffiliateCommissionsForPayment unexpected:', e?.message || e);
+    return { ok: false, reason: 'unexpected' };
+  }
 }
 
 async function resolveBillingIntervalForAffiliateCommission(userId, opts = {}) {
@@ -295,16 +356,21 @@ async function resolveBillingIntervalForAffiliateCommission(userId, opts = {}) {
 }
 
 /**
- * Record affiliate commission on paid subscription (first payment + renewals within window).
- * Commissions apply to monthly billing only (not annual plans).
+ * Record affiliate commission on paid subscription.
+ * - Monthly: 30% on each payment within the recurring window (default 12 months).
+ * - Annual: 30% on first annual payment only; held until refund window ends; renewals excluded.
  */
 async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opts = {}) {
   const uid = String(userId || '').trim();
   if (!uid || !planType || planType === 'free') return { ok: false, reason: 'invalid_input' };
 
   const billingInterval = await resolveBillingIntervalForAffiliateCommission(uid, opts);
-  if (billingInterval !== 'month') {
-    return { ok: false, reason: 'commission_monthly_plans_only', billingInterval: billingInterval || 'unknown' };
+  const commissionKindRaw = String(opts.commissionKind || 'subscription').toLowerCase();
+  const isRenewal = commissionKindRaw.includes('renewal');
+  const isAnnual = billingInterval === 'year';
+
+  if (!isAnnual && billingInterval !== 'month') {
+    return { ok: false, reason: 'unsupported_billing_interval', billingInterval: billingInterval || 'unknown' };
   }
 
   const slug =
@@ -320,6 +386,8 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
   const paymentId = opts.paymentId || null;
 
   try {
+    await promoteHeldAffiliateCommissions();
+
     if (paymentId) {
       const { data: dupPay } = await supabaseAdmin
         .from('affiliate_commissions')
@@ -329,8 +397,23 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
       if (dupPay?.id) return { ok: true, duplicate: true };
     }
 
-    const windowCheck = await affiliateCommissionWindowAllows(affiliate, uid);
-    if (!windowCheck.ok) return { ok: false, reason: windowCheck.reason };
+    let commissionKind = commissionKindRaw === 'renewal' ? 'renewal' : 'subscription';
+    let status = 'pending';
+    let payableAfter = null;
+    let windowCheck = { ok: true, recurringMonths: getRecurringMonthsForAffiliate(affiliate) };
+
+    if (isAnnual) {
+      if (isRenewal) return { ok: false, reason: 'annual_renewal_excluded' };
+      const annualCheck = await affiliateAnnualFirstCommissionAllows(affiliate, uid);
+      if (!annualCheck.ok) return { ok: false, reason: annualCheck.reason };
+      commissionKind = 'annual_first';
+      status = 'held';
+      payableAfter = new Date(Date.now() + affiliateRefundHoldMs()).toISOString();
+    } else {
+      windowCheck = await affiliateCommissionWindowAllows(affiliate, uid);
+      if (!windowCheck.ok) return { ok: false, reason: windowCheck.reason };
+      if (isRenewal) commissionKind = 'renewal';
+    }
 
     const rate = Math.min(
       1,
@@ -348,8 +431,9 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
       amount_cents: amountCents,
       commission_cents: commissionCents,
       currency: String(opts.currency || 'usd').toLowerCase(),
-      status: 'pending',
-      commission_kind: opts.commissionKind || 'subscription',
+      status,
+      commission_kind: commissionKind,
+      payable_after: payableAfter,
     });
     if (insErr) {
       if (insErr.code === '23505') return { ok: true, duplicate: true };
@@ -360,11 +444,15 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
       affiliateSlug: affiliate.slug,
       userId: uid,
       planType,
+      billingInterval,
       amountCents,
       commissionCents,
+      status,
+      commissionKind,
       recurringMonths: windowCheck.recurringMonths,
+      payableAfter,
     });
-    return { ok: true, affiliateSlug: affiliate.slug, commissionCents };
+    return { ok: true, affiliateSlug: affiliate.slug, commissionCents, status, commissionKind };
   } catch (e) {
     console.warn('recordAffiliateCommission unexpected:', e?.message || e);
     return { ok: false, reason: 'unexpected' };
@@ -12766,6 +12854,8 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
 
     const slug = affiliate.slug;
     const recurringMonths = getRecurringMonthsForAffiliate(affiliate);
+    await promoteHeldAffiliateCommissions();
+
     const { count: signups } = await supabaseAdmin
       .from('profiles')
       .select('id', { count: 'exact', head: true })
@@ -12773,18 +12863,30 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
 
     const { data: commissions } = await supabaseAdmin
       .from('affiliate_commissions')
-      .select('id, plan_type, amount_cents, commission_cents, status, created_at, commission_kind')
+      .select(
+        'id, plan_type, amount_cents, commission_cents, status, created_at, commission_kind, payable_after'
+      )
       .eq('affiliate_id', affiliate.id)
       .order('created_at', { ascending: false })
       .limit(50);
 
-    const rows = commissions || [];
-    const pendingCents = rows
+    const { data: statsRows } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .select('commission_cents, status')
+      .eq('affiliate_id', affiliate.id);
+
+    const allRows = statsRows || [];
+    const heldCents = allRows
+      .filter((r) => r.status === 'held')
+      .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
+    const pendingCents = allRows
       .filter((r) => r.status === 'pending' || r.status === 'approved')
       .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
-    const paidCents = rows
+    const paidCents = allRows
       .filter((r) => r.status === 'paid')
       .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
+
+    const rows = commissions || [];
 
     let frontendBase = process.env.FRONTEND_BASE_URL || 'https://url2pin.com';
     try {
@@ -12810,12 +12912,14 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
       referralLink,
       stats: {
         signups: signups || 0,
-        conversions: rows.length,
+        conversions: rows.filter((r) => r.status !== 'void').length,
+        heldCommissionCents: heldCents,
         pendingCommissionCents: pendingCents,
         paidCommissionCents: paidCents,
       },
       commissions: rows,
       recurringMonthsDefault,
+      refundHoldDays: DEFAULT_AFFILIATE_REFUND_HOLD_DAYS,
     });
   } catch (err) {
     console.error('affiliate/me error:', err);
@@ -14777,6 +14881,18 @@ app.post('/api/dodo/webhook', async (req, res) => {
           .eq('id', uidForProfile);
       }
       return res.json({ ok: true, action: 'cancelled', userId: uidForProfile });
+    }
+
+    if (eventType.includes('refund')) {
+      const refundPaymentId =
+        extractDodoPaymentId(dataObj) ||
+        String(dataObj?.payment_id || dataObj?.original_payment_id || dataObj?.payment?.payment_id || '').trim() ||
+        null;
+      if (refundPaymentId) {
+        await voidAffiliateCommissionsForPayment(refundPaymentId);
+        return res.json({ ok: true, action: 'affiliate_commission_voided', paymentId: refundPaymentId });
+      }
+      return res.json({ ok: true, ignored: true, reason: 'refund_missing_payment_id' });
     }
 
     return res.json({ ok: true, ignored: true, reason: 'unhandled_event', eventType });
