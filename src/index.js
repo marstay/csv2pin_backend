@@ -355,6 +355,18 @@ async function resolveBillingIntervalForAffiliateCommission(userId, opts = {}) {
   return interval || '';
 }
 
+function affiliateCommissionSchemaError(err) {
+  const msg = String(err?.message || err || '').toLowerCase();
+  const code = String(err?.code || '');
+  return (
+    code === '23514' ||
+    code === '42703' ||
+    code === 'PGRST204' ||
+    msg.includes('affiliate_commissions_status_check') ||
+    msg.includes('payable_after')
+  );
+}
+
 /**
  * Record affiliate commission on paid subscription.
  * - Monthly: 30% on each payment within the recurring window (default 12 months).
@@ -422,7 +434,7 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
     const amountCents = Math.max(0, Number(opts.amountCents || 0) || 0);
     const commissionCents = amountCents > 0 ? Math.round(amountCents * rate) : 0;
 
-    const { error: insErr } = await supabaseAdmin.from('affiliate_commissions').insert({
+    const insertPayload = {
       affiliate_id: affiliate.id,
       referred_user_id: uid,
       plan_type: planType,
@@ -434,7 +446,23 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
       status,
       commission_kind: commissionKind,
       payable_after: payableAfter,
-    });
+    };
+
+    let { error: insErr } = await supabaseAdmin.from('affiliate_commissions').insert(insertPayload);
+    if (insErr && isAnnual && status === 'held' && affiliateCommissionSchemaError(insErr)) {
+      console.warn(
+        'recordAffiliateCommission: held/payable_after unavailable — run affiliates_program_v3.sql; falling back to pending',
+        insErr.message || insErr
+      );
+      status = 'pending';
+      payableAfter = null;
+      const { error: retryErr } = await supabaseAdmin.from('affiliate_commissions').insert({
+        ...insertPayload,
+        status: 'pending',
+        payable_after: null,
+      });
+      insErr = retryErr;
+    }
     if (insErr) {
       if (insErr.code === '23505') return { ok: true, duplicate: true };
       console.warn('recordAffiliateCommission insert error:', insErr.message || insErr);
@@ -12754,7 +12782,23 @@ app.post('/api/affiliate/apply', requireUser, async (req, res) => {
       return res.status(400).json({ error: 'You already have an active partner account.' });
     }
     if (existing?.status === 'pending') {
-      return res.json({ ok: true, status: 'pending', message: 'Your application is already pending review.' });
+      const now = new Date().toISOString();
+      await supabaseAdmin
+        .from('affiliates')
+        .update({ status: 'active', updated_at: now })
+        .eq('id', existing.id)
+        .eq('user_id', req.user.id);
+      return res.json({
+        ok: true,
+        status: 'active',
+        message: 'Your partner account is active. Open your dashboard to copy your referral link.',
+      });
+    }
+    if (existing?.status === 'disabled') {
+      return res.status(403).json({
+        error:
+          'Your partner account was deactivated. Contact us through the Contact page if you believe this is a mistake.',
+      });
     }
 
     const { data: slugTaken } = await supabaseAdmin
@@ -12767,23 +12811,8 @@ app.post('/api/affiliate/apply', requireUser, async (req, res) => {
     }
 
     const now = new Date().toISOString();
-    if (existing?.id && existing.status === 'disabled') {
-      const { error: updErr } = await supabaseAdmin
-        .from('affiliates')
-        .update({
-          slug,
-          email,
-          display_name: displayName || slug,
-          payout_email: payoutEmail,
-          status: 'pending',
-          user_id: req.user.id,
-          updated_at: now,
-        })
-        .eq('id', existing.id);
-      if (updErr) {
-        return res.status(500).json({ error: 'Failed to submit application' });
-      }
-      return res.json({ ok: true, status: 'pending', message: 'Application resubmitted. We will review it shortly.' });
+    if (existing?.id) {
+      return res.status(409).json({ error: 'You already have a partner record. Contact support if you need help.' });
     }
 
     const { error: insErr } = await supabaseAdmin.from('affiliates').insert({
@@ -12792,7 +12821,7 @@ app.post('/api/affiliate/apply', requireUser, async (req, res) => {
       display_name: displayName || slug,
       payout_email: payoutEmail,
       user_id: req.user.id,
-      status: 'pending',
+      status: 'active',
       commission_rate: DEFAULT_AFFILIATE_COMMISSION_RATE,
       recurring_months: null,
       created_at: now,
@@ -12806,8 +12835,8 @@ app.post('/api/affiliate/apply', requireUser, async (req, res) => {
     }
     return res.json({
       ok: true,
-      status: 'pending',
-      message: 'Application received. We will email you when your partner account is approved.',
+      status: 'active',
+      message: 'You are in! Open your dashboard to copy your referral link.',
     });
   } catch (err) {
     console.error('affiliate/apply error:', err);
@@ -12830,16 +12859,15 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
       });
     }
 
-    const status = String(affiliate.status || 'pending');
+    let status = String(affiliate.status || 'pending');
     if (status === 'pending') {
-      return res.json({
-        ok: true,
-        isAffiliate: false,
-        applicationStatus: 'pending',
-        isAdmin: isAffiliateAdminUser(req.user),
-        recurringMonthsDefault,
-        message: 'Your partner application is pending approval.',
-      });
+      const now = new Date().toISOString();
+      await supabaseAdmin
+        .from('affiliates')
+        .update({ status: 'active', updated_at: now })
+        .eq('id', affiliate.id);
+      status = 'active';
+      affiliate.status = 'active';
     }
     if (status === 'disabled') {
       return res.json({
@@ -12941,6 +12969,20 @@ app.get('/api/admin/affiliates/pending', requireUser, requireAffiliateAdmin, asy
   }
 });
 
+app.get('/api/admin/affiliates/active', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('affiliates')
+      .select('id, slug, email, display_name, payout_email, commission_rate, recurring_months, created_at, user_id')
+      .eq('status', 'active')
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: 'Failed to load active partners' });
+    return res.json({ ok: true, partners: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load active partners' });
+  }
+});
+
 app.post('/api/admin/affiliates/:id/approve', requireUser, requireAffiliateAdmin, async (req, res) => {
   try {
     const id = String(req.params.id || '').trim();
@@ -12978,6 +13020,26 @@ app.post('/api/admin/affiliates/:id/reject', requireUser, requireAffiliateAdmin,
     return res.json({ ok: true, affiliate: data });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to reject' });
+  }
+});
+
+app.post('/api/admin/affiliates/:id/disable', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'Missing id' });
+    const now = new Date().toISOString();
+    const { data, error } = await supabaseAdmin
+      .from('affiliates')
+      .update({ status: 'disabled', updated_at: now })
+      .eq('id', id)
+      .eq('status', 'active')
+      .select('id, slug, email')
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: 'Failed to disable partner' });
+    if (!data) return res.status(404).json({ error: 'Active partner not found or already disabled' });
+    return res.json({ ok: true, affiliate: data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to disable partner' });
   }
 });
 
@@ -14702,6 +14764,15 @@ app.post('/api/dodo/webhook', async (req, res) => {
             },
             { onConflict: 'id' }
           );
+          if (
+            eventType.includes('payment.succeeded') ||
+            eventType.includes('subscription.renewed')
+          ) {
+            await recordAffiliateCommissionOnPaidSubscription(userId, planType, {
+              ...affiliateCommissionOpts,
+              commissionKind: eventType.includes('subscription.renewed') ? 'renewal' : 'subscription',
+            });
+          }
           return res.json({ ok: true, action: 'reactivated_from_past_due', userId, planType });
         }
       }
@@ -14886,7 +14957,14 @@ app.post('/api/dodo/webhook', async (req, res) => {
     if (eventType.includes('refund')) {
       const refundPaymentId =
         extractDodoPaymentId(dataObj) ||
-        String(dataObj?.payment_id || dataObj?.original_payment_id || dataObj?.payment?.payment_id || '').trim() ||
+        String(
+          dataObj?.payment_id ||
+            dataObj?.original_payment_id ||
+            dataObj?.payment?.payment_id ||
+            dataObj?.payment?.id ||
+            metadata?.payment_id ||
+            ''
+        ).trim() ||
         null;
       if (refundPaymentId) {
         await voidAffiliateCommissionsForPayment(refundPaymentId);
