@@ -7598,12 +7598,12 @@ const STYLE_ON_IMAGE_TEXT_GUIDANCE = {
     'Generate a before/after or transformation headline (max 60 chars). Subheadline: contrast or outcome line with varied phrasing.',
   timeline_infographic:
     'Generate a step-by-step or roadmap headline (max 60 chars). Subheadline: guide framing — avoid repeating the same roadmap/steps cliché every time.',
-  grid_3_images: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
-  grid_4_images: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
-  stacked_strips: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
-  offset_collage_3: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
-  circle_cluster_4: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
-  step_cards_3: 'Generate a short bold headline about the topic. Max 60 chars. Subheadline: supporting line. Adapt to the article.',
+  grid_3_images: 'Generate a specific "3 ..." headline (e.g. "3 Ways to ...", "3 Ideas for ...") tied to the article. Max 60 chars. Vary the opening — do not reuse the same phrasing as other pins. Subheadline: concrete supporting line.',
+  grid_4_images: 'Generate a specific "4 ..." headline (e.g. "4 Tips ...", "4 Picks for ...") tied to the article. Max 60 chars. Vary the opening — do not reuse the same phrasing as other pins. Subheadline: concrete supporting line.',
+  stacked_strips: 'Generate a concrete, specific headline naming the subject or outcome (not a generic hype verb). Max 60 chars. Vary the opening across pins. Subheadline: supporting line.',
+  offset_collage_3: 'Generate a concrete, specific headline about the article. Max 60 chars. Lead with the subject, a number, or an outcome — not "elevate/transform/discover". Subheadline: supporting line.',
+  circle_cluster_4: 'Generate a concrete, specific headline about the article. Max 60 chars. Lead with the subject, a number, or an outcome — not a generic hype verb. Subheadline: supporting line.',
+  step_cards_3: 'Generate a specific "3 steps/ways" headline tied to the article. Max 60 chars. Vary the opening across pins. Subheadline: supporting line.',
 };
 
 async function generateStyleOnImageText({
@@ -7648,7 +7648,9 @@ async function generateStyleOnImageText({
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content }],
       max_tokens: 120,
-      temperature: 0.8,
+      temperature: 0.9,
+      frequency_penalty: 0.5,
+      presence_penalty: 0.4,
     });
     const raw = completion.choices?.[0]?.message?.content?.trim() || '';
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -7711,17 +7713,20 @@ async function generateMultiProductHeadline({ mode, items, outputLanguage }, ope
           : 'Which One Should You Buy?')
       : `${count} Top Picks Worth Buying`;
   if (!openaiClient || !safeItems.length) return fallback.slice(0, 70);
+  const antiHype = `Do NOT open with overused hype verbs like "Elevate", "Transform", "Discover", "Unlock", "Upgrade", "Experience", or "Ultimate"; lead with the products, a number, or a question.\n`;
   const instruction =
     mode === 'comparison'
-      ? `Write ONE punchy Pinterest pin headline (max 8 words) comparing these two products. Use a "X vs Y" angle ending in a question or hook. Do not mention any quantity or count. No quotes, no emojis.\n`
+      ? `Write ONE punchy Pinterest pin headline (max 8 words) comparing these two products. Use a "X vs Y" angle ending in a question or hook. Do not mention any quantity or count. No quotes, no emojis.\n${antiHype}`
       : `Write ONE punchy Pinterest pin headline (max 8 words) for a product roundup / gift guide of the items below. ` +
-        `There are EXACTLY ${count} product${count === 1 ? '' : 's'}. If the headline includes a number, that number MUST be ${count} — never use any other number. No quotes, no emojis.\n`;
+        `There are EXACTLY ${count} product${count === 1 ? '' : 's'}. If the headline includes a number, that number MUST be ${count} — never use any other number. No quotes, no emojis.\n${antiHype}`;
   try {
     const completion = await openaiClient.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content: `${instruction}${langLine}Products:\n${titles}` }],
       max_tokens: 40,
-      temperature: 0.8,
+      temperature: 0.9,
+      frequency_penalty: 0.4,
+      presence_penalty: 0.3,
     });
     let h = String(completion.choices?.[0]?.message?.content || '').trim();
     h = h.replace(/^["'`\s]+|["'`\s]+$/g, '').replace(/[\r\n]+/g, ' ').slice(0, 80);
@@ -10520,7 +10525,7 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
       : '';
 
     const prompt = type === 'title'
-      ? `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. Curiosity-driven, descriptive, use emotional triggers or questions. Only return the title, nothing else. Avoid quotes.${varietyHint}\n\n${contentBase}`
+      ? `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. Curiosity-driven, descriptive, use questions, numbers, or a specific outcome. Do NOT open with overused hype verbs like "Elevate", "Transform", "Discover", "Unlock", "Upgrade", "Experience", or "Ultimate"; lead with the concrete subject, a number, a question, or a result. Only return the title, nothing else. Avoid quotes.${varietyHint}\n\n${contentBase}`
       : `Write an engaging Pinterest pin description (max 450 characters) for this content. Explain the benefit or insight. No URLs or "visit/click" CTAs. Include 4–6 relevant hashtags at the end. Only return the description.${varietyHint}\n\n${contentBase}`;
 
     const languageLine =
@@ -10571,6 +10576,8 @@ app.post('/api/urltopin/regenerate-metadata', requireUser, async (req, res) => {
         messages: [{ role: 'user', content: effectivePrompt }],
         max_tokens: type === 'title' ? 150 : 500,
         temperature: 0.85,
+        frequency_penalty: type === 'title' ? 0.5 : 0.3,
+        presence_penalty: type === 'title' ? 0.4 : 0.2,
       });
       return String(completion.choices?.[0]?.message?.content || '').trim();
     };
@@ -12223,8 +12230,8 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
   const prompt = type === 'title'
     ? (
       isShortTitle
-        ? `Write a concise Pinterest pin title (max 50 characters). Focus on the main keyword and benefit. No quotes or hashtags. Return only the title.${languageLine}\n${content}`
-        : `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Include emotional triggers, urgency, numbers, or questions where possible. Make it descriptive and specific rather than generic. Use engaging words that create intrigue. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:${languageLine}\n${content}`
+        ? `Write a concise Pinterest pin title (max 50 characters). Focus on the main keyword and benefit. Do NOT open with generic hype verbs like "Elevate", "Transform", "Discover", "Unlock", "Upgrade", "Experience", or "Ultimate" — lead with the concrete subject, a number, or a question. No quotes or hashtags. Return only the title.${languageLine}\n${content}`
+        : `Write a compelling Pinterest pin title (aim for 80-100 characters) for this content. The title should be curiosity-driven and make people want to click to learn more. Use numbers, questions, or a specific outcome where possible. Make it descriptive and specific rather than generic. Do NOT open with overused hype verbs like "Elevate", "Transform", "Discover", "Unlock", "Unleash", "Upgrade", "Experience", "Revolutionize", or "Ultimate"; lead with the concrete subject, a number, a question, or a specific result, and vary how the title begins. Only return the title, nothing else. Avoid quotes but you can use basic punctuation like periods, commas, exclamation points, and question marks:${languageLine}\n${content}`
     )
     : `Write an engaging Pinterest pin description (max 450 characters) for this content. The description should explain the benefit or insight the user will get by clicking. Avoid phrases like "+visit site+", "+click the link+", or adding URLs. Include 4–6 relevant hashtags at the end. Only return the description, nothing else:${languageLine}\n${content}`;
   try {
@@ -12272,7 +12279,9 @@ app.post('/api/generate-field', requireUser, async (req, res) => {
         model: 'gpt-4o-mini',
         messages: [{ role: 'user', content: effectivePrompt }],
       max_tokens: type === 'title' ? 150 : 500,
-      temperature: 0.7,
+      temperature: type === 'title' ? 0.85 : 0.7,
+      frequency_penalty: type === 'title' ? 0.5 : 0.3,
+      presence_penalty: type === 'title' ? 0.4 : 0.2,
       });
       return completion.choices?.[0]?.message?.content?.trim() || '';
     };

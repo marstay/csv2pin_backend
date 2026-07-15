@@ -58,10 +58,10 @@ Image prompt: Structured composition, multiple elements or sections, clean and o
   lifestyle: {
     goal: 'engagement',
     rules: `Goal: Increase engagement and relatability.
-- Use emotional or aspirational tone
-- Show real-life usage or scenario
+- Use a warm, relatable tone grounded in a specific real-life moment or scenario (name the situation, room, routine, or feeling)
+- Aspirational is fine, but express it through concrete detail — NOT generic hype verbs like "elevate", "transform", or "upgrade your life"
 - Avoid aggressive marketing language
-Overlay text: Soft, natural phrasing
+Overlay text: Soft, natural phrasing; lead with the concrete scene or benefit, not a hype verb
 Image prompt: Real-life setting, natural lighting, human presence if relevant`,
   },
   clean_authority: {
@@ -697,7 +697,11 @@ function shuffleCopy(arr) {
 }
 
 /** Shared instruction for LLM + image prompts: block overused Pinterest hooks. */
-const PIN_COPY_ANTI_CLICHE_INSTRUCTION = `ANTI-CLICHÉ: Do not use these exact phrases or tired close variants: "most people get this wrong", "check before you decide", "here's what actually works", "the truth about … they don't tell you", "stop wasting time and money", "do it the smart way instead", "key things you should know", "can you really trust", "get the real answer", "i tried … for 30 days", "here's what actually happened", "practical tips you can actually use", "plain-english guide, no fluff", "nobody talks about" (as empty hype). Write hooks that fit THIS article with fresh wording.`;
+const PIN_COPY_ANTI_CLICHE_INSTRUCTION = `ANTI-CLICHÉ: Do not use these exact phrases or tired close variants: "most people get this wrong", "check before you decide", "here's what actually works", "the truth about … they don't tell you", "stop wasting time and money", "do it the smart way instead", "key things you should know", "can you really trust", "get the real answer", "i tried … for 30 days", "here's what actually happened", "practical tips you can actually use", "plain-english guide, no fluff", "nobody talks about" (as empty hype). Write hooks that fit THIS article with fresh wording.
+
+BANNED OPENING WORDS: Do NOT start the title or overlay_headline with any of these overused verbs/words (or their close variants): "Elevate", "Transform", "Discover", "Unlock", "Unleash", "Upgrade", "Experience", "Revolutionize", "Boost", "Master", "Ultimate", "Effortless", "Supercharge", "Reveal", "Level up". Also avoid the pattern "Elevate/Transform/Upgrade your <noun>". Lead with the concrete subject, a number, a question, or a specific outcome instead.
+
+OPENING VARIETY: Vary how each headline/title BEGINS across the batch — do not start two pins the same way. Rotate between: a number ("7 ..."), a question ("Why does ...?"), the concrete noun/subject first, a "How to ..." frame, a specific outcome, or a contrast ("X vs Y"). Prefer plain, specific language over generic hype verbs.`;
 
 /**
  * Pick an angle based on strategy, content profile, and already used angles.
@@ -912,7 +916,9 @@ async function generateStrategicPinMetadata(
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 500,
-      temperature: 0.8,
+      temperature: 0.9,
+      frequency_penalty: 0.5,
+      presence_penalty: 0.4,
     });
     const raw = completion.choices?.[0]?.message?.content?.trim() || '';
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
