@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-15T11:04:46.162Z",
+  "generatedAt": "2026-07-16T15:42:21.845Z",
   "season": "Summer",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -13,7 +13,7 @@
       "category": "amazon",
       "title": "Nails",
       "badge": "trending",
-      "overview": "Pinterest US searches for “nails” are up (2% week-over-week, 10% month-over-month, 4% year-over-year) in Pinterest’s monthly trends feed.",
+      "overview": "Pinterest US searches for “nails” are up (2% week-over-week, 9% month-over-month, 4% year-over-year) in Pinterest’s monthly trends feed.",
       "pinterestAngle": "Search demand is rising on Pinterest now — pins that match “nails” can ride current discovery.",
       "audience": "Amazon affiliates who can match pins to buyer-intent products for this search theme.",
       "productSearchQueries": [
@@ -30,7 +30,7 @@
         "trendType": "monthly",
         "keyword": "nails",
         "pctGrowthWow": 2,
-        "pctGrowthMom": 10,
+        "pctGrowthMom": 9,
         "pctGrowthYoy": 4,
         "timeSeries": {
           "2025-07-18": 91,
@@ -75,7 +75,7 @@
           "2026-04-17": 84,
           "2026-04-24": 88,
           "2026-05-01": 89,
-          "2026-05-08": 90,
+          "2026-05-08": 89,
           "2026-05-15": 90,
           "2026-05-22": 86,
           "2026-05-29": 71,
@@ -89,64 +89,28 @@
       },
       "suggestions": [
         {
-          "id": "B0D1CB3K11",
-          "title": "Beetles Soft Gel Nail Tips Short Almond 288pcs in 12 Sizes, Etch-X Pre-Etched Full Cover Acrylic Fake Nails Art, Salon Q",
-          "url": "https://www.amazon.com/dp/B0D1CB3K11",
-          "imageUrl": "https://m.media-amazon.com/images/I/81DbhH-PKHL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "nails",
+          "url": "https://www.amazon.com/s?k=nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0CHHX1PZC",
-          "title": "Wensilon 430pcs Stainless Steel 304 Nails Kit, Hanging Nails Kit, Wall Nails Kit, Dowels Kit, Long Nails Kit",
-          "url": "https://www.amazon.com/dp/B0CHHX1PZC",
-          "imageUrl": "https://m.media-amazon.com/images/I/71xXgjDxbuL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "nails gifts",
+          "url": "https://www.amazon.com/s?k=nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B08BJC6MJC",
-          "title": "Mr. Pen- Nail Assortment Kit, 600 pcs, 4 Sizes, Silver Picture Hangers | Small Nails for Hanging Pictures, Finishing Nai",
-          "url": "https://www.amazon.com/dp/B08BJC6MJC",
-          "imageUrl": "https://m.media-amazon.com/images/I/81yP7WIkrVL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best nails",
+          "url": "https://www.amazon.com/s?k=best%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0FNWTNXM3",
-          "title": "LPOODDNU Press on Nails",
-          "url": "https://www.amazon.com/dp/B0FNWTNXM3",
-          "imageUrl": "https://m.media-amazon.com/images/I/61UWot0bM-L._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0B6CLFY48",
-          "title": "UNA GELLA Short Almond Nail Tips: 504PCS Short Fake Nails Soft Press On Gel Nail Tips Pre Shaped Almond Shape Home Nail ",
-          "url": "https://www.amazon.com/dp/B0B6CLFY48",
-          "imageUrl": "https://m.media-amazon.com/images/I/711zcjo2TOL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0CMHHDYFJ",
-          "title": "WOXVM Premium Manicure Set, 7 in 1 Professional Nail Clippers Scissors Pedicure Kit, Stainless Steel Cuticle Nail Care T",
-          "url": "https://www.amazon.com/dp/B0CMHHDYFJ",
-          "imageUrl": "https://m.media-amazon.com/images/I/717cqSIoaPL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0C9C245NH",
-          "title": "ANGNYA Nail Dust Brush, Pink Rose Soft Duster Brush Art Dust Powder Remover Makeup Manicure Brushes Clean Up Tools for A",
-          "url": "https://www.amazon.com/dp/B0C9C245NH",
-          "imageUrl": "https://m.media-amazon.com/images/I/710FN-OU1QL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0FSJL33F9",
-          "title": "Teenitor Nail Charms and Nail Art Tools Set, Nail Art Kit with 5 Boxes of 3D Nail Charms and Gems Rhinestones, 15 Pcs Na",
-          "url": "https://www.amazon.com/dp/B0FSJL33F9",
-          "imageUrl": "https://m.media-amazon.com/images/I/91YhB3z-RBL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GC5L6T63",
-          "title": "GSPY Scented Candle - Nail Tech Gifts for Women, Men - Nail Technician Gifts, Salon Decor - Funny Birthday, Appreciation",
-          "url": "https://www.amazon.com/dp/B0GC5L6T63",
-          "imageUrl": "https://m.media-amazon.com/images/I/71deW872UoL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0DLKM7PV2",
-          "title": "Teenitor Nail Charms Nail Gems with 15 Sheets Gold Nail Stickers, 6 Boxes of Rhinestones for Nails Art Tools, 3D Nail De",
-          "url": "https://www.amazon.com/dp/B0DLKM7PV2",
-          "imageUrl": "https://m.media-amazon.com/images/I/912v3WMdqYL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "nails ideas",
+          "url": "https://www.amazon.com/s?k=nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
@@ -446,28 +410,64 @@
       },
       "suggestions": [
         {
-          "id": "amazon-search-0",
-          "title": "fourth of july nails",
-          "url": "https://www.amazon.com/s?k=fourth%20of%20july%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0G2MXFKKS",
+          "title": "xo, Fetti America 250 Nail Stickers - 948 Stickers, 4 Sheet Pack | USA Nails, Patriotic, 4th of July, Red White Blue, Am",
+          "url": "https://www.amazon.com/dp/B0G2MXFKKS",
+          "imageUrl": "https://m.media-amazon.com/images/I/71asbtSkKkL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-1",
-          "title": "fourth of july nails gifts",
-          "url": "https://www.amazon.com/s?k=fourth%20of%20july%20nails%20gifts",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GV3Y2ZL8",
+          "title": "4th of July Press on Nails Medium Oval Fake Nails French Tip Glue on Nail with Star | Polka Dot | Bow Designs Independen",
+          "url": "https://www.amazon.com/dp/B0GV3Y2ZL8",
+          "imageUrl": "https://m.media-amazon.com/images/I/71tLK4qb8fL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-2",
-          "title": "best fourth of july nails",
-          "url": "https://www.amazon.com/s?k=best%20fourth%20of%20july%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GY1F5CZ3",
+          "title": "30pcs 4th of July Press on Nails Short Square Fake Nails with American Flag 3D Stripe Gold Star Design Independence Day ",
+          "url": "https://www.amazon.com/dp/B0GY1F5CZ3",
+          "imageUrl": "https://m.media-amazon.com/images/I/81YfjyJcZGL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-3",
-          "title": "fourth of july nails ideas",
-          "url": "https://www.amazon.com/s?k=fourth%20of%20july%20nails%20ideas",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0GT7G7LX3",
+          "title": "24Pcs 4th of July Press on Nails Short Square Fake Nails with Star Designs Patriotic False Nail for Women Stripe Acrylic",
+          "url": "https://www.amazon.com/dp/B0GT7G7LX3",
+          "imageUrl": "https://m.media-amazon.com/images/I/71jupxKbokL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GV3QRP2F",
+          "title": "4th of July Press on Nails Medium Oval Fake Nails with Designs Checkered | Star | American flag,Cute Reusable Independen",
+          "url": "https://www.amazon.com/dp/B0GV3QRP2F",
+          "imageUrl": "https://m.media-amazon.com/images/I/71MgfvYXE6L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GSFW51W5",
+          "title": "30 Sheets 4th of July Nail Stickers for Nail Art Independence Day Nails Art Stickers 3D Self Adhesive American Flag Star",
+          "url": "https://www.amazon.com/dp/B0GSFW51W5",
+          "imageUrl": "https://m.media-amazon.com/images/I/816nU21exRL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GX5M5VGT",
+          "title": "6 Sheets 4th of July Nail Stickers for Nail Art 3D Self-Adhesive American Flag Nail Art Stickers Independence Day Star R",
+          "url": "https://www.amazon.com/dp/B0GX5M5VGT",
+          "imageUrl": "https://m.media-amazon.com/images/I/81XG6MYYxzL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F2N6CMFH",
+          "title": "Tyuimhx 4th of July Press on Nails Medium Square Fake Nail Independence Day False Nails with American Flag Eagle Star St",
+          "url": "https://www.amazon.com/dp/B0F2N6CMFH",
+          "imageUrl": "https://m.media-amazon.com/images/I/71PLGoBkscL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F2NBRS25",
+          "title": "Fourth of July American Flag Press-On Toenails Short Square False Toenails Independence Day Glitter Full Coverage False ",
+          "url": "https://www.amazon.com/dp/B0F2NBRS25",
+          "imageUrl": "https://m.media-amazon.com/images/I/61JwIawBQjL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0F1TJR3X1",
+          "title": "6 Sheets 4th of July Nail Stickers for Nail Art 3D Self Adhesive Independence Day Nail Art Stickers American Flag Stars ",
+          "url": "https://www.amazon.com/dp/B0F1TJR3X1",
+          "imageUrl": "https://m.media-amazon.com/images/I/81EFInw8xuL._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"

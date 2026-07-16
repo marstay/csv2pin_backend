@@ -325,6 +325,19 @@ export async function getTrendsCatalog({ force = false, rereadDisk = false } = {
         const built = await buildAutomatedTrends();
         memoryCache = built;
         await writeCacheToDisk(built);
+        // Freshly regenerated: trigger a Netlify rebuild via the API so the new
+        // trends go live (the frontend prebuild re-fetches /api/trends). Fire-and-
+        // forget — never let a failed trigger affect trend generation.
+        const netlifyToken = process.env.NETLIFY_API_TOKEN;
+        const netlifySiteId = process.env.NETLIFY_SITE_ID;
+        if (netlifyToken && netlifySiteId) {
+          fetch(`https://api.netlify.com/api/v1/sites/${netlifySiteId}/builds`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${netlifyToken}` },
+          })
+            .then((r) => console.log('[trendsEngine] Netlify build triggered:', r.status))
+            .catch((e) => console.warn('[trendsEngine] build trigger failed:', e?.message || e));
+        }
         return built;
       } catch (e) {
         const disk = await readCacheFromDisk();
