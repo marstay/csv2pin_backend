@@ -6503,6 +6503,65 @@ async function rescheduleSpamBlockedPins(userId) {
   }
 }
 
+/**
+ * Normalize the many shapes the Pinterest v5 pin analytics endpoint can return into a
+ * flat metrics object, and report whether it actually contained usable metric data.
+ *
+ * Returning `hasData: false` lets callers SKIP writing to the DB instead of overwriting
+ * previously-good values with zeros when Pinterest returns an empty / not-yet-ready
+ * payload (a major cause of dashboards silently trending to zero).
+ *
+ * @param {any} analyticsData Parsed JSON body from Pinterest.
+ * @returns {{ hasData: boolean, metrics: { IMPRESSION:number, OUTBOUND_CLICK:number, SAVE:number, PIN_CLICK:number, CLOSEUP:number } }}
+ */
+function extractPinterestPinMetrics(analyticsData) {
+  const METRIC_KEYS = ['IMPRESSION', 'OUTBOUND_CLICK', 'SAVE', 'PIN_CLICK', 'CLOSEUP'];
+  const d = analyticsData && typeof analyticsData === 'object' ? analyticsData : {};
+  let metrics = null;
+
+  if (d.all_time && typeof d.all_time === 'object') {
+    metrics = d.all_time;
+  } else if (d.summary && typeof d.summary === 'object') {
+    metrics = d.summary;
+  } else if (d.all && d.all.summary_metrics && typeof d.all.summary_metrics === 'object') {
+    metrics = d.all.summary_metrics;
+  } else if (d.all && Array.isArray(d.all.daily_metrics)) {
+    const readyDays = d.all.daily_metrics.filter((day) => day && day.data_status === 'READY');
+    if (readyDays.length > 0) {
+      metrics = readyDays.reduce((acc, day) => {
+        acc.IMPRESSION = (acc.IMPRESSION || 0) + (day.metrics?.IMPRESSION || 0);
+        acc.SAVE = (acc.SAVE || 0) + (day.metrics?.SAVE || 0);
+        acc.PIN_CLICK = (acc.PIN_CLICK || 0) + (day.metrics?.PIN_CLICK || 0);
+        acc.OUTBOUND_CLICK = (acc.OUTBOUND_CLICK || 0) + (day.metrics?.OUTBOUND_CLICK || 0);
+        acc.CLOSEUP = (acc.CLOSEUP || 0) + (day.metrics?.CLOSEUP || 0);
+        return acc;
+      }, {});
+    }
+  } else if (d.all && typeof d.all === 'object') {
+    metrics = d.all;
+  } else if (d.summary_metrics && typeof d.summary_metrics === 'object') {
+    metrics = d.summary_metrics;
+  }
+
+  // Last resort: metric keys living directly on the root object.
+  if (!metrics && METRIC_KEYS.some((k) => typeof d[k] === 'number')) {
+    metrics = d;
+  }
+
+  const hasData = !!metrics && METRIC_KEYS.some((k) => typeof metrics[k] === 'number');
+  const safe = metrics || {};
+  return {
+    hasData,
+    metrics: {
+      IMPRESSION: safe.IMPRESSION || 0,
+      OUTBOUND_CLICK: safe.OUTBOUND_CLICK || 0,
+      SAVE: safe.SAVE || 0,
+      PIN_CLICK: safe.PIN_CLICK || 0,
+      CLOSEUP: safe.CLOSEUP || 0,
+    },
+  };
+}
+
 // Background job processor for Pinterest analytics sync
 async function processAnalyticsSync() {
   console.log('📊 Processing automatic Pinterest analytics sync...');
@@ -6554,17 +6613,20 @@ async function processAnalyticsSync() {
     // Process each user's analytics
     for (const userId of userIds) {
       try {
-        // Resolve the correct Pinterest access token for this user
-        const accessToken = await getPinterestAccessTokenForUser(userId, null);
+        // Resolve the correct Pinterest account + access token for this user.
+        // We keep the account so we can reactively refresh the token on 401s.
+        const { account, accessToken } = await resolvePinterestAccountAndToken(userId, null);
         if (!accessToken) {
           console.log(`⚠️ No Pinterest access token for user ${userId}, skipping analytics sync`);
           continue;
         }
-        await syncUserAnalytics(userId, accessToken);
+        await syncUserAnalytics(userId, accessToken, account);
         // Add delay between users to respect rate limits
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
-        console.error(`❌ Error syncing analytics for user ${userPin.user_id}:`, error);
+        // NOTE: previously referenced an undefined `userPin`, which threw inside the
+        // catch and aborted the whole sync loop (starving every remaining user).
+        console.error(`❌ Error syncing analytics for user ${userId}:`, error?.message || error);
       }
     }
 
@@ -6575,20 +6637,28 @@ async function processAnalyticsSync() {
   }
 }
 
-async function syncUserAnalytics(userId, accessToken) {
+async function syncUserAnalytics(userId, accessToken, account = null) {
   if (!accessToken) {
     console.log(`⚠️ No access token found for user ${userId}, skipping`);
     return;
   }
+  // Mutable token so we can swap it in after a reactive refresh on 401.
+  let token = accessToken;
+  let refreshAttempted = false;
 
-  // Get all posted pins for this user that haven't been updated in 12+ hours
+  // Per-run cap keeps us well under Pinterest rate limits while covering far more than the
+  // old hard limit of 10. We order stalest-first (least-recently-synced, nulls first) so
+  // every pin gets refreshed over successive runs instead of only the first arbitrary 10.
+  const MAX_PINS_PER_USER_PER_RUN = 100;
+
   const { data: scheduledPins, error: scheduledError } = await supabaseAdmin
     .from('scheduled_pins')
     .select('id, pinterest_pin_id, metrics_last_updated')
     .eq('user_id', userId)
     .eq('status', 'posted')
     .not('pinterest_pin_id', 'is', null)
-    .limit(10); // Limit per user to avoid rate limits
+    .order('metrics_last_updated', { ascending: true, nullsFirst: true })
+    .limit(MAX_PINS_PER_USER_PER_RUN);
 
   // Also get direct uploads from user_images
   const { data: userImagePins, error: userImagesError } = await supabaseAdmin
@@ -6597,7 +6667,8 @@ async function syncUserAnalytics(userId, accessToken) {
     .eq('user_id', userId)
     .eq('pinterest_uploaded', true)
     .not('pinterest_pin_id', 'is', null)
-    .limit(10);
+    .order('metrics_last_updated', { ascending: true, nullsFirst: true })
+    .limit(MAX_PINS_PER_USER_PER_RUN);
 
   // Combine both sources and deduplicate by pinterest_pin_id
   const allPins = [];
@@ -6651,73 +6722,66 @@ async function syncUserAnalytics(userId, accessToken) {
       
       const analyticsUrl = `https://api.pinterest.com/v5/pins/${pin.pinterest_pin_id}/analytics?start_date=${startDateStr}&end_date=${endDate}&metric_types=IMPRESSION,OUTBOUND_CLICK,SAVE,PIN_CLICK,CLOSEUP`;
       
-      const analyticsResponse = await fetch(analyticsUrl, {
+      let analyticsResponse = await fetch(analyticsUrl, {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${accessToken}`,
+          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
         }
       });
 
       if (!analyticsResponse.ok) {
-        console.error(`❌ Pinterest API error for pin ${pin.pinterest_pin_id}`);
-        continue;
+        let errBody = null;
+        try { errBody = await analyticsResponse.json(); } catch (_) {}
+
+        // Reactive token refresh: try once per user when the failure looks like auth.
+        if (account && !refreshAttempted && pinterestResponseIsAuthFailure(analyticsResponse.status, errBody)) {
+          refreshAttempted = true;
+          const newToken = await pinterestRefreshAfterAuthFailure(account);
+          if (newToken) {
+            token = newToken;
+            console.log(`🔑 Refreshed Pinterest token for user ${userId}; retrying analytics sync`);
+            analyticsResponse = await fetch(analyticsUrl, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+              }
+            });
+          }
+        }
+
+        if (!analyticsResponse.ok) {
+          let body2 = errBody;
+          try { body2 = await analyticsResponse.json(); } catch (_) {}
+          const detail = body2?.message || body2?.error || '';
+          console.error(`❌ Pinterest analytics API error for pin ${pin.pinterest_pin_id}: status ${analyticsResponse.status}${detail ? ` — ${detail}` : ''}`);
+          // If auth is still failing after a refresh attempt, every remaining pin for this
+          // user will fail too — stop here so the account can be reconnected.
+          if (pinterestResponseIsAuthFailure(analyticsResponse.status, body2)) {
+            console.warn(`⚠️ Pinterest auth still failing for user ${userId}; account likely needs reconnect. Halting this user's sync.`);
+            break;
+          }
+          continue;
+        }
       }
 
       const analyticsData = await analyticsResponse.json();
-      
-      // Handle different Pinterest API response formats
-      let metrics = {};
-      console.log(`📊 Raw Pinterest API response for pin ${pin.pinterest_pin_id}:`, JSON.stringify(analyticsData, null, 2));
-      
-      // Try different response structures Pinterest might use
-      if (analyticsData.all_time) {
-        metrics = analyticsData.all_time;
-        console.log(`📊 Using all_time structure for pin ${pin.pinterest_pin_id}:`, metrics);
-      } else if (analyticsData.summary) {
-        metrics = analyticsData.summary;
-        console.log(`📊 Using summary structure for pin ${pin.pinterest_pin_id}:`, metrics);
-      } else if (analyticsData.all && analyticsData.all.summary_metrics) {
-        metrics = analyticsData.all.summary_metrics;
-        console.log(`📊 Using all.summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
-      } else if (analyticsData.all && analyticsData.all.daily_metrics) {
-        // Try daily metrics if summary_metrics is empty
-        const dailyMetrics = analyticsData.all.daily_metrics;
-        if (Array.isArray(dailyMetrics) && dailyMetrics.length > 0) {
-          // Sum up daily metrics
-          metrics = dailyMetrics.reduce((acc, day) => {
-            if (day.data_status === 'READY') {
-              acc.IMPRESSION = (acc.IMPRESSION || 0) + (day.metrics?.IMPRESSION || 0);
-              acc.SAVE = (acc.SAVE || 0) + (day.metrics?.SAVE || 0);
-              acc.PIN_CLICK = (acc.PIN_CLICK || 0) + (day.metrics?.PIN_CLICK || 0);
-              acc.OUTBOUND_CLICK = (acc.OUTBOUND_CLICK || 0) + (day.metrics?.OUTBOUND_CLICK || 0);
-              acc.CLOSEUP = (acc.CLOSEUP || 0) + (day.metrics?.CLOSEUP || 0);
-            }
-            return acc;
-          }, {});
-          console.log(`📊 Using summed daily_metrics for pin ${pin.pinterest_pin_id}:`, metrics);
-        }
-      } else if (analyticsData.all) {
-        // Try the all object directly
-        metrics = analyticsData.all;
-        console.log(`📊 Using all structure directly for pin ${pin.pinterest_pin_id}:`, metrics);
-      } else if (analyticsData.summary_metrics) {
-        metrics = analyticsData.summary_metrics;
-        console.log(`📊 Using summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
-      } else {
-        metrics = analyticsData;
-        console.log(`📊 Using root structure for pin ${pin.pinterest_pin_id}:`, metrics);
+      const { hasData, metrics } = extractPinterestPinMetrics(analyticsData);
+
+      // Do NOT overwrite previously-good metrics with zeros when Pinterest returns an
+      // empty / not-yet-ready payload. Skip the write and let a later run pick it up.
+      if (!hasData) {
+        console.log(`📊 No usable metrics returned for pin ${pin.pinterest_pin_id} yet; leaving existing values untouched`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
       }
-      
-      const impressions = metrics.IMPRESSION || 0;
-      const outboundClicks = metrics.OUTBOUND_CLICK || 0;
-      const saves = metrics.SAVE || 0;
-      const pinClicks = metrics.PIN_CLICK || 0;
-      const closeupViews = metrics.CLOSEUP || 0;
-      
-      console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, {
-        impressions, outboundClicks, saves, pinClicks, closeupViews, rawMetrics: metrics
-      });
+
+      const impressions = metrics.IMPRESSION;
+      const outboundClicks = metrics.OUTBOUND_CLICK;
+      const saves = metrics.SAVE;
+      const pinClicks = metrics.PIN_CLICK;
+      const closeupViews = metrics.CLOSEUP;
       
       // Calculate engagement metrics
       const engagementRate = impressions > 0 ? ((saves + pinClicks) / impressions) * 100 : 0;
@@ -15486,7 +15550,14 @@ function extractAccountId(req) {
   return req.query.account_id || req.body?.account_id || null;
 }
 
-async function getPinterestAccessTokenForUser(userId, accountId) {
+/**
+ * Resolve both the Pinterest account row AND a usable (proactively-refreshed) access token
+ * for a user. Returning the account lets callers reactively refresh on a later 401.
+ * Legacy profile tokens have no associated account row, so `account` is null in that case.
+ *
+ * @returns {Promise<{ account: { id:string, access_token?:string|null, refresh_token?:string|null, token_expires_at?:string|null } | null, accessToken: string | null }>}
+ */
+async function resolvePinterestAccountAndToken(userId, accountId = null) {
   if (accountId) {
     const { data: account } = await supabaseAdmin
       .from('pinterest_accounts')
@@ -15494,9 +15565,9 @@ async function getPinterestAccessTokenForUser(userId, accountId) {
       .eq('id', accountId)
       .eq('user_id', userId)
       .single();
-    if (!account) return null;
+    if (!account) return { account: null, accessToken: null };
     const { accessToken } = await ensureValidPinterestAccessToken(account);
-    return accessToken || null;
+    return { account, accessToken: accessToken || null };
   }
 
   const { data: accounts } = await supabaseAdmin
@@ -15508,16 +15579,21 @@ async function getPinterestAccessTokenForUser(userId, accountId) {
     .limit(1);
   if (accounts?.[0]) {
     const { accessToken } = await ensureValidPinterestAccessToken(accounts[0]);
-    if (accessToken) return accessToken;
+    if (accessToken) return { account: accounts[0], accessToken };
   }
 
-  // Legacy single-token on profiles
+  // Legacy single-token on profiles (no account row to refresh against)
   const { data: profile } = await supabaseAdmin
     .from('profiles')
     .select('pinterest_access_token')
     .eq('id', userId)
     .single();
-  return profile?.pinterest_access_token || null;
+  return { account: null, accessToken: profile?.pinterest_access_token || null };
+}
+
+async function getPinterestAccessTokenForUser(userId, accountId) {
+  const { accessToken } = await resolvePinterestAccountAndToken(userId, accountId);
+  return accessToken || null;
 }
 
 /** Pinterest GET /v5/boards is paginated; first page alone misses boards when user has > page_size. */
@@ -17029,10 +17105,13 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
   console.log(`📊 Manual sync requested by user ${user.id} with force_sync: ${force_sync}`);
 
   try {
-    const accessToken = await getPinterestAccessTokenForUser(user.id, account_id);
+    const { account, accessToken } = await resolvePinterestAccountAndToken(user.id, account_id);
     if (!accessToken) {
       return res.status(400).json({ error: 'No Pinterest access token found' });
     }
+    // Mutable token so we can swap it in after a reactive refresh on 401.
+    let token = accessToken;
+    let refreshAttempted = false;
 
     // Get posted pins with pagination when force_sync is requested
     let postedPins = [];
@@ -17184,65 +17263,52 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
         
         console.log(`🔗 Analytics URL for pin ${pin.pinterest_pin_id}: ${analyticsUrl}`);
         
-        const analyticsResponse = await fetch(analyticsUrl, {
+        let analyticsResponse = await fetch(analyticsUrl, {
           method: 'GET',
           headers: {
-            'Authorization': `Bearer ${accessToken}`,
+            'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json'
           }
         });
 
+        // Reactive token refresh: try once when the failure looks like auth.
+        if (!analyticsResponse.ok && account && !refreshAttempted) {
+          let authErrBody = null;
+          try { authErrBody = await analyticsResponse.clone().json(); } catch (_) {}
+          if (pinterestResponseIsAuthFailure(analyticsResponse.status, authErrBody)) {
+            refreshAttempted = true;
+            const newToken = await pinterestRefreshAfterAuthFailure(account);
+            if (newToken) {
+              token = newToken;
+              console.log(`🔑 Refreshed Pinterest token for user ${user.id}; retrying force sync`);
+              analyticsResponse = await fetch(analyticsUrl, {
+                method: 'GET',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json'
+                }
+              });
+            }
+          }
+        }
+
         if (analyticsResponse.ok) {
           const analyticsData = await analyticsResponse.json();
-          console.log(`📊 Raw Pinterest API response for pin ${pin.pinterest_pin_id}:`, JSON.stringify(analyticsData, null, 2));
-          
-          // Handle different Pinterest API response formats
-          let metrics = {};
-          
-          // Try different response structures Pinterest might use
-          if (analyticsData.all_time) {
-            metrics = analyticsData.all_time;
-            console.log(`📊 Using all_time structure for pin ${pin.pinterest_pin_id}:`, metrics);
-          } else if (analyticsData.summary) {
-            metrics = analyticsData.summary;
-            console.log(`📊 Using summary structure for pin ${pin.pinterest_pin_id}:`, metrics);
-          } else if (analyticsData.all && analyticsData.all.summary_metrics) {
-            metrics = analyticsData.all.summary_metrics;
-            console.log(`📊 Using all.summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
-          } else if (analyticsData.all && analyticsData.all.daily_metrics) {
-            // Try daily metrics if summary_metrics is empty
-            const dailyMetrics = analyticsData.all.daily_metrics;
-            if (Array.isArray(dailyMetrics) && dailyMetrics.length > 0) {
-              // Sum up daily metrics
-              metrics = dailyMetrics.reduce((acc, day) => {
-                if (day.data_status === 'READY') {
-                  acc.IMPRESSION = (acc.IMPRESSION || 0) + (day.metrics?.IMPRESSION || 0);
-                  acc.SAVE = (acc.SAVE || 0) + (day.metrics?.SAVE || 0);
-                  acc.PIN_CLICK = (acc.PIN_CLICK || 0) + (day.metrics?.PIN_CLICK || 0);
-                  acc.OUTBOUND_CLICK = (acc.OUTBOUND_CLICK || 0) + (day.metrics?.OUTBOUND_CLICK || 0);
-                  acc.CLOSEUP = (acc.CLOSEUP || 0) + (day.metrics?.CLOSEUP || 0);
-                }
-                return acc;
-              }, {});
-              console.log(`📊 Using summed daily_metrics for pin ${pin.pinterest_pin_id}:`, metrics);
-            }
-          } else if (analyticsData.all) {
-            // Try the all object directly
-            metrics = analyticsData.all;
-            console.log(`📊 Using all structure directly for pin ${pin.pinterest_pin_id}:`, metrics);
-          } else if (analyticsData.summary_metrics) {
-            metrics = analyticsData.summary_metrics;
-            console.log(`📊 Using summary_metrics structure for pin ${pin.pinterest_pin_id}:`, metrics);
-          } else {
-            metrics = analyticsData;
-            console.log(`📊 Using root structure for pin ${pin.pinterest_pin_id}:`, metrics);
+          const { hasData, metrics } = extractPinterestPinMetrics(analyticsData);
+
+          // Do NOT overwrite previously-good metrics with zeros when Pinterest returns an
+          // empty / not-yet-ready payload. Skip this pin and let a later run pick it up.
+          if (!hasData) {
+            console.log(`📊 No usable metrics returned for pin ${pin.pinterest_pin_id} yet; leaving existing values untouched`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            continue;
           }
-          
-          const impressions = metrics.IMPRESSION || 0;
-          const outboundClicks = metrics.OUTBOUND_CLICK || 0;
-          const saves = metrics.SAVE || 0;
-          const pinClicks = metrics.PIN_CLICK || 0;
-          const closeupViews = metrics.CLOSEUP || 0;
+
+          const impressions = metrics.IMPRESSION;
+          const outboundClicks = metrics.OUTBOUND_CLICK;
+          const saves = metrics.SAVE;
+          const pinClicks = metrics.PIN_CLICK;
+          const closeupViews = metrics.CLOSEUP;
           
           console.log(`📊 Extracted metrics for pin ${pin.pinterest_pin_id}:`, {
             impressions, outboundClicks, saves, pinClicks, closeupViews, rawMetrics: metrics
@@ -17325,12 +17391,20 @@ app.post('/api/pinterest/sync-analytics', async (req, res) => {
           
         } else {
           const errorData = await analyticsResponse.json().catch(() => ({}));
-          const errorMsg = errorData.message || 'API error';
+          const errorMsg = errorData.message || errorData.error || 'API error';
           errors.push(`Pin ${pin.pinterest_pin_id}: ${errorMsg}`);
-          console.error(`❌ Failed to fetch analytics for pin ${pin.pinterest_pin_id}:`, errorData);
-          
+          console.error(`❌ Failed to fetch analytics for pin ${pin.pinterest_pin_id}: status ${analyticsResponse.status}`, errorData);
+
+          // If auth is still failing after a refresh attempt, every remaining pin will
+          // fail too — stop and surface a clear "reconnect" signal.
+          if (pinterestResponseIsAuthFailure(analyticsResponse.status, errorData)) {
+            errors.push('Pinterest authentication failed — please reconnect your Pinterest account in My Account.');
+            console.warn(`⚠️ Pinterest auth still failing for user ${user.id}; halting force sync.`);
+            break;
+          }
+
           // If it's a date range error, log helpful info
-          if (errorMsg.includes('90 days')) {
+          if (String(errorMsg).includes('90 days')) {
             console.log(`📅 Note: Pinterest API only allows data from the last 90 days for pin ${pin.pinterest_pin_id}`);
           }
         }

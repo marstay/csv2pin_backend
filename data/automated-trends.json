@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-15T06:29:45.598Z",
+  "generatedAt": "2026-07-15T11:04:46.162Z",
   "season": "Summer",
   "source": "pinterest_trends",
   "dataProviders": [
@@ -89,28 +89,64 @@
       },
       "suggestions": [
         {
-          "id": "amazon-search-0",
-          "title": "nails",
-          "url": "https://www.amazon.com/s?k=nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0D1CB3K11",
+          "title": "Beetles Soft Gel Nail Tips Short Almond 288pcs in 12 Sizes, Etch-X Pre-Etched Full Cover Acrylic Fake Nails Art, Salon Q",
+          "url": "https://www.amazon.com/dp/B0D1CB3K11",
+          "imageUrl": "https://m.media-amazon.com/images/I/81DbhH-PKHL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-1",
-          "title": "nails gifts",
-          "url": "https://www.amazon.com/s?k=nails%20gifts",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0CHHX1PZC",
+          "title": "Wensilon 430pcs Stainless Steel 304 Nails Kit, Hanging Nails Kit, Wall Nails Kit, Dowels Kit, Long Nails Kit",
+          "url": "https://www.amazon.com/dp/B0CHHX1PZC",
+          "imageUrl": "https://m.media-amazon.com/images/I/71xXgjDxbuL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-2",
-          "title": "best nails",
-          "url": "https://www.amazon.com/s?k=best%20nails",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B08BJC6MJC",
+          "title": "Mr. Pen- Nail Assortment Kit, 600 pcs, 4 Sizes, Silver Picture Hangers | Small Nails for Hanging Pictures, Finishing Nai",
+          "url": "https://www.amazon.com/dp/B08BJC6MJC",
+          "imageUrl": "https://m.media-amazon.com/images/I/81yP7WIkrVL._AC_UL320_.jpg"
         },
         {
-          "id": "amazon-search-3",
-          "title": "nails ideas",
-          "url": "https://www.amazon.com/s?k=nails%20ideas",
-          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
+          "id": "B0FNWTNXM3",
+          "title": "LPOODDNU Press on Nails",
+          "url": "https://www.amazon.com/dp/B0FNWTNXM3",
+          "imageUrl": "https://m.media-amazon.com/images/I/61UWot0bM-L._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0B6CLFY48",
+          "title": "UNA GELLA Short Almond Nail Tips: 504PCS Short Fake Nails Soft Press On Gel Nail Tips Pre Shaped Almond Shape Home Nail ",
+          "url": "https://www.amazon.com/dp/B0B6CLFY48",
+          "imageUrl": "https://m.media-amazon.com/images/I/711zcjo2TOL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0CMHHDYFJ",
+          "title": "WOXVM Premium Manicure Set, 7 in 1 Professional Nail Clippers Scissors Pedicure Kit, Stainless Steel Cuticle Nail Care T",
+          "url": "https://www.amazon.com/dp/B0CMHHDYFJ",
+          "imageUrl": "https://m.media-amazon.com/images/I/717cqSIoaPL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0C9C245NH",
+          "title": "ANGNYA Nail Dust Brush, Pink Rose Soft Duster Brush Art Dust Powder Remover Makeup Manicure Brushes Clean Up Tools for A",
+          "url": "https://www.amazon.com/dp/B0C9C245NH",
+          "imageUrl": "https://m.media-amazon.com/images/I/710FN-OU1QL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0FSJL33F9",
+          "title": "Teenitor Nail Charms and Nail Art Tools Set, Nail Art Kit with 5 Boxes of 3D Nail Charms and Gems Rhinestones, 15 Pcs Na",
+          "url": "https://www.amazon.com/dp/B0FSJL33F9",
+          "imageUrl": "https://m.media-amazon.com/images/I/91YhB3z-RBL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0GC5L6T63",
+          "title": "GSPY Scented Candle - Nail Tech Gifts for Women, Men - Nail Technician Gifts, Salon Decor - Funny Birthday, Appreciation",
+          "url": "https://www.amazon.com/dp/B0GC5L6T63",
+          "imageUrl": "https://m.media-amazon.com/images/I/71deW872UoL._AC_UL320_.jpg"
+        },
+        {
+          "id": "B0DLKM7PV2",
+          "title": "Teenitor Nail Charms Nail Gems with 15 Sheets Gold Nail Stickers, 6 Boxes of Rhinestones for Nails Art Tools, 3D Nail De",
+          "url": "https://www.amazon.com/dp/B0DLKM7PV2",
+          "imageUrl": "https://m.media-amazon.com/images/I/912v3WMdqYL._AC_UL320_.jpg"
         }
       ],
       "source": "pinterest_trends"
@@ -624,64 +660,28 @@
       },
       "suggestions": [
         {
-          "id": "B0F4CZ9BM4",
-          "title": "Glamnetic Press On Nails - Salty Waves | Short Almond Starfish Fake Nails with 3D Nail Art, Salon Quality Summer Nails |",
-          "url": "https://www.amazon.com/dp/B0F4CZ9BM4",
-          "imageUrl": "https://m.media-amazon.com/images/I/71cx517ifoL._AC_UL320_.jpg"
+          "id": "amazon-search-0",
+          "title": "beach nails",
+          "url": "https://www.amazon.com/s?k=beach%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0FLDLFVDP",
-          "title": "HOSAILY Pink Press on Nails Short Almond Milky Butter Yellow French Tip Pink Ombre 3D Flower Gold Starfish Rhinestone Go",
-          "url": "https://www.amazon.com/dp/B0FLDLFVDP",
-          "imageUrl": "https://m.media-amazon.com/images/I/71m4KbLo0oL._AC_UL320_.jpg"
+          "id": "amazon-search-1",
+          "title": "beach nails gifts",
+          "url": "https://www.amazon.com/s?k=beach%20nails%20gifts",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0FP9DMCVS",
-          "title": "30Pcs Summer Beach Press on Nails Almond Medium Fake Nails Blue Sea French False Nails Press ons Ocean Shell Acrylic Nai",
-          "url": "https://www.amazon.com/dp/B0FP9DMCVS",
-          "imageUrl": "https://m.media-amazon.com/images/I/51rMuYyJniL._AC_UL320_.jpg"
+          "id": "amazon-search-2",
+          "title": "best beach nails",
+          "url": "https://www.amazon.com/s?k=best%20beach%20nails",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         },
         {
-          "id": "B0GTW8SGTS",
-          "title": "Summer Beach Press on Nails Short Almond 24Pcs Floral False Nails with 3D Ocean Seashell Turtle Starfish Design Cute Fak",
-          "url": "https://www.amazon.com/dp/B0GTW8SGTS",
-          "imageUrl": "https://m.media-amazon.com/images/I/71ASre3hbrL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F53WLQSJ",
-          "title": "HOSAILY 3D Summer Beach Press on Nails Medium Almond, Blue White Ombre Shell Star Pearl Designs Semi-Handmade Full Cover",
-          "url": "https://www.amazon.com/dp/B0F53WLQSJ",
-          "imageUrl": "https://m.media-amazon.com/images/I/71QIvhskHXL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F53WLQSJ",
-          "title": "HOSAILY 3D Summer Beach Press on Nails Medium Almond, Blue White Ombre Shell Star Pearl Designs Semi-Handmade Full Cover",
-          "url": "https://www.amazon.com/dp/B0F53WLQSJ",
-          "imageUrl": "https://m.media-amazon.com/images/I/71QIvhskHXL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0H2811Z61",
-          "title": "H1vojoxo Coastal Beach Themed Nail Files - 48pcs Blue Ocean Emery Boards | 8 Styles, Double Sided Seashell, Under the Se",
-          "url": "https://www.amazon.com/dp/B0H2811Z61",
-          "imageUrl": "https://m.media-amazon.com/images/I/91m81+38K1L._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0H3ZDJMSF",
-          "title": "30pcs Ocean Beach Press on Nails Short Almond Fake Nails with 3D Sea Turtle Shell Starfish Design Summer Flower False Na",
-          "url": "https://www.amazon.com/dp/B0H3ZDJMSF",
-          "imageUrl": "https://m.media-amazon.com/images/I/71i5QpYYlRL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0GRGLG7WG",
-          "title": "Beach Press on Nails Medium Coffin Fake Nails with Starfish Shell Coral Design Acrylic False Nail Glossy Full Cover Stic",
-          "url": "https://www.amazon.com/dp/B0GRGLG7WG",
-          "imageUrl": "https://m.media-amazon.com/images/I/71SWXc+v9wL._AC_UL320_.jpg"
-        },
-        {
-          "id": "B0F944CRKJ",
-          "title": "4 Pack Coastal Cosmetic Bags Beach Ocean Themed Gifts Makeup Pouches Zippered Travel Toiletry Bags for Women Beach Summe",
-          "url": "https://www.amazon.com/dp/B0F944CRKJ",
-          "imageUrl": "https://m.media-amazon.com/images/I/814X4KX8+qL._AC_UL320_.jpg"
+          "id": "amazon-search-3",
+          "title": "beach nails ideas",
+          "url": "https://www.amazon.com/s?k=beach%20nails%20ideas",
+          "note": "No product thumbnails returned (check RAPIDAPI_KEY and your Amazon RapidAPI subscription on the server). Open Amazon search and pick a product URL for URL2Pin."
         }
       ],
       "source": "pinterest_trends"
