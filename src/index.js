@@ -8302,23 +8302,13 @@ function buildPinterestKeywordIdeas(seed, niche = '') {
   const n = String(niche || '').trim().toLowerCase();
   const base = s;
   const year = new Date().getFullYear();
+  // Suffix-safe modifiers only (read naturally as "<seed> <modifier>"); the
+  // heuristic is a fallback for when the AI expansion is unavailable.
   const modifiers = [
     'ideas',
     'tips',
-    'checklist',
-    'template',
-    'guide',
     'for beginners',
-    'step by step',
-    'mistakes',
-    'vs',
-    'best',
-    'best {year}',
-    'how to',
-    'easy',
-    'quick',
-    'cheap',
-    'budget',
+    'inspiration',
   ];
   const ecommerce = ['etsy', 'shopify', 'amazon', 'gift', 'under $50', 'small business'];
   const food = ['meal prep', 'healthy', 'high protein', 'air fryer', 'dinner', 'snack'];
@@ -8349,12 +8339,10 @@ function buildPinterestKeywordIdeas(seed, niche = '') {
   }
 
   const questions = [
-    `how to ${base}`,
-    `why ${base} isn't working`,
-    `how many ${base}`,
-    `best time to post ${base}`,
-    `${base} strategy`,
-    `${base} checklist`,
+    `how to use ${base}`,
+    `what is the best ${base}`,
+    `is ${base} worth it`,
+    `best ${base} for beginners`,
   ];
 
   const longTail = [
@@ -8452,14 +8440,9 @@ function buildPinterestHashtagIdeas(topic, niche = '') {
     t,
     `${t} ideas`,
     `${t} tips`,
-    `${t} checklist`,
     `${t} for beginners`,
-    `how to ${t}`,
-    `${t} {year}`,
     `best ${t}`,
-    `${t} tutorial`,
-    `${t} guide`,
-    `${t} hacks`,
+    `${t} inspiration`,
   ].map((x) => String(x).replace(/\{year\}/g, String(year)));
 
   const nicheBoost = n
@@ -8467,7 +8450,6 @@ function buildPinterestHashtagIdeas(topic, niche = '') {
         `${n} tips`,
         `${n} ideas`,
         `${t} ${n}`,
-        `${t} for ${n}`,
         `${n} inspiration`,
       ]
     : [];
@@ -8848,13 +8830,17 @@ app.post('/api/tools/pinterest-keywords', async (req, res) => {
     if (s.length < 2) return res.status(400).json({ error: 'Enter a keyword (at least 2 characters).' });
     const base = buildPinterestKeywordIdeas(s, niche || '');
     const ai = await maybeAiExpandPinterestKeywords(s, niche || '', openai);
+    // The AI output is high quality; the heuristic is a template fallback that
+    // produces grammatical junk for product seeds ("air fryer vs", "why air fryer
+    // isn't working"). Only backfill from the heuristic when the AI result is thin.
+    const aiOk = (ai?.primary?.length || 0) >= 12;
     const merged = {
       seed: base.seed,
-      primary: dedupeKeepOrder([...(ai?.primary || []), ...base.primary]).slice(0, 60),
-      questions: dedupeKeepOrder([...(ai?.questions || []), ...base.questions]).slice(0, 30),
-      longTail: dedupeKeepOrder([...(ai?.longTail || []), ...base.longTail]).slice(0, 45),
+      primary: dedupeKeepOrder([...(ai?.primary || []), ...(aiOk ? [] : base.primary)]).slice(0, 60),
+      questions: dedupeKeepOrder([...(ai?.questions || []), ...(aiOk ? [] : base.questions)]).slice(0, 30),
+      longTail: dedupeKeepOrder([...(ai?.longTail || []), ...(aiOk ? [] : base.longTail)]).slice(0, 45),
     };
-    return res.json({ ...merged, source: ai ? 'ai+heuristic' : 'heuristic' });
+    return res.json({ ...merged, source: aiOk ? 'ai' : ai ? 'ai+heuristic' : 'heuristic' });
   } catch (e) {
     console.error('pinterest-keywords tool error:', e);
     return res.status(500).json({ error: 'Failed to generate keyword ideas.' });
@@ -8928,13 +8914,17 @@ app.post('/api/tools/pinterest-hashtag-generator', async (req, res) => {
     if (t.length < 2) return res.status(400).json({ error: 'Enter a topic (at least 2 characters).' });
     const base = buildPinterestHashtagIdeas(t, niche || '');
     const ai = await maybeAiPinterestHashtags(t, niche || '', openai);
-    const suggested = dedupeKeepOrder([...(ai?.suggested || []), ...base.suggested]).slice(0, 40);
+    // Prefer the (higher-quality) AI hashtags; the heuristic mashes topic+suffix
+    // into unsearched tags (#airfryerrecipeschecklist), so only backfill from it
+    // when the AI result is thin. The avoid-list is useful from both sources.
+    const aiOk = (ai?.suggested?.length || 0) >= 10;
+    const suggested = dedupeKeepOrder([...(ai?.suggested || []), ...(aiOk ? [] : base.suggested)]).slice(0, 40);
     const avoid = dedupeKeepOrder([...(ai?.avoid || []), ...base.avoid]).slice(0, 25);
     return res.json({
       topic: base.topic,
       suggested,
       avoid,
-      source: ai ? 'ai+heuristic' : 'heuristic',
+      source: aiOk ? 'ai' : ai ? 'ai+heuristic' : 'heuristic',
     });
   } catch (e) {
     console.error('pinterest-hashtag-generator tool error:', e);
