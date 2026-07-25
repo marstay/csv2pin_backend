@@ -8932,6 +8932,155 @@ app.post('/api/tools/pinterest-hashtag-generator', async (req, res) => {
   }
 });
 
+const ETSY_STOPWORDS = new Set([
+  'a', 'an', 'the', 'with', 'and', 'for', 'of', 'in', 'on', 'to', 'by', 'is', 'it', 'this', 'that',
+]);
+
+function significantWords(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length > 1 && !ETSY_STOPWORDS.has(w));
+}
+
+function capAt(phrase, maxLen = 20) {
+  const p = String(phrase || '').trim().replace(/\s+/g, ' ');
+  if (p.length <= maxLen) return p;
+  const words = p.split(' ');
+  let out = '';
+  for (const w of words) {
+    const next = out ? `${out} ${w}` : w;
+    if (next.length > maxLen) break;
+    out = next;
+  }
+  return out || p.slice(0, maxLen);
+}
+
+const ETSY_TAG_MODIFIERS = [
+  'gift for her',
+  'gift for him',
+  'gift for mom',
+  'custom gift',
+  'personalized gift',
+  'handmade gift',
+  'housewarming gift',
+  'wedding gift',
+  'birthday gift',
+  'christmas gift',
+  'unique gift idea',
+  'gift idea',
+  'home decor',
+  'boho decor',
+  'rustic decor',
+  'minimalist',
+  'baby shower gift',
+  'new home gift',
+];
+
+function buildEtsyTagIdeas(description, niche = '') {
+  const desc = String(description || '').trim().replace(/\s+/g, ' ');
+  const n = normalizeNicheLabel(niche);
+  const words = significantWords(desc);
+  const primaryWords = words.slice(0, 6);
+
+  const phraseTags = [];
+  // Consecutive word pairs/triples from the description itself.
+  for (let size = 3; size >= 2; size--) {
+    for (let i = 0; i + size <= primaryWords.length; i++) {
+      phraseTags.push(capAt(primaryWords.slice(i, i + size).join(' ')));
+    }
+  }
+  // The description itself, capped.
+  if (desc) phraseTags.push(capAt(desc));
+
+  // Lead word(s) + a common Etsy buyer-intent modifier.
+  const lead = primaryWords.slice(0, 2).join(' ');
+  const modifierTags = ETSY_TAG_MODIFIERS.map((m) => capAt(lead ? `${lead} ${m}` : m));
+
+  const nicheTag = n ? capAt(`${lead} ${n}`.trim()) : '';
+
+  const tags = dedupeKeepOrder([...phraseTags, nicheTag, ...modifierTags].filter((t) => t && t.length >= 3)).slice(
+    0,
+    13
+  );
+
+  const titleLead = primaryWords.slice(0, 5).join(' ');
+  const title = [titleLead, n, 'Gift'].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+
+  return { description: desc, niche: n, tags, title };
+}
+
+async function maybeAiEtsyTags(description, niche, openaiClient) {
+  if (process.env.ETSY_TAG_TOOL_AI === '0' || !process.env.OPENAI_API_KEY || !openaiClient) return null;
+  const d = String(description || '').trim();
+  if (d.length < 3) return null;
+  try {
+    const completion = await openaiClient.chat.completions.create({
+      model: process.env.ETSY_TAG_TOOL_MODEL || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Generate Etsy SEO tags and a title for this listing.\n` +
+            `Product: ${d}\n` +
+            `${niche ? `Category/occasion: ${String(niche)}\n` : ''}\n` +
+            `Return JSON only with keys: tags, title, altTitles.\n` +
+            `Rules:\n` +
+            `- tags: exactly 13 strings. Each must be 20 characters or fewer (Etsy's hard limit). Prefer full multi-word buyer-search phrases over single generic words (e.g. "gift for new homeowner" not "gift"). No duplicate tags. No hashtags, no punctuation besides spaces and hyphens.\n` +
+            `- title: one SEO title, 120-140 characters, front-load the single most important keyword phrase in the first 40 characters, human-readable (not keyword-stuffed), no ALL CAPS.\n` +
+            `- altTitles: 2 more title options, same rules.\n`,
+        },
+      ],
+      max_tokens: 500,
+      temperature: 0.6,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const tags = dedupeKeepOrder((parsed.tags || []).map((t) => capAt(String(t || ''), 20))).filter(Boolean);
+    if (tags.length < 8) return null;
+    const title = String(parsed.title || '').trim().slice(0, 140);
+    const altTitles = dedupeKeepOrder((parsed.altTitles || []).map((t) => String(t || '').trim().slice(0, 140))).filter(
+      Boolean
+    );
+    return { tags: tags.slice(0, 13), title, altTitles: altTitles.slice(0, 2) };
+  } catch (e) {
+    console.warn('maybeAiEtsyTags:', e.message || e);
+    return null;
+  }
+}
+
+app.post('/api/tools/etsy-tag-generator', async (req, res) => {
+  try {
+    if (!rateLimitTool(req, 'etsy-tag-generator', { windowMs: 60_000, max: 25 })) {
+      return res.status(429).json({ error: 'Too many requests. Please try again in a minute.' });
+    }
+    const { description, niche } = req.body || {};
+    const d = String(description || '').trim();
+    if (d.length < 3) return res.status(400).json({ error: 'Describe the listing (at least 3 characters).' });
+    const base = buildEtsyTagIdeas(d, niche || '');
+    const ai = await maybeAiEtsyTags(d, niche || '', openai);
+    const aiOk = (ai?.tags?.length || 0) >= 10;
+    const tags = dedupeKeepOrder([...(ai?.tags || []), ...(aiOk ? [] : base.tags)]).slice(0, 13);
+    const title = String(ai?.title || base.title || '').trim();
+    const altTitles = ai?.altTitles || [];
+    return res.json({
+      description: base.description,
+      niche: base.niche,
+      tags,
+      title,
+      altTitles,
+      source: aiOk ? 'ai' : ai ? 'ai+heuristic' : 'heuristic',
+    });
+  } catch (e) {
+    console.error('etsy-tag-generator tool error:', e);
+    return res.status(500).json({ error: 'Failed to generate tags.' });
+  }
+});
+
 // --- URL → Pin helper endpoints ---
 
 app.post('/api/urltopin/scrape', async (req, res) => {
