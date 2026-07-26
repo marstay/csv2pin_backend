@@ -70,6 +70,8 @@ function rowToPage(row) {
     bestFor: asArray(row.best_for),
     specifications: asArray(row.specifications),
     disclosure: row.disclosure || DEFAULT_DISCLOSURE,
+    price: row.price || '',
+    priceUpdatedAt: row.price_updated_at || null,
     userId: row.user_id || null,
     manageToken: row.manage_token || '',
     createdAt: row.created_at,
@@ -267,6 +269,26 @@ export async function updateAffiliateProductPageByUser(slug, userId, patches) {
   }
   if (patches.disclosure !== undefined) {
     update.disclosure = String(patches.disclosure || '').trim().slice(0, 500);
+  }
+  // Destination the buy button points to. Never allow it to be cleared to empty
+  // (a live pin must still land somewhere); reject clearly if it is not a URL.
+  if (patches.buyUrl !== undefined) {
+    const raw = String(patches.buyUrl || '').trim();
+    if (raw) {
+      let normalized;
+      try {
+        normalized = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).toString();
+      } catch {
+        throw new Error('That destination URL does not look valid.');
+      }
+      update.buy_url = normalized;
+    }
+  }
+  // Optional, owner-entered price string (e.g. "$49.99"); stamp when it was set.
+  if (patches.price !== undefined) {
+    const priceStr = String(patches.price || '').trim().slice(0, 40);
+    update.price = priceStr;
+    update.price_updated_at = priceStr ? new Date().toISOString() : null;
   }
   const listColumn = { pros: 'pros', cons: 'cons', bestFor: 'best_for' };
   for (const listKey of ['pros', 'cons', 'bestFor']) {
