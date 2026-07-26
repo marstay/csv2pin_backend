@@ -1,14 +1,17 @@
 /**
- * AI affiliate product pages — JSON file store (Phase 1).
+ * AI affiliate product pages — Supabase-backed store (durable across redeploys).
  * Public at /page/[slug], noindex; generator at /ai-product-page-generator.
+ * Table: public.affiliate_product_pages (see supabase/affiliate_product_pages.sql).
  */
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { createClient } from '@supabase/supabase-js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = path.join(__dirname, '..', 'data', 'affiliate-product-pages.json');
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
+const TABLE = 'affiliate_product_pages';
 
 const DEFAULT_DISCLOSURE =
   'Disclosure: As an Amazon Associate and affiliate partner, I earn from qualifying purchases. ' +
@@ -44,27 +47,47 @@ function merchantLabel(merchant) {
   return map[merchant] || 'Store';
 }
 
-async function readStore() {
-  try {
-    const raw = await fs.readFile(STORE_PATH, 'utf8');
-    const json = JSON.parse(raw);
-    if (json && typeof json.pages === 'object') return json;
-  } catch {
-    /* fresh store */
-  }
-  return { pages: {} };
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
 }
 
-async function writeStore(store) {
-  await fs.mkdir(path.dirname(STORE_PATH), { recursive: true });
-  await fs.writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+/** Map a snake_case DB row to the camelCase page object callers expect. */
+function rowToPage(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    slug: row.slug,
+    productUrl: row.product_url || '',
+    affiliateUrl: row.affiliate_url || null,
+    buyUrl: row.buy_url || '',
+    merchant: row.merchant || 'other',
+    merchantLabel: row.merchant_label || merchantLabel(row.merchant || 'other'),
+    title: row.title || 'Product overview',
+    imageUrl: row.image_url || '',
+    imageUrls: asArray(row.image_urls),
+    summary: row.summary || '',
+    pros: asArray(row.pros),
+    cons: asArray(row.cons),
+    bestFor: asArray(row.best_for),
+    specifications: asArray(row.specifications),
+    disclosure: row.disclosure || DEFAULT_DISCLOSURE,
+    userId: row.user_id || null,
+    manageToken: row.manage_token || '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    views: Number(row.views) || 0,
+    outboundClicks: Number(row.outbound_clicks) || 0,
+  };
 }
 
 export async function getAffiliateProductPageBySlug(slug) {
   const key = String(slug || '').trim().toLowerCase();
   if (!key || key.length > 80) return null;
-  const store = await readStore();
-  return store.pages[key] || null;
+  const { data, error } = await supabase.from(TABLE).select('*').eq('slug', key).maybeSingle();
+  if (error) {
+    console.error('getAffiliateProductPageBySlug:', error.message || error);
+    return null;
+  }
+  return rowToPage(data);
 }
 
 export async function createAffiliateProductPage({
@@ -77,11 +100,6 @@ export async function createAffiliateProductPage({
   const resolvedProductUrl = String(productUrl || '').trim();
   const buyUrl = String(affiliateUrl || '').trim() || resolvedProductUrl;
   const title = String(aiContent?.title || scrapeMeta?.title || 'Product overview').trim().slice(0, 160);
-  let slug = slugifyTitle(title);
-  const store = await readStore();
-  while (store.pages[slug]) {
-    slug = slugifyTitle(`${title}-${crypto.randomBytes(1).toString('hex')}`);
-  }
 
   const hostname = scrapeMeta?.domain || '';
   const merchant = detectMerchant(hostname, scrapeMeta);
@@ -98,57 +116,76 @@ export async function createAffiliateProductPage({
   const imageUrl =
     String(aiContent?.imageUrl || scrapeMeta?.imageUrl || imageUrls[0] || '').trim();
 
-  const page = {
-    slug,
-    productUrl: resolvedProductUrl,
-    affiliateUrl: affiliateUrl ? buyUrl : null,
-    buyUrl,
+  const row = {
+    product_url: resolvedProductUrl,
+    affiliate_url: affiliateUrl ? buyUrl : null,
+    buy_url: buyUrl,
     merchant,
-    merchantLabel: merchantLabel(merchant),
+    merchant_label: merchantLabel(merchant),
     title,
-    imageUrl,
-    imageUrls: imageUrls.length ? imageUrls : imageUrl ? [imageUrl] : [],
+    image_url: imageUrl,
+    image_urls: imageUrls.length ? imageUrls : imageUrl ? [imageUrl] : [],
     summary: String(aiContent?.summary || scrapeMeta?.description || '').trim(),
     pros: Array.isArray(aiContent?.pros) ? aiContent.pros.slice(0, 6) : [],
     cons: Array.isArray(aiContent?.cons) ? aiContent.cons.slice(0, 5) : [],
-    bestFor: Array.isArray(aiContent?.bestFor) ? aiContent.bestFor.slice(0, 5) : [],
+    best_for: Array.isArray(aiContent?.bestFor) ? aiContent.bestFor.slice(0, 5) : [],
     specifications: Array.isArray(aiContent?.specifications) ? aiContent.specifications.slice(0, 10) : [],
     disclosure: String(aiContent?.disclosure || DEFAULT_DISCLOSURE).trim(),
-    userId: userId ? String(userId).trim() : null,
-    manageToken: crypto.randomBytes(16).toString('hex'),
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    views: 0,
-    outboundClicks: 0,
+    user_id: userId ? String(userId).trim() : null,
+    manage_token: crypto.randomBytes(16).toString('hex'),
   };
 
-  store.pages[slug] = page;
-  await writeStore(store);
-  return page;
+  // slugifyTitle already appends a random suffix; retry on the rare unique collision.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const slug = slugifyTitle(title);
+    const { data, error } = await supabase
+      .from(TABLE)
+      .insert({ slug, ...row })
+      .select('*')
+      .single();
+    if (!error) return rowToPage(data);
+    if (error.code === '23505') continue; // unique_violation on slug — retry with a new suffix
+    console.error('createAffiliateProductPage:', error.message || error);
+    throw new Error('Could not save product page.');
+  }
+  throw new Error('Could not generate a unique page slug. Please try again.');
 }
 
 export async function incrementAffiliateProductPageViews(slug) {
   const key = String(slug || '').trim().toLowerCase();
-  const store = await readStore();
-  const page = store.pages[key];
-  if (!page) return null;
-  page.views = (Number(page.views) || 0) + 1;
-  page.updatedAt = new Date().toISOString();
-  store.pages[key] = page;
-  await writeStore(store);
-  return page;
+  const current = await getAffiliateProductPageBySlug(key);
+  if (!current) return null;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .update({ views: (Number(current.views) || 0) + 1, updated_at: new Date().toISOString() })
+    .eq('slug', key)
+    .select('*')
+    .single();
+  if (error) {
+    console.error('incrementAffiliateProductPageViews:', error.message || error);
+    return current; // still serve the page even if the counter write fails
+  }
+  return rowToPage(data);
 }
 
 export async function incrementAffiliateProductPageOutboundClicks(slug) {
   const key = String(slug || '').trim().toLowerCase();
-  const store = await readStore();
-  const page = store.pages[key];
-  if (!page) return null;
-  page.outboundClicks = (Number(page.outboundClicks) || 0) + 1;
-  page.updatedAt = new Date().toISOString();
-  store.pages[key] = page;
-  await writeStore(store);
-  return page;
+  const current = await getAffiliateProductPageBySlug(key);
+  if (!current) return null;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .update({
+      outbound_clicks: (Number(current.outboundClicks) || 0) + 1,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('slug', key)
+    .select('*')
+    .single();
+  if (error) {
+    console.error('incrementAffiliateProductPageOutboundClicks:', error.message || error);
+    return current;
+  }
+  return rowToPage(data);
 }
 
 /** Strip secrets before public API responses. */
@@ -185,73 +222,81 @@ export async function deleteAffiliateProductPage(slug, manageTokenOrOpts) {
   } else {
     manageToken = String(manageTokenOrOpts || '').trim();
   }
-  const store = await readStore();
-  const page = store.pages[key];
+  const page = await getAffiliateProductPageBySlug(key);
   if (!page) return false;
-  if (userId && page.userId === userId) {
-    delete store.pages[key];
-    await writeStore(store);
-    return true;
+  const authorized =
+    (userId && page.userId === userId) ||
+    (manageToken && String(page.manageToken || '') === manageToken);
+  if (!authorized) return false;
+  const { error } = await supabase.from(TABLE).delete().eq('slug', key);
+  if (error) {
+    console.error('deleteAffiliateProductPage:', error.message || error);
+    return false;
   }
-  if (manageToken && String(page.manageToken || '') === manageToken) {
-    delete store.pages[key];
-    await writeStore(store);
-    return true;
-  }
-  return false;
+  return true;
 }
 
 export async function listAffiliateProductPagesByUserId(userId) {
   const uid = String(userId || '').trim();
   if (!uid) return [];
-  const store = await readStore();
-  return Object.values(store.pages)
-    .filter((p) => p.userId === uid)
-    .sort(
-      (a, b) =>
-        new Date(b.updatedAt || b.createdAt || 0).getTime() -
-        new Date(a.updatedAt || a.createdAt || 0).getTime()
-    )
-    .map((p) => sanitizeAffiliateProductPageForPublic(p));
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select('*')
+    .eq('user_id', uid)
+    .order('updated_at', { ascending: false });
+  if (error) {
+    console.error('listAffiliateProductPagesByUserId:', error.message || error);
+    return [];
+  }
+  return (data || []).map((row) => sanitizeAffiliateProductPageForPublic(rowToPage(row)));
 }
 
 export async function updateAffiliateProductPageByUser(slug, userId, patches) {
   const key = String(slug || '').trim().toLowerCase();
   const uid = String(userId || '').trim();
   if (!key || !uid || !patches || typeof patches !== 'object') return null;
-  const store = await readStore();
-  const page = store.pages[key];
+  const page = await getAffiliateProductPageBySlug(key);
   if (!page || page.userId !== uid) return null;
 
+  const update = { updated_at: new Date().toISOString() };
   if (patches.title !== undefined) {
-    page.title = String(patches.title || '').trim().slice(0, 160);
+    update.title = String(patches.title || '').trim().slice(0, 160);
   }
   if (patches.summary !== undefined) {
-    page.summary = String(patches.summary || '').trim().slice(0, 2000);
+    update.summary = String(patches.summary || '').trim().slice(0, 2000);
   }
   if (patches.disclosure !== undefined) {
-    page.disclosure = String(patches.disclosure || '').trim().slice(0, 500);
+    update.disclosure = String(patches.disclosure || '').trim().slice(0, 500);
   }
+  const listColumn = { pros: 'pros', cons: 'cons', bestFor: 'best_for' };
   for (const listKey of ['pros', 'cons', 'bestFor']) {
     if (patches[listKey] !== undefined && Array.isArray(patches[listKey])) {
-      const max = listKey === 'specifications' ? 10 : listKey === 'cons' ? 5 : 6;
-      page[listKey] = patches[listKey]
+      const max = listKey === 'cons' ? 5 : 6;
+      update[listColumn[listKey]] = patches[listKey]
         .map((s) => String(s || '').trim())
         .filter(Boolean)
         .slice(0, max);
     }
   }
   if (patches.specifications !== undefined && Array.isArray(patches.specifications)) {
-    page.specifications = patches.specifications
+    update.specifications = patches.specifications
       .map((s) => String(s || '').trim())
       .filter(Boolean)
       .slice(0, 10);
   }
 
-  page.updatedAt = new Date().toISOString();
-  store.pages[key] = page;
-  await writeStore(store);
-  return page;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .update(update)
+    .eq('slug', key)
+    .eq('user_id', uid)
+    .select('*')
+    .single();
+  if (error) {
+    console.error('updateAffiliateProductPageByUser:', error.message || error);
+    return null;
+  }
+  return rowToPage(data);
 }
 
 export async function claimAffiliateProductPage(slug, manageToken, userId) {
@@ -259,15 +304,20 @@ export async function claimAffiliateProductPage(slug, manageToken, userId) {
   const token = String(manageToken || '').trim();
   const uid = String(userId || '').trim();
   if (!key || !token || !uid) return null;
-  const store = await readStore();
-  const page = store.pages[key];
+  const page = await getAffiliateProductPageBySlug(key);
   if (!page || String(page.manageToken || '') !== token) return null;
   if (page.userId && page.userId !== uid) return null;
-  page.userId = uid;
-  page.updatedAt = new Date().toISOString();
-  store.pages[key] = page;
-  await writeStore(store);
-  return page;
+  const { data, error } = await supabase
+    .from(TABLE)
+    .update({ user_id: uid, updated_at: new Date().toISOString() })
+    .eq('slug', key)
+    .select('*')
+    .single();
+  if (error) {
+    console.error('claimAffiliateProductPage:', error.message || error);
+    return null;
+  }
+  return rowToPage(data);
 }
 
 const HOSTED_PAGE_SLUG_RE = /\/page\/([^/?#]+)/i;
