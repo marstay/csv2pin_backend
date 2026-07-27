@@ -6,11 +6,20 @@
 import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
-);
+// Lazily created: index.js calls dotenv.config() AFTER importing this module, so
+// creating the client at import time would read an empty process.env and throw
+// "supabaseUrl is required." Building it on first use defers that until env is loaded.
+let _supabase = null;
+function getDb() {
+  if (!_supabase) {
+    _supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    );
+  }
+  return _supabase;
+}
 const TABLE = 'affiliate_product_pages';
 
 const DEFAULT_DISCLOSURE =
@@ -84,7 +93,7 @@ function rowToPage(row) {
 export async function getAffiliateProductPageBySlug(slug) {
   const key = String(slug || '').trim().toLowerCase();
   if (!key || key.length > 80) return null;
-  const { data, error } = await supabase.from(TABLE).select('*').eq('slug', key).maybeSingle();
+  const { data, error } = await getDb().from(TABLE).select('*').eq('slug', key).maybeSingle();
   if (error) {
     console.error('getAffiliateProductPageBySlug:', error.message || error);
     return null;
@@ -140,7 +149,7 @@ export async function createAffiliateProductPage({
   // slugifyTitle already appends a random suffix; retry on the rare unique collision.
   for (let attempt = 0; attempt < 5; attempt++) {
     const slug = slugifyTitle(title);
-    const { data, error } = await supabase
+    const { data, error } = await getDb()
       .from(TABLE)
       .insert({ slug, ...row })
       .select('*')
@@ -157,7 +166,7 @@ export async function incrementAffiliateProductPageViews(slug) {
   const key = String(slug || '').trim().toLowerCase();
   const current = await getAffiliateProductPageBySlug(key);
   if (!current) return null;
-  const { data, error } = await supabase
+  const { data, error } = await getDb()
     .from(TABLE)
     .update({ views: (Number(current.views) || 0) + 1, updated_at: new Date().toISOString() })
     .eq('slug', key)
@@ -174,7 +183,7 @@ export async function incrementAffiliateProductPageOutboundClicks(slug) {
   const key = String(slug || '').trim().toLowerCase();
   const current = await getAffiliateProductPageBySlug(key);
   if (!current) return null;
-  const { data, error } = await supabase
+  const { data, error } = await getDb()
     .from(TABLE)
     .update({
       outbound_clicks: (Number(current.outboundClicks) || 0) + 1,
@@ -230,7 +239,7 @@ export async function deleteAffiliateProductPage(slug, manageTokenOrOpts) {
     (userId && page.userId === userId) ||
     (manageToken && String(page.manageToken || '') === manageToken);
   if (!authorized) return false;
-  const { error } = await supabase.from(TABLE).delete().eq('slug', key);
+  const { error } = await getDb().from(TABLE).delete().eq('slug', key);
   if (error) {
     console.error('deleteAffiliateProductPage:', error.message || error);
     return false;
@@ -241,7 +250,7 @@ export async function deleteAffiliateProductPage(slug, manageTokenOrOpts) {
 export async function listAffiliateProductPagesByUserId(userId) {
   const uid = String(userId || '').trim();
   if (!uid) return [];
-  const { data, error } = await supabase
+  const { data, error } = await getDb()
     .from(TABLE)
     .select('*')
     .eq('user_id', uid)
@@ -307,7 +316,7 @@ export async function updateAffiliateProductPageByUser(slug, userId, patches) {
       .slice(0, 10);
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await getDb()
     .from(TABLE)
     .update(update)
     .eq('slug', key)
@@ -329,7 +338,7 @@ export async function claimAffiliateProductPage(slug, manageToken, userId) {
   const page = await getAffiliateProductPageBySlug(key);
   if (!page || String(page.manageToken || '') !== token) return null;
   if (page.userId && page.userId !== uid) return null;
-  const { data, error } = await supabase
+  const { data, error } = await getDb()
     .from(TABLE)
     .update({ user_id: uid, updated_at: new Date().toISOString() })
     .eq('slug', key)
