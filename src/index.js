@@ -861,6 +861,33 @@ function resolveDodoProductIdForPlan(planType, billingInterval) {
   return map[pt] || null;
 }
 
+/**
+ * Reverse of resolveDodoProductIdForPlan: what plan is this Dodo product?
+ *
+ * The product a subscription is attached to is what the customer is ACTUALLY billed for, so it
+ * is the only non-stale source of plan truth. Subscription metadata (`app_plan_type`) is written
+ * once at checkout and is NOT updated on plan change — trusting it caused paying Agency customers
+ * to be silently served Creator limits on renewal.
+ */
+function inferPlanTypeFromDodoProductId(productId) {
+  const id = String(productId || '').trim();
+  if (!id) return null;
+  const pairs = [
+    ['starter', process.env.DODO_PRODUCT_STARTER_ID],
+    ['creator', process.env.DODO_PRODUCT_CREATOR_ID],
+    ['pro', process.env.DODO_PRODUCT_PRO_ID],
+    ['agency', process.env.DODO_PRODUCT_AGENCY_ID],
+    ['starter', process.env.DODO_PRODUCT_STARTER_ANNUAL_ID],
+    ['creator', process.env.DODO_PRODUCT_CREATOR_ANNUAL_ID],
+    ['pro', process.env.DODO_PRODUCT_PRO_ANNUAL_ID],
+    ['agency', process.env.DODO_PRODUCT_AGENCY_ANNUAL_ID],
+  ];
+  for (const [plan, pid] of pairs) {
+    if (pid && String(pid).trim() === id) return plan;
+  }
+  return null;
+}
+
 function inferBillingIntervalFromDodoProductId(productId) {
   const id = String(productId || '').trim();
   if (!id) return 'month';
@@ -14823,6 +14850,33 @@ app.post('/api/account/change-plan', requireUser, async (req, res) => {
       });
     }
 
+    // Dodo's change-plan call does NOT persist the metadata we pass in changeBody — the
+    // subscription keeps whatever app_plan_type was set at checkout. Left stale, the next
+    // renewal webhook would revert the customer to their original plan. Patch it explicitly.
+    try {
+      const metaResp = await fetch(`${DODO_BASE_URL}/subscriptions/${encodeURIComponent(dodoSubId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DODO_API_KEY}` },
+        body: JSON.stringify({
+          metadata: {
+            supabase_user_id: req.user.id,
+            app_plan_type: targetPlanType,
+            app_billing_interval: targetInterval,
+            app_change_requested_at: nowIso,
+          },
+        }),
+      });
+      if (!metaResp.ok) {
+        console.warn('account/change-plan: metadata sync failed (renewal may revert plan)', {
+          subId: dodoSubId,
+          status: metaResp.status,
+          targetPlanType,
+        });
+      }
+    } catch (e) {
+      console.warn('account/change-plan: metadata sync threw', { subId: dodoSubId, error: e?.message || e });
+    }
+
     return res.json({
       ok: true,
       subscription_id: dodoSubId,
@@ -14900,8 +14954,31 @@ app.post('/api/dodo/webhook', async (req, res) => {
         return res.json({ ok: true, ignored: true, reason: 'missing_user_metadata' });
       }
 
-      let planType = planTypeFromMeta;
-      let billingInterval = billingIntervalFromMeta;
+      // Plan resolution order matters. The product the subscription is attached to is what the
+      // customer is actually being charged for, so it wins. `metadata.app_plan_type` is written at
+      // checkout and never updated on plan change — trusting it first caused a paying Agency
+      // customer to be reverted to Creator limits on renewal (2026-07-30).
+      const productIdFromEvent = String(
+        dataObj?.product_id || dataObj?.product?.product_id || dataObj?.product?.id || ''
+      ).trim();
+      const planFromProduct = inferPlanTypeFromDodoProductId(productIdFromEvent);
+
+      let planType = planFromProduct || planTypeFromMeta;
+      let billingInterval = productIdFromEvent
+        ? inferBillingIntervalFromDodoProductId(productIdFromEvent)
+        : billingIntervalFromMeta;
+
+      if (planFromProduct && planTypeFromMeta && planFromProduct !== planTypeFromMeta) {
+        console.warn('dodo webhook: stale metadata plan ignored in favour of product', {
+          eventType,
+          userId,
+          dodoSubId,
+          productId: productIdFromEvent,
+          planFromProduct,
+          planTypeFromMeta,
+        });
+      }
+
       if (!planType || !PLAN_PIN_LIMITS[planType]) {
         const local = dodoSubId ? await lookupLocalSubscriptionByDodoSubscriptionId(dodoSubId) : null;
         const localPlan = String(local?.plan_type || '').trim();
