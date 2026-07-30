@@ -7446,6 +7446,15 @@ function isNanoBananaStateInProgress(stateNorm) {
   return NANO_BANANA_IN_PROGRESS_STATES.has(stateNorm);
 }
 
+/**
+ * Concurrent in-flight image tasks.
+ *
+ * Kept at 3 deliberately. The provider itself allows far more (100+ concurrent, 20 new requests
+ * per 10s), so this is not a provider limit — it is a local safety margin. The download/buffer/
+ * upload step after each image is NOT gated by this semaphore, so raising it clusters those
+ * buffers together and raises peak memory. Raise via the NANO_BANANA_MAX_CONCURRENT env var and
+ * watch memory before changing this default.
+ */
 const NANO_BANANA_MAX_CONCURRENT = Math.max(
   1,
   parseInt(process.env.NANO_BANANA_MAX_CONCURRENT || '3', 10) || 3
@@ -7472,10 +7481,35 @@ function releaseNanoBananaSlot() {
   if (next) next();
 }
 
+/**
+ * Rolling stats so a generation run can report how long images actually took and, crucially,
+ * how much of that was spent QUEUED behind the concurrency limit rather than generating.
+ * If queue time is a large share, raising NANO_BANANA_MAX_CONCURRENT is the lever; if it is
+ * near zero, the provider itself is the bottleneck and concurrency will not help.
+ */
+function createImageTimingCollector() {
+  return { count: 0, queuedMs: 0, genMs: 0, maxGenMs: 0, failures: 0 };
+}
+
 async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) {
+  const timing = options?.timing || null;
+  const queuedAt = Date.now();
   await acquireNanoBananaSlot();
+  const startedAt = Date.now();
   try {
-    return await generateImageWithNanoBananaInner(prompt, logLabel, options);
+    const result = await generateImageWithNanoBananaInner(prompt, logLabel, options);
+    if (timing) {
+      const genMs = Date.now() - startedAt;
+      timing.count += 1;
+      timing.queuedMs += startedAt - queuedAt;
+      timing.genMs += genMs;
+      timing.maxGenMs = Math.max(timing.maxGenMs, genMs);
+      if (!result) timing.failures += 1;
+    }
+    return result;
+  } catch (e) {
+    if (timing) timing.failures += 1;
+    throw e;
   } finally {
     releaseNanoBananaSlot();
   }
@@ -9596,6 +9630,17 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
 });
 
 app.post('/api/urltopin/generate', requireUser, async (req, res) => {
+  // Per-run timing. Without this there is no way to tell whether a slow generation was the
+  // scrape, the copy loop, or the image provider — and therefore no way to know if a change helped.
+  const runT0 = Date.now();
+  const phaseMs = { setup: 0, copy: 0, images: 0 };
+  let phaseMark = runT0;
+  const markPhase = (name) => {
+    const now = Date.now();
+    if (phaseMs[name] != null) phaseMs[name] += now - phaseMark;
+    phaseMark = now;
+  };
+  const imageTiming = createImageTimingCollector();
   try {
     const {
       url,
@@ -10097,6 +10142,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     let strategicMetadataByIndex = [];
     let keyIdeas = [];
     const usedAngles = [];
+    // Must sit OUTSIDE the strategic branch: on the non-strategic path setup time would
+    // otherwise be silently attributed to the copy phase.
+    markPhase('setup');
     if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
       const plan = req._strategicPlan;
       keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
@@ -10300,6 +10348,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     /** Bottom-of-pin line: user brand/CTA replaces raw URL when set (AI prompt + overlays stay consistent). */
     const pinFooterSourceLine = String(brandName || '').trim().slice(0, 80) || domain;
 
+    markPhase('copy');
     const pinPromises = stylePrompts.map(async (sp) => {
       const metaKey = sp.index != null && ((isStrategic || isStrategicSingle) || effectiveStyles.length > 1) ? `${sp.id}::${sp.index}` : sp.id;
       const meta = styleMetadataByStyleId.get(metaKey) || styleMetadataByStyleId.get(sp.id) || {};
@@ -10486,7 +10535,10 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         }
       } else if (!useUserComposite) {
         try {
-          const nanoOpts = nanoBananaReferenceInputs.length ? { imageInput: nanoBananaReferenceInputs } : {};
+          const nanoOpts = {
+            ...(nanoBananaReferenceInputs.length ? { imageInput: nanoBananaReferenceInputs } : {}),
+            timing: imageTiming,
+          };
           const providerSoftTimeoutMs =
             Math.max(30_000, parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000);
           const nanoUrl = await withSoftTimeout(
@@ -10727,6 +10779,25 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     });
 
     const pins = await Promise.all(pinPromises);
+    markPhase('images');
+
+    {
+      const totalMs = Date.now() - runT0;
+      const n = imageTiming.count || 0;
+      const avgGen = n ? Math.round(imageTiming.genMs / n) : 0;
+      const avgQueue = n ? Math.round(imageTiming.queuedMs / n) : 0;
+      // queuedShare is the headline number: high => raise NANO_BANANA_MAX_CONCURRENT,
+      // near zero => the provider is the ceiling and more concurrency will not help.
+      const queuedShare = imageTiming.genMs + imageTiming.queuedMs
+        ? Math.round((imageTiming.queuedMs / (imageTiming.genMs + imageTiming.queuedMs)) * 100)
+        : 0;
+      console.log(
+        `⏱️  urltopin/generate: total=${totalMs}ms pins=${pins.length} ` +
+          `setup=${phaseMs.setup}ms copy=${phaseMs.copy}ms images=${phaseMs.images}ms | ` +
+          `imgs=${n} avgGen=${avgGen}ms avgQueue=${avgQueue}ms maxGen=${imageTiming.maxGenMs}ms ` +
+          `queuedShare=${queuedShare}% failures=${imageTiming.failures} concurrency=${NANO_BANANA_MAX_CONCURRENT}`
+      );
+    }
 
     // If some pins fail to produce an image (provider queue / timeout), refund quota so users
     // are not charged for pins they can't see/use.
