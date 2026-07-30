@@ -191,7 +191,10 @@
   "scripts": {
     "start": "node src/index.js",
     "export:subscribers": "node scripts/export-subscribers-csv.mjs",
-    "trends:refresh": "node scripts/refresh-trends.mjs"
+    "trends:refresh": "node scripts/refresh-trends.mjs",
+    "billing:audit": "node scripts/audit-billing-health.mjs",
+    "billing:reconcile": "node scripts/reconcile-billing.mjs",
+    "billing:reconcile:apply": "node scripts/reconcile-billing.mjs --apply"
   },
   "repository": {
     "type": "git",

@@ -24,6 +24,7 @@ import {
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
+import { runBillingReconciliation, buildProductMaps } from './billingReconcile.js';
 import { analyzeWinningProduct, normalizeAmazonProduct } from './winningProductFinder.js';
 import {
   createAffiliateProductPage,
@@ -7073,6 +7074,60 @@ async function processOnboardingEmails() {
     }
   }
   if (sent > 0) console.log(`📧 Onboarding emails: ${sent} sent this run`);
+}
+
+let billingReconcileInterval;
+
+/**
+ * Nightly safety net for billing state. Webhooks are the primary path; this catches the
+ * cases where one never arrived and Supabase silently disagrees with Dodo.
+ * Set BILLING_RECONCILE_DISABLED=1 to turn off, or BILLING_RECONCILE_DRY_RUN=1 to log only.
+ */
+async function processBillingReconciliation() {
+  try {
+    const dodoKey = process.env.DODO_API_KEY;
+    const dodoBase = process.env.DODO_BASE_URL || 'https://live.dodopayments.com';
+    if (!dodoKey) return;
+    const { productToPlan, productToInterval } = buildProductMaps(process.env);
+    if (!Object.keys(productToPlan).length) {
+      console.warn('💳 Billing reconcile skipped: no DODO_PRODUCT_*_ID env vars found');
+      return;
+    }
+    const apply = process.env.BILLING_RECONCILE_DRY_RUN !== '1';
+    const { actions, applied, failed, critical } = await runBillingReconciliation({
+      db: supabaseAdmin,
+      dodoKey,
+      dodoBase,
+      productToPlan,
+      productToInterval,
+      apply,
+    });
+    if (!actions.length) {
+      console.log('💳 Billing reconcile: clean');
+      return;
+    }
+    for (const a of actions) {
+      console.log(`💳 [${a.sev}] ${a.kind}: ${a.msg}${a.error ? ` (ERROR ${a.error})` : ''}`);
+    }
+    console.log(`💳 Billing reconcile: ${actions.length} issue(s), ${applied} fixed, ${failed} failed`);
+    if (critical) {
+      console.error(`🚨 Billing reconcile: ${critical} CRITICAL issue(s) — a customer may be paying with no access`);
+    }
+  } catch (e) {
+    console.warn('💳 Billing reconcile error:', e?.message || e);
+  }
+}
+
+function startBillingReconciliation() {
+  if (billingReconcileInterval) clearInterval(billingReconcileInterval);
+  if (process.env.BILLING_RECONCILE_DISABLED === '1') {
+    console.log('💳 Billing reconciliation disabled');
+    return;
+  }
+  billingReconcileInterval = setInterval(processBillingReconciliation, 24 * 60 * 60 * 1000);
+  // Delay the first run so it never competes with boot; drift is days-old by the time it matters.
+  setTimeout(processBillingReconciliation, 5 * 60 * 1000);
+  console.log('💳 Billing reconciliation started (runs daily)');
 }
 
 function startOnboardingEmails() {
@@ -17894,4 +17949,5 @@ app.listen(PORT, () => {
   startRefImageCleanup();
   startTrendsScheduler();
   startOnboardingEmails();
+  startBillingReconciliation();
 }); 
