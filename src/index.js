@@ -16832,7 +16832,9 @@ app.put('/api/pinterest/scheduled-pins/:id', async (req, res) => {
     // Build update object
     const updates = {};
     if (title) updates.title = title;
-    if (description) updates.description = description;
+    // Compare against undefined, not truthiness: a caller sending description: '' is explicitly
+    // clearing it, which a plain `if (description)` would silently ignore.
+    if (description !== undefined) updates.description = description;
     if (scheduled_for) updates.scheduled_for = new Date(scheduled_for).toISOString();
     if (timezone) updates.timezone = timezone;
     if (status) updates.status = status;
