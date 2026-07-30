@@ -4,7 +4,6 @@ import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import net from 'node:net';
-import { createHash } from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import JSZip from 'jszip';
@@ -7751,52 +7750,6 @@ async function persistProviderImageUrlToAiImages(sourceUrl, fileStem, logLabel =
   }
 }
 
-/**
- * Small TTL memo for work that is identical across every pin of one fan-out batch.
- *
- * The frontend generates pins one HTTP request at a time (mode: strategic_single), so the article
- * fetch and key-idea extraction were being redone for every pin of the same URL — measured at
- * ~9.5s of duplicated work per pin. Caching them removes that without changing any output:
- * same inputs, same result, just computed once.
- *
- * Keys ALWAYS include the user id so two users generating for the same URL can never share an
- * entry. In-flight promises are cached too, so pins that start together share one computation
- * instead of racing to do it N times.
- */
-const FANOUT_CACHE_TTL_MS = 15 * 60 * 1000;
-const FANOUT_CACHE_MAX = 200;
-const fanoutCache = new Map(); // key -> { at: number, value: Promise }
-
-function fanoutMemo(key, produce) {
-  const now = Date.now();
-  const hit = fanoutCache.get(key);
-  if (hit && now - hit.at < FANOUT_CACHE_TTL_MS) return hit.value;
-
-  const value = (async () => {
-    try {
-      return await produce();
-    } catch (e) {
-      // Never cache a failure — drop it so the next pin retries cleanly.
-      fanoutCache.delete(key);
-      throw e;
-    }
-  })();
-
-  fanoutCache.set(key, { at: now, value });
-
-  if (fanoutCache.size > FANOUT_CACHE_MAX) {
-    for (const [k, v] of fanoutCache) {
-      if (now - v.at >= FANOUT_CACHE_TTL_MS) fanoutCache.delete(k);
-    }
-    while (fanoutCache.size > FANOUT_CACHE_MAX) {
-      const oldest = fanoutCache.keys().next().value;
-      if (oldest === undefined) break;
-      fanoutCache.delete(oldest);
-    }
-  }
-  return value;
-}
-
 async function withSoftTimeout(promise, timeoutMs) {
   const ms = Number(timeoutMs);
   if (!Number.isFinite(ms) || ms <= 0) return await promise;
@@ -9692,6 +9645,32 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     phaseMark = now;
   };
   const imageTiming = createImageTimingCollector();
+
+  // Quota is taken up-front, before any image work. Track what is still owed back so an
+  // exception anywhere after the deduction returns it — previously a thrown error consumed
+  // the user's pins and produced nothing, which on a free plan burns a lifetime allowance.
+  let outstandingAi = 0;
+  let outstandingUserPhoto = 0;
+  const refundQuota = async (ai, userPhoto, reason) => {
+    const a = Math.min(Math.max(0, Number(ai) || 0), outstandingAi);
+    const p = Math.min(Math.max(0, Number(userPhoto) || 0), outstandingUserPhoto);
+    if (!a && !p) return;
+    try {
+      await applyPinQuotaDelta(
+        req.user.id,
+        { aiDelta: a ? -a : 0, userPhotoDelta: p ? -p : 0 },
+        req
+      );
+      // Only decrement once the write succeeded, so a failed refund can be retried by the
+      // error path rather than being silently forgotten.
+      outstandingAi -= a;
+      outstandingUserPhoto -= p;
+      console.log(`urltopin: refunded quota (ai=${a} userPhoto=${p}) reason=${reason}`);
+    } catch (e) {
+      console.warn('urltopin: quota refund failed:', e?.message || e);
+    }
+  };
+
   try {
     const {
       url,
@@ -9795,23 +9774,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     }
 
     const fastForFanOut = isStrategicSingle && !!articleData;
-    const fetchArticleOnce = () =>
-      fetchArticleBaseAndSummary(rawUrl, articleData, {
+    const fetchedBase =
+      req._fetchedArticle ||
+      (await fetchArticleBaseAndSummary(rawUrl, articleData, {
         ...(fastForFanOut ? { fast: true } : {}),
         preResolvedUrl: productPageUrl ? '' : effectiveUrl,
         productPageUrl,
         outputLanguage,
-      });
-    const fetchedBase =
-      req._fetchedArticle ||
-      // Only memoised on the fan-out path, where every pin of a batch asks for the identical
-      // article. The multi-pin path already computes this once via req._fetchedArticle.
-      (fastForFanOut
-        ? await fanoutMemo(
-            `article::${req.user.id}::${rawUrl}::${productPageUrl || ''}::${outputLanguage || ''}`,
-            fetchArticleOnce
-          )
-        : await fetchArticleOnce());
+      }));
     const base = fetchedBase.base;
     let articleSummary = fetchedBase.articleSummary;
 
@@ -9916,6 +9886,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       },
       req
     );
+    if (usageResult.allowed) {
+      // Now owed back if anything below fails.
+      outstandingAi = aiPins;
+      outstandingUserPhoto = userPhotoPins;
+    }
     if (!usageResult.allowed) {
       if (usageResult.limitKind === 'user_photo') {
         return res.status(402).json({
@@ -10207,14 +10182,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     markPhase('setup');
     if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
       const plan = req._strategicPlan;
-      // Pure function of articleSummary (it only reads the first 1500 chars), so every pin of a
-      // batch was making the identical OpenAI call. Memoise on a digest of exactly that slice.
-      keyIdeas = await fanoutMemo(
-        `keyideas::${req.user.id}::${createHash('sha1')
-          .update(String(articleSummary || '').slice(0, 1500))
-          .digest('hex')}`,
-        () => extractArticleKeyIdeas(articleSummary, openai)
-      );
+      keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
       const usedOverlayByLayout = new Map(); // layoutId -> [{ headline, subheadline }, ...]
       const metaResults = [];
       const priorPinCopy = [];
@@ -10882,18 +10850,13 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       // (Text-based pins are counted as user_photo pins in this codebase.)
       const refundAi = Math.max(0, failedAi);
       const refundUserPhoto = Math.max(0, failedUserPhoto + failedTextBased);
-      if (refundAi > 0 || refundUserPhoto > 0) {
-        try {
-          await applyPinQuotaDelta(
-            req.user.id,
-            { aiDelta: refundAi ? -refundAi : 0, userPhotoDelta: refundUserPhoto ? -refundUserPhoto : 0 },
-            req
-          );
-        } catch (e) {
-          console.warn('urltopin: quota refund failed:', e?.message || e);
-        }
-      }
+      await refundQuota(refundAi, refundUserPhoto, 'pins_without_image');
     }
+
+    // Pins that did produce an image are legitimately consumed — stop tracking them so the
+    // error path below can never refund work the user actually received.
+    outstandingAi = 0;
+    outstandingUserPhoto = 0;
 
     let finalPins = pins;
     if (isStrategic || isStrategicSingle) {
@@ -10906,6 +10869,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     return res.json(metadataOnly ? { pins: finalPins, metadataOnly: true } : { pins: finalPins });
   } catch (err) {
     console.error('urltopin generate error:', err);
+    // Give back anything charged for pins the user never received. Guarded on headersSent:
+    // if we already responded, the pins were delivered and the quota was legitimately spent.
+    if (!res.headersSent) {
+      await refundQuota(outstandingAi, outstandingUserPhoto, 'generate_error');
+    }
     return res.status(500).json({ error: err.message });
   }
 });
