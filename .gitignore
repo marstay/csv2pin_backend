@@ -85,3 +85,4 @@ Thumbs.db
 # One-off admin exports (PII)
 subscribers-*.csv
 subscribers-emails-*.txt
+lifecycle-emails/*.csv

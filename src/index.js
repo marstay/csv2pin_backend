@@ -223,6 +223,14 @@ async function attachAffiliateReferralToUser(userId, slug) {
   }
 }
 
+/**
+ * Dodo reports every money field in MINOR UNITS (cents) — a $9.00 payment arrives as 900.
+ * See scripts/dodo-audit.mjs, which divides raw total_amount by 100 against live data.
+ *
+ * Do NOT reintroduce a magnitude heuristic here. The previous version multiplied any value
+ * below 1000 by 100 on the assumption it was dollars, which turned the $9 Starter plan
+ * (900 cents) into $900 and paid affiliates 100x the correct commission.
+ */
 function extractDodoPaymentAmountCents(dataObj) {
   const o = dataObj || {};
   const candidates = [
@@ -236,7 +244,6 @@ function extractDodoPaymentAmountCents(dataObj) {
   for (const c of candidates) {
     const n = Number(c);
     if (!Number.isFinite(n) || n <= 0) continue;
-    if (n < 1000 && !String(c).includes('cent')) return Math.round(n * 100);
     return Math.round(n);
   }
   return 0;
@@ -13104,7 +13111,7 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
     const { data: commissions } = await supabaseAdmin
       .from('affiliate_commissions')
       .select(
-        'id, plan_type, amount_cents, commission_cents, status, created_at, commission_kind, payable_after'
+        'id, plan_type, amount_cents, commission_cents, currency, status, created_at, commission_kind, payable_after'
       )
       .eq('affiliate_id', affiliate.id)
       .order('created_at', { ascending: false })
@@ -13112,19 +13119,40 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
 
     const { data: statsRows } = await supabaseAdmin
       .from('affiliate_commissions')
-      .select('commission_cents, status')
+      .select('commission_cents, status, currency')
       .eq('affiliate_id', affiliate.id);
 
     const allRows = statsRows || [];
-    const heldCents = allRows
-      .filter((r) => r.status === 'held')
-      .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
-    const pendingCents = allRows
-      .filter((r) => r.status === 'pending' || r.status === 'approved')
-      .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
-    const paidCents = allRows
-      .filter((r) => r.status === 'paid')
-      .reduce((sum, r) => sum + (Number(r.commission_cents) || 0), 0);
+
+    // Totals MUST be grouped by currency. Dodo settles in USD/EUR/CAD/AUD/BRL, and adding
+    // EUR cents to USD cents then labelling the result "$" silently misstates what is owed.
+    const bucketFor = (status) => {
+      if (status === 'held') return 'held';
+      if (status === 'pending' || status === 'approved') return 'pending';
+      if (status === 'paid') return 'paid';
+      return null;
+    };
+
+    const totalsByCurrency = {};
+    for (const r of allRows) {
+      const bucket = bucketFor(r.status);
+      if (!bucket) continue;
+      const code = String(r.currency || 'usd').toLowerCase();
+      if (!totalsByCurrency[code]) {
+        totalsByCurrency[code] = { heldCents: 0, pendingCents: 0, paidCents: 0 };
+      }
+      totalsByCurrency[code][`${bucket}Cents`] += Number(r.commission_cents) || 0;
+    }
+
+    const currencies = Object.keys(totalsByCurrency);
+    // Legacy single-currency fields, kept so existing clients keep working. Only meaningful
+    // when every row shares one currency — `currencies` tells the client whether that holds.
+    const usdTotals = totalsByCurrency.usd || { heldCents: 0, pendingCents: 0, paidCents: 0 };
+    const singleCurrencyTotals =
+      currencies.length === 1 ? totalsByCurrency[currencies[0]] : usdTotals;
+    const heldCents = singleCurrencyTotals.heldCents;
+    const pendingCents = singleCurrencyTotals.pendingCents;
+    const paidCents = singleCurrencyTotals.paidCents;
 
     const rows = commissions || [];
 
@@ -13156,6 +13184,9 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
         heldCommissionCents: heldCents,
         pendingCommissionCents: pendingCents,
         paidCommissionCents: paidCents,
+        // Authoritative breakdown: { usd: { heldCents, pendingCents, paidCents }, eur: {...} }
+        totalsByCurrency,
+        currencies,
       },
       commissions: rows,
       recurringMonthsDefault,
