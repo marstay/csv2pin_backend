@@ -99,10 +99,23 @@ export async function runBillingReconciliation({
       continue;
     }
     for (const r of active) {
-      if (r.plan_type !== truePlan || r.pins_limit_per_month !== PLAN_LIMITS[truePlan]) {
+      const planWrong = r.plan_type !== truePlan || r.pins_limit_per_month !== PLAN_LIMITS[truePlan];
+      // billing_interval alone matters more than it looks: pinUsageBucketKey() keys the usage
+      // bucket by CALENDAR MONTH for 'year' and by BILLING PERIOD for 'month'. An annual
+      // subscription mislabelled 'month' would key its bucket to the period start and not
+      // reset until the period ends — one year's worth of pins in a single month's allowance.
+      const intervalWrong = trueInterval && r.billing_interval !== trueInterval;
+
+      if (planWrong) {
         act('CRITICAL', 'plan-drift', `${d.customer?.email}: local ${r.plan_type}/${r.pins_limit_per_month} -> ${truePlan}/${PLAN_LIMITS[truePlan]}`, async () =>
           db.from('billing_subscriptions')
             .update({ plan_type: truePlan, pins_limit_per_month: PLAN_LIMITS[truePlan], billing_interval: trueInterval, updated_at: nowIso() })
+            .eq('id', r.id)
+        );
+      } else if (intervalWrong) {
+        act('HIGH', 'interval-drift', `${d.customer?.email}: billing_interval ${r.billing_interval} -> ${trueInterval} (wrong interval breaks monthly quota reset)`, async () =>
+          db.from('billing_subscriptions')
+            .update({ billing_interval: trueInterval, updated_at: nowIso() })
             .eq('id', r.id)
         );
       }
