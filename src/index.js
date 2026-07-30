@@ -6692,6 +6692,9 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
     .eq('user_id', userId)
     .eq('status', 'posted')
     .not('pinterest_pin_id', 'is', null)
+    // Skip pins Pinterest has told us are gone (404). `neq` would also drop NULLs, which is
+    // what every existing row is, so match "not explicitly disabled" instead.
+    .or('metrics_sync_enabled.is.null,metrics_sync_enabled.eq.true')
     .order('metrics_last_updated', { ascending: true, nullsFirst: true })
     .limit(MAX_PINS_PER_USER_PER_RUN);
 
@@ -6738,7 +6741,42 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
   const twelveHoursAgo = new Date();
   twelveHoursAgo.setHours(twelveHoursAgo.getHours() - 12);
 
+  /**
+   * Pinterest returns 404 for pins the user deleted (or that were posted from an account since
+   * disconnected). They are gone permanently, but nothing marked them, so every run re-queried
+   * them — burning the rate-limit budget and causing 429s for pins that DO have data.
+   * `metrics_sync_enabled` exists on scheduled_pins for exactly this; user_images has no such
+   * column yet, so that update is attempted and its failure logged rather than thrown.
+   */
+  const disableMetricsSyncForDeadPin = async (pin) => {
+    try {
+      const table = pin.source === 'user_images' ? 'user_images' : 'scheduled_pins';
+      const { error } = await supabaseAdmin
+        .from(table)
+        .update({ metrics_sync_enabled: false })
+        .eq('id', pin.id)
+        .eq('user_id', userId);
+      if (error) {
+        console.warn(`⚠️ Could not disable metrics sync for pin ${pin.pinterest_pin_id} (${table}):`, error.message || error);
+      } else {
+        console.log(`🚫 Pin ${pin.pinterest_pin_id} no longer exists on Pinterest — metrics sync disabled`);
+      }
+    } catch (e) {
+      console.warn('disableMetricsSyncForDeadPin threw:', e?.message || e);
+    }
+  };
+
   for (const pin of allPins) {
+    // Spacing must apply to EVERY iteration, not just successful ones. Previously the delay
+    // lived at the end of the loop body and every error path `continue`d past it, so a run of
+    // 404s or 429s fired as fast as Node could manage — which is what produced the bursts.
+    let throttled = false;
+    const throttle = async (ms = 1000) => {
+      if (throttled) return;
+      throttled = true;
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    };
+
     try {
       // Skip if updated recently (within 12 hours)
       if (pin.metrics_last_updated) {
@@ -6797,6 +6835,20 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
             console.warn(`⚠️ Pinterest auth still failing for user ${userId}; account likely needs reconnect. Halting this user's sync.`);
             break;
           }
+          // Gone for good — stop querying it on every future run.
+          if (analyticsResponse.status === 404) {
+            await disableMetricsSyncForDeadPin(pin);
+            await throttle();
+            continue;
+          }
+          // Rate limited. Continuing immediately just 429s the next pin too, so stop this
+          // user's batch — the next scheduled run picks up where this left off, and the
+          // stalest-first ordering means nothing is starved.
+          if (analyticsResponse.status === 429) {
+            console.warn(`⏸️ Pinterest rate limit hit for user ${userId}; halting this user's sync until the next run.`);
+            break;
+          }
+          await throttle();
           continue;
         }
       }
@@ -6808,7 +6860,7 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
       // empty / not-yet-ready payload. Skip the write and let a later run pick it up.
       if (!hasData) {
         console.log(`📊 No usable metrics returned for pin ${pin.pinterest_pin_id} yet; leaving existing values untouched`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await throttle();
         continue;
       }
 
@@ -6871,11 +6923,11 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
         console.error(`❌ Error updating analytics for pin ${pin.pinterest_pin_id}:`, updateError || userImagesError);
       }
 
-      // Rate limit: 1 second between requests
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
     } catch (error) {
       console.error(`❌ Error syncing pin ${pin.pinterest_pin_id}:`, error);
+    } finally {
+      // Rate limit: 1s between requests, on every path including errors and early continues.
+      await throttle();
     }
   }
 
