@@ -4,6 +4,7 @@ import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import dotenv from 'dotenv';
 import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import JSZip from 'jszip';
@@ -7488,7 +7489,10 @@ function releaseNanoBananaSlot() {
  * near zero, the provider itself is the bottleneck and concurrency will not help.
  */
 function createImageTimingCollector() {
-  return { count: 0, queuedMs: 0, genMs: 0, maxGenMs: 0, failures: 0 };
+  // refImgs tracks how many reference images were sent to the provider. Generation times are
+  // sharply bimodal (~78s vs ~200-273s with nothing in between), and the leading hypothesis is
+  // that reference-image requests take the slow path. Logging it makes that testable.
+  return { count: 0, queuedMs: 0, genMs: 0, maxGenMs: 0, failures: 0, refImgs: 0 };
 }
 
 async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) {
@@ -7504,6 +7508,7 @@ async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) 
       timing.queuedMs += startedAt - queuedAt;
       timing.genMs += genMs;
       timing.maxGenMs = Math.max(timing.maxGenMs, genMs);
+      timing.refImgs += Array.isArray(options?.imageInput) ? options.imageInput.length : 0;
       if (!result) timing.failures += 1;
     }
     return result;
@@ -7744,6 +7749,52 @@ async function persistProviderImageUrlToAiImages(sourceUrl, fileStem, logLabel =
     );
     return sourceUrl;
   }
+}
+
+/**
+ * Small TTL memo for work that is identical across every pin of one fan-out batch.
+ *
+ * The frontend generates pins one HTTP request at a time (mode: strategic_single), so the article
+ * fetch and key-idea extraction were being redone for every pin of the same URL — measured at
+ * ~9.5s of duplicated work per pin. Caching them removes that without changing any output:
+ * same inputs, same result, just computed once.
+ *
+ * Keys ALWAYS include the user id so two users generating for the same URL can never share an
+ * entry. In-flight promises are cached too, so pins that start together share one computation
+ * instead of racing to do it N times.
+ */
+const FANOUT_CACHE_TTL_MS = 15 * 60 * 1000;
+const FANOUT_CACHE_MAX = 200;
+const fanoutCache = new Map(); // key -> { at: number, value: Promise }
+
+function fanoutMemo(key, produce) {
+  const now = Date.now();
+  const hit = fanoutCache.get(key);
+  if (hit && now - hit.at < FANOUT_CACHE_TTL_MS) return hit.value;
+
+  const value = (async () => {
+    try {
+      return await produce();
+    } catch (e) {
+      // Never cache a failure — drop it so the next pin retries cleanly.
+      fanoutCache.delete(key);
+      throw e;
+    }
+  })();
+
+  fanoutCache.set(key, { at: now, value });
+
+  if (fanoutCache.size > FANOUT_CACHE_MAX) {
+    for (const [k, v] of fanoutCache) {
+      if (now - v.at >= FANOUT_CACHE_TTL_MS) fanoutCache.delete(k);
+    }
+    while (fanoutCache.size > FANOUT_CACHE_MAX) {
+      const oldest = fanoutCache.keys().next().value;
+      if (oldest === undefined) break;
+      fanoutCache.delete(oldest);
+    }
+  }
+  return value;
 }
 
 async function withSoftTimeout(promise, timeoutMs) {
@@ -9744,14 +9795,23 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     }
 
     const fastForFanOut = isStrategicSingle && !!articleData;
-    const fetchedBase =
-      req._fetchedArticle ||
-      (await fetchArticleBaseAndSummary(rawUrl, articleData, {
+    const fetchArticleOnce = () =>
+      fetchArticleBaseAndSummary(rawUrl, articleData, {
         ...(fastForFanOut ? { fast: true } : {}),
         preResolvedUrl: productPageUrl ? '' : effectiveUrl,
         productPageUrl,
         outputLanguage,
-      }));
+      });
+    const fetchedBase =
+      req._fetchedArticle ||
+      // Only memoised on the fan-out path, where every pin of a batch asks for the identical
+      // article. The multi-pin path already computes this once via req._fetchedArticle.
+      (fastForFanOut
+        ? await fanoutMemo(
+            `article::${req.user.id}::${rawUrl}::${productPageUrl || ''}::${outputLanguage || ''}`,
+            fetchArticleOnce
+          )
+        : await fetchArticleOnce());
     const base = fetchedBase.base;
     let articleSummary = fetchedBase.articleSummary;
 
@@ -10147,7 +10207,14 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     markPhase('setup');
     if ((isStrategic || isStrategicSingle) && req._strategicPlan) {
       const plan = req._strategicPlan;
-      keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
+      // Pure function of articleSummary (it only reads the first 1500 chars), so every pin of a
+      // batch was making the identical OpenAI call. Memoise on a digest of exactly that slice.
+      keyIdeas = await fanoutMemo(
+        `keyideas::${req.user.id}::${createHash('sha1')
+          .update(String(articleSummary || '').slice(0, 1500))
+          .digest('hex')}`,
+        () => extractArticleKeyIdeas(articleSummary, openai)
+      );
       const usedOverlayByLayout = new Map(); // layoutId -> [{ headline, subheadline }, ...]
       const metaResults = [];
       const priorPinCopy = [];
@@ -10794,8 +10861,9 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       console.log(
         `⏱️  urltopin/generate: total=${totalMs}ms pins=${pins.length} ` +
           `setup=${phaseMs.setup}ms copy=${phaseMs.copy}ms images=${phaseMs.images}ms | ` +
-          `imgs=${n} avgGen=${avgGen}ms avgQueue=${avgQueue}ms maxGen=${imageTiming.maxGenMs}ms ` +
-          `queuedShare=${queuedShare}% failures=${imageTiming.failures} concurrency=${NANO_BANANA_MAX_CONCURRENT}`
+          `imgs=${n} refImgs=${imageTiming.refImgs} avgGen=${avgGen}ms avgQueue=${avgQueue}ms ` +
+          `maxGen=${imageTiming.maxGenMs}ms queuedShare=${queuedShare}% ` +
+          `failures=${imageTiming.failures} concurrency=${NANO_BANANA_MAX_CONCURRENT}`
       );
     }
 
