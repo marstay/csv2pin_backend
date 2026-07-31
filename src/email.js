@@ -163,6 +163,40 @@ export async function sendPaymentFailedEmail({ to, planType, recoveryUrl } = {})
 }
 
 /**
+ * Build the "your Pinterest connection expired" email.
+ *
+ * A dead Pinterest token fails silently today: analytics stop updating AND scheduled pins stop
+ * posting, while the dashboard still shows the account as connected. The customer only finds out
+ * when they notice their pins never went live — which is a churn event you never see coming.
+ */
+export function renderPinterestReconnectEmail({ accountName } = {}) {
+  const url = `${FRONTEND_URL}/my-account`;
+  const who = String(accountName || '').trim();
+  const whoPhrase = who ? ` for <strong>${who}</strong>` : '';
+  const subject = `Reconnect your Pinterest account — pins aren't posting`;
+  const bodyHtml = `
+    <p style="margin:0 0 14px;">Hi there,</p>
+    <p style="margin:0 0 14px;">Pinterest has stopped accepting our connection${whoPhrase}. This normally happens when the account password changed, access was revoked, or the connection simply expired.</p>
+    <p style="margin:0 0 14px;">While it's disconnected, <strong>scheduled pins won't post and analytics won't update</strong>. Nothing is lost — your scheduled pins are safe and will resume once you reconnect.</p>
+    <p style="margin:0 0 14px;">Reconnecting takes about 30 seconds:</p>`;
+  const html = emailLayout({
+    heading: 'Your Pinterest connection expired',
+    bodyHtml,
+    ctaText: 'Reconnect Pinterest',
+    ctaUrl: url,
+    ps: `If you reconnect and still see problems, just reply to this email — it comes straight to me.`,
+    footerNote: `You're receiving this because ${BRAND} could not reach Pinterest with your saved connection.`,
+  });
+  return { subject, html };
+}
+
+/** Send the Pinterest reconnect email. Returns the same shape as sendEmail. */
+export async function sendPinterestReconnectEmail({ to, accountName } = {}) {
+  const { subject, html } = renderPinterestReconnectEmail({ accountName });
+  return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });
+}
+
+/**
  * Build the "you're out of / running low on pins — upgrade" expansion email.
  * `reason` is 'limit_reached' (sent when the user hits their monthly AI pin cap).
  */

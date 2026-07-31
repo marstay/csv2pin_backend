@@ -43,6 +43,7 @@ import {
 import {
   sendPaymentFailedEmail,
   sendUpgradeNudgeEmail,
+  sendPinterestReconnectEmail,
   nextPlanFor,
   sendWelcomeEmail,
   sendFirstPinEmail,
@@ -1859,6 +1860,77 @@ async function getUserEmailById(userId) {
 // then subscription.on_hold/failed in quick succession.
 const recentDunningEmails = new Map(); // dedupeKey -> timestamp(ms)
 const DUNNING_EMAIL_DEDUPE_MS = 12 * 60 * 60 * 1000; // 12h
+
+/** In-memory fallback used only when pinterest_accounts.auth_notified_at does not exist. */
+const recentReconnectEmails = new Map(); // userId -> timestamp(ms)
+const RECONNECT_EMAIL_DEDUPE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+let reconnectColumnMissingWarned = false;
+
+/**
+ * Tell a customer their Pinterest connection is dead.
+ *
+ * Deduped against `pinterest_accounts.auth_notified_at` so a redeploy cannot re-email people —
+ * an in-memory guard alone would reset on every Render restart and spam them. If that column
+ * has not been added yet the code still works, falling back to the in-memory map and warning
+ * once, so this can ship before the migration.
+ *
+ *   ALTER TABLE pinterest_accounts ADD COLUMN auth_notified_at timestamptz;
+ */
+async function triggerPinterestReconnectEmail({ userId, account }) {
+  try {
+    if (!isEmailEnabled()) return;
+    const uid = String(userId || '').trim();
+    if (!uid) return;
+    const nowMs = Date.now();
+
+    let usedDbDedupe = false;
+    if (account?.id) {
+      const { data, error } = await supabaseAdmin
+        .from('pinterest_accounts')
+        .select('auth_notified_at')
+        .eq('id', account.id)
+        .maybeSingle();
+      if (!error) {
+        usedDbDedupe = true;
+        const last = data?.auth_notified_at ? new Date(data.auth_notified_at).getTime() : 0;
+        if (last && nowMs - last < RECONNECT_EMAIL_DEDUPE_MS) return;
+      } else if (!reconnectColumnMissingWarned) {
+        reconnectColumnMissingWarned = true;
+        console.warn(
+          '⚠️ pinterest_accounts.auth_notified_at missing — reconnect emails will dedupe in memory only ' +
+            'and may repeat after a restart. Run: ALTER TABLE pinterest_accounts ADD COLUMN auth_notified_at timestamptz;'
+        );
+      }
+    }
+
+    if (!usedDbDedupe) {
+      const last = recentReconnectEmails.get(uid);
+      if (last && nowMs - last < RECONNECT_EMAIL_DEDUPE_MS) return;
+    }
+
+    const email = await getUserEmailById(uid);
+    if (!email) return;
+
+    // Reserve before awaiting the send so two concurrent syncs cannot both email.
+    recentReconnectEmails.set(uid, nowMs);
+    if (usedDbDedupe && account?.id) {
+      await supabaseAdmin
+        .from('pinterest_accounts')
+        .update({ auth_notified_at: new Date(nowMs).toISOString() })
+        .eq('id', account.id);
+    }
+
+    const result = await sendPinterestReconnectEmail({ to: email, accountName: account?.account_name });
+    if (result?.ok) {
+      console.log(`📧 Pinterest reconnect email sent to user ${uid}`);
+    } else {
+      recentReconnectEmails.delete(uid);
+      console.warn('Pinterest reconnect email not sent:', result?.reason || 'unknown');
+    }
+  } catch (e) {
+    console.warn('triggerPinterestReconnectEmail error:', e?.message || e);
+  }
+}
 
 /**
  * Send a "your payment failed — update your card" email, deduped per subscription.
@@ -6833,6 +6905,9 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
           // user will fail too — stop here so the account can be reconnected.
           if (pinterestResponseIsAuthFailure(analyticsResponse.status, body2)) {
             console.warn(`⚠️ Pinterest auth still failing for user ${userId}; account likely needs reconnect. Halting this user's sync.`);
+            // Silent failure is the real damage here: scheduled pins stop posting too, and the
+            // dashboard still shows the account connected. Tell them.
+            await triggerPinterestReconnectEmail({ userId, account });
             break;
           }
           // Gone for good — stop querying it on every future run.
