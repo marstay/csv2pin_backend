@@ -251,6 +251,65 @@ function extractDodoPaymentAmountCents(dataObj) {
   return 0;
 }
 
+/**
+ * Merchant-of-record fee Dodo takes off the top. Not reported per payment, so it is modelled.
+ * Override if Dodo changes terms; both are applied in the SETTLEMENT currency.
+ */
+const AFFILIATE_MOR_FEE_RATE = Math.max(0, Number(process.env.AFFILIATE_MOR_FEE_RATE || '0.04') || 0);
+const AFFILIATE_MOR_FEE_FLAT_CENTS = Math.max(
+  0,
+  Math.floor(Number(process.env.AFFILIATE_MOR_FEE_FLAT_CENTS || '40') || 0)
+);
+
+/**
+ * What we actually KEEP from a payment, which is what commission should be paid on.
+ *
+ * Three corrections over the raw webhook amount, each verified against live Dodo data:
+ *  1. SETTLEMENT, not the charged amount. A CNY 6338 payment settles as 900 USD — commissioning
+ *     the charged figure would treat ¥63.38 as $63.38.
+ *  2. MINUS TAX. A €9.65 sale carried €1.74 of VAT that Dodo remits to the tax authority; we
+ *     never keep it, so paying commission on it is paying out of pocket.
+ *  3. MINUS the MoR fee, which Dodo does not report per payment (settlement_amount is gross of it).
+ *
+ * Returns null when the payment cannot be fetched — callers must then fall back explicitly rather
+ * than silently commissioning the gross amount.
+ */
+async function fetchDodoPaymentNetBreakdown(paymentId) {
+  const pid = String(paymentId || '').trim();
+  if (!pid || !DODO_API_KEY) return null;
+  try {
+    const r = await fetch(`${DODO_BASE_URL}/payments/${encodeURIComponent(pid)}`, {
+      headers: { Authorization: `Bearer ${DODO_API_KEY}` },
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    const grossCents = Math.max(0, Math.round(Number(d?.total_amount) || 0));
+    const settledGross = Number.isFinite(Number(d?.settlement_amount))
+      ? Math.round(Number(d.settlement_amount))
+      : grossCents;
+    const settledTax = Math.max(
+      0,
+      Math.round(Number(d?.settlement_tax ?? d?.tax ?? 0) || 0)
+    );
+    const currency = String(d?.settlement_currency || d?.currency || 'usd').toLowerCase();
+    const afterTax = Math.max(0, settledGross - settledTax);
+    const fee = afterTax > 0 ? Math.round(afterTax * AFFILIATE_MOR_FEE_RATE) + AFFILIATE_MOR_FEE_FLAT_CENTS : 0;
+    return {
+      grossCents,
+      settledGrossCents: settledGross,
+      taxCents: settledTax,
+      feeCents: Math.min(fee, afterTax),
+      netCents: Math.max(0, afterTax - fee),
+      currency,
+      refunded: String(d?.refund_status || '').toLowerCase() === 'succeeded',
+      disputed: Boolean(d?.dispute_status) && String(d.dispute_status).toLowerCase() !== 'null',
+    };
+  } catch (e) {
+    console.warn('fetchDodoPaymentNetBreakdown error:', e?.message || e);
+    return null;
+  }
+}
+
 function extractDodoPaymentId(dataObj) {
   const o = dataObj || {};
   return String(o.payment_id || o.id || o.paymentId || '').trim() || null;
@@ -364,6 +423,46 @@ async function resolveBillingIntervalForAffiliateCommission(userId, opts = {}) {
   return interval || '';
 }
 
+/**
+ * Do the net-accounting / payout columns exist yet? Added by migration, so both schemas must work:
+ *   ALTER TABLE affiliate_commissions
+ *     ADD COLUMN net_amount_cents integer,
+ *     ADD COLUMN tax_cents integer,
+ *     ADD COLUMN fee_cents integer,
+ *     ADD COLUMN paid_at timestamptz,
+ *     ADD COLUMN payout_reference text;
+ */
+let _hasAffiliateNetColumns = null;
+async function hasAffiliateNetColumns() {
+  if (_hasAffiliateNetColumns !== null) return _hasAffiliateNetColumns;
+  try {
+    const { error } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .select('net_amount_cents, tax_cents, fee_cents, paid_at, payout_reference')
+      .limit(1);
+    _hasAffiliateNetColumns = !error;
+    if (error) {
+      console.warn(
+        '💸 affiliate_commissions is missing the net/payout columns — commissions still compute ' +
+          'on net, but the breakdown and payout state cannot be stored. See affiliates_net_payout.sql'
+      );
+    }
+  } catch {
+    _hasAffiliateNetColumns = false;
+  }
+  return _hasAffiliateNetColumns;
+}
+
+/** Net breakdown columns to spread into an insert, or {} on the un-migrated schema. */
+async function affiliateNetColumnsPatch(net) {
+  if (!net || !(await hasAffiliateNetColumns())) return {};
+  return {
+    net_amount_cents: net.netCents,
+    tax_cents: net.taxCents,
+    fee_cents: net.feeCents,
+  };
+}
+
 function affiliateCommissionSchemaError(err) {
   const msg = String(err?.message || err || '').toLowerCase();
   const code = String(err?.code || '');
@@ -440,8 +539,24 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
       1,
       Math.max(0, Number(affiliate.commission_rate) || DEFAULT_AFFILIATE_COMMISSION_RATE)
     );
-    const amountCents = Math.max(0, Number(opts.amountCents || 0) || 0);
-    const commissionCents = amountCents > 0 ? Math.round(amountCents * rate) : 0;
+    const grossCents = Math.max(0, Number(opts.amountCents || 0) || 0);
+
+    // Commission is paid on NET — what we actually keep after settlement FX, tax and MoR fees.
+    // Paying on gross means paying out of pocket on VAT we merely collect for a tax authority.
+    const net = await fetchDodoPaymentNetBreakdown(paymentId);
+    if (net && (net.refunded || net.disputed)) {
+      return { ok: false, reason: net.refunded ? 'payment_refunded' : 'payment_disputed' };
+    }
+    const baseCents = net ? net.netCents : grossCents;
+    const currency = net ? net.currency : String(opts.currency || 'usd').toLowerCase();
+    if (!net) {
+      // Falling back to gross would overpay. Log loudly so it is visible rather than silent.
+      console.warn('affiliate: net breakdown unavailable, commissioning GROSS', {
+        paymentId,
+        grossCents,
+      });
+    }
+    const commissionCents = baseCents > 0 ? Math.round(baseCents * rate) : 0;
 
     const insertPayload = {
       affiliate_id: affiliate.id,
@@ -449,12 +564,13 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
       plan_type: planType,
       payment_id: paymentId,
       dodo_subscription_id: opts.dodoSubscriptionId || null,
-      amount_cents: amountCents,
+      amount_cents: net ? net.settledGrossCents : grossCents,
       commission_cents: commissionCents,
-      currency: String(opts.currency || 'usd').toLowerCase(),
+      currency,
       status,
       commission_kind: commissionKind,
       payable_after: payableAfter,
+      ...(await affiliateNetColumnsPatch(net)),
     };
 
     let { error: insErr } = await supabaseAdmin.from('affiliate_commissions').insert(insertPayload);
@@ -13760,6 +13876,86 @@ app.post('/api/admin/affiliates/:id/disable', requireUser, requireAffiliateAdmin
   }
 });
 
+/**
+ * What is owed to a partner right now, grouped by settlement currency.
+ *
+ * Only `pending`/`approved` count: `held` is still inside the refund window, `void` was refunded
+ * or charged back, `paid` already went out. Currencies are never summed together — Dodo settles
+ * EUR sales in EUR and USD sales in USD, so one number would be meaningless.
+ */
+app.get('/api/admin/affiliate-commissions/owed', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const slug = normalizeAffiliateSlug(req.query.slug);
+    let q = supabaseAdmin
+      .from('affiliate_commissions')
+      .select('id, affiliate_id, commission_cents, currency, status, commission_kind, created_at');
+    if (slug) {
+      const affiliate = await getActiveAffiliateBySlug(slug);
+      if (!affiliate) return res.status(404).json({ error: 'Partner not found' });
+      q = q.eq('affiliate_id', affiliate.id);
+    }
+    const { data, error } = await q.in('status', ['pending', 'approved']);
+    if (error) return res.status(500).json({ error: 'Failed to load commissions' });
+
+    const byAffiliate = {};
+    for (const r of data || []) {
+      const key = r.affiliate_id;
+      const code = String(r.currency || 'usd').toLowerCase();
+      byAffiliate[key] = byAffiliate[key] || { affiliateId: key, count: 0, byCurrency: {} };
+      byAffiliate[key].count += 1;
+      byAffiliate[key].byCurrency[code] =
+        (byAffiliate[key].byCurrency[code] || 0) + (Number(r.commission_cents) || 0);
+    }
+    return res.json({ ok: true, owed: Object.values(byAffiliate) });
+  } catch {
+    return res.status(500).json({ error: 'Failed to load commissions' });
+  }
+});
+
+/**
+ * Record that a payout actually went out. Without this, settled money still reads as owed and
+ * there is no record of what was paid — the fastest route to a dispute with a revenue partner.
+ *
+ * Only `pending`/`approved` rows are marked, so a concurrent refund that voided a row cannot be
+ * silently overwritten as paid, and re-running is idempotent.
+ */
+app.post('/api/admin/affiliate-commissions/pay', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const slug = normalizeAffiliateSlug(req.body?.slug);
+    const currency = String(req.body?.currency || '').trim().toLowerCase();
+    const reference = String(req.body?.reference || '').trim();
+    if (!slug) return res.status(400).json({ error: 'Missing or invalid slug' });
+    if (!currency) return res.status(400).json({ error: 'Missing currency (payouts are per-currency)' });
+    if (!reference) return res.status(400).json({ error: 'Missing payout reference (e.g. the transfer id)' });
+
+    const affiliate = await getActiveAffiliateBySlug(slug);
+    if (!affiliate) return res.status(404).json({ error: 'Partner not found' });
+
+    const now = new Date().toISOString();
+    const patch = { status: 'paid' };
+    if (await hasAffiliateNetColumns()) {
+      patch.paid_at = now;
+      patch.payout_reference = reference;
+    }
+    const { data, error } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .update(patch)
+      .eq('affiliate_id', affiliate.id)
+      .eq('currency', currency)
+      .in('status', ['pending', 'approved'])
+      .select('id, commission_cents');
+    if (error) {
+      console.warn('affiliate payout error:', error.message || error);
+      return res.status(500).json({ error: 'Failed to record payout' });
+    }
+    const totalCents = (data || []).reduce((s, r) => s + (Number(r.commission_cents) || 0), 0);
+    console.log('affiliate: payout recorded', { slug, currency, reference, rows: data?.length || 0, totalCents });
+    return res.json({ ok: true, slug, currency, reference, marked: data?.length || 0, totalCents });
+  } catch {
+    return res.status(500).json({ error: 'Failed to record payout' });
+  }
+});
+
 // ===========================================================================
 // Founder analytics dashboard (admin only)
 // ---------------------------------------------------------------------------
@@ -15786,9 +15982,34 @@ app.post('/api/dodo/webhook', async (req, res) => {
       return res.json({ ok: true, action: 'cancelled', userId: uidForProfile });
     }
 
+    // Chargebacks cost more than the sale itself (the money goes back AND Dodo charges a dispute
+    // fee), so a commission on a disputed payment is money paid out twice over. `refund` alone
+    // never matched these — Dodo raises them as dispute.* events with their own payload shape.
+    if (eventType.includes('dispute') || eventType.includes('chargeback')) {
+      const disputedPaymentId =
+        String(
+          dataObj?.payment_id ||
+            dataObj?.payment?.payment_id ||
+            dataObj?.payment?.id ||
+            metadata?.payment_id ||
+            ''
+        ).trim() || null;
+      if (!disputedPaymentId) {
+        console.warn('dodo webhook: dispute event without a payment id', { eventType });
+        return res.json({ ok: true, ignored: true, reason: 'dispute_missing_payment_id' });
+      }
+      // Void on the way in; a dispute won in our favour is rare and easier to re-credit by hand
+      // than to chase a payout that already went out the door.
+      await voidAffiliateCommissionsForPayment(disputedPaymentId);
+      console.warn('affiliate: commissions voided by dispute', { eventType, paymentId: disputedPaymentId });
+      return res.json({ ok: true, action: 'affiliate_commission_voided_dispute', paymentId: disputedPaymentId });
+    }
+
     if (eventType.includes('refund')) {
       const refundPaymentId =
-        extractDodoPaymentId(dataObj) ||
+        // A refund payload's own `id` is the REFUND id, so the payment id must be read from the
+        // explicit fields first; extractDodoPaymentId would otherwise return the refund's id and
+        // silently match no commission.
         String(
           dataObj?.payment_id ||
             dataObj?.original_payment_id ||
@@ -15796,8 +16017,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
             dataObj?.payment?.id ||
             metadata?.payment_id ||
             ''
-        ).trim() ||
-        null;
+        ).trim() || null;
       if (refundPaymentId) {
         await voidAffiliateCommissionsForPayment(refundPaymentId);
         return res.json({ ok: true, action: 'affiliate_commission_voided', paymentId: refundPaymentId });
