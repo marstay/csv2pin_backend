@@ -341,6 +341,58 @@ export async function sendDay3TipEmail({ to } = {}) {
   return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });
 }
 
+// --- Price-change notice (to customers grandfathered on superseded pricing) ---
+
+/**
+ * "Prices went up, yours didn't" — sent once to existing subscribers when new pricing ships.
+ *
+ * `currentMonthlyUsd` / `newMonthlyUsd` are the customer's REAL rate and the new list rate for
+ * the same plan, so the email states their actual numbers rather than a generic claim.
+ *
+ * The caveat paragraph is not optional. Two paths lose the old rate permanently, and both run
+ * through resolveDodoProductIdForPlan / the checkout map, which ALWAYS return current pricing:
+ *   - changing plan  -> the subscription is moved onto the current product
+ *   - cancelling     -> re-subscribing later is a fresh checkout at current prices
+ * Neither is reversible; there is no code path that puts anyone back on a legacy product.
+ * Promising a locked price without saying so would be a promise the billing code does not keep.
+ */
+export function renderPriceLockEmail({ planType, currentUsd, newUsd, yearly = false } = {}) {
+  const plan = String(planType || '').toLowerCase();
+  const label = PLAN_LABELS[plan] || plan;
+  const cur = Number(currentUsd);
+  const nxt = Number(newUsd);
+  if (!label || !Number.isFinite(cur) || !Number.isFinite(nxt) || cur <= 0) return null;
+  if (nxt <= cur) return null; // nothing to reassure them about
+
+  const per = yearly ? '/year' : '/month';
+  const saving = Math.round((nxt - cur) * 100) / 100;
+  const savingPerYear = yearly ? saving : saving * 12;
+
+  const subject = `Your ${label} price isn't changing`;
+  const bodyHtml = `
+    <p style="margin:0 0 14px;">Hi there,</p>
+    <p style="margin:0 0 14px;">${BRAND} pricing went up this week — ${label} is now <strong>$${nxt}${per}</strong> for new customers.</p>
+    <p style="margin:0 0 14px;"><strong>Your price is not changing.</strong> You keep paying <strong>$${cur}${per}</strong>, with the same ${PLAN_AI_PIN_LIMITS[plan] ? `${PLAN_AI_PIN_LIMITS[plan]} AI pins a month and the ` : ''}same features. That's $${savingPerYear} a year less than the new rate.</p>
+    <p style="margin:0 0 14px;">This isn't a temporary promotion. As long as your subscription stays active, it keeps renewing at $${cur}${per} — there's no end date and nothing you need to do to keep it.</p>
+    <p style="margin:0 0 14px;">The one thing worth knowing: <strong>the old rate is tied to this subscription.</strong> If you switch plans, or cancel and re-subscribe later, you'd be on whatever pricing is current at that point — I can't put you back on $${cur}${per} afterwards. So if you're ever considering a change, reply first and I'll tell you exactly what it would cost you.</p>
+    <p style="margin:0 0 14px;">Otherwise there's nothing to do and nothing to click. I'm only writing so you don't see the new prices on the site and assume your bill went up.</p>`;
+  return {
+    subject,
+    html: emailLayout({
+      heading: `Your price stays at $${cur}${per}`,
+      bodyHtml,
+      ps: `Genuinely — reply to this email if anything about your plan or billing is unclear. It comes straight to me.`,
+      footerNote: `You're receiving this because you're a ${BRAND} ${label} subscriber.`,
+    }),
+  };
+}
+
+export async function sendPriceLockEmail({ to, planType, currentUsd, newUsd, yearly } = {}) {
+  const rendered = renderPriceLockEmail({ planType, currentUsd, newUsd, yearly });
+  if (!rendered) return { ok: false, skipped: true, reason: 'no_price_increase_for_plan' };
+  return sendEmail({ to, subject: rendered.subject, html: rendered.html, replyTo: SUPPORT_EMAIL });
+}
+
 // --- Annual-plan push (to current monthly subscribers) ---
 
 /**
@@ -366,7 +418,8 @@ export function renderAnnualUpgradeEmail({ planType, currentMonthlyUsd } = {}) {
   // dollars is not worth an email either.
   if (savings < monthly) return null;
   const monthsFree = Math.round((savings / monthly) * 10) / 10;
-  const effMonthly = Math.round((annual / 12) * 100) / 100;
+  // Whole dollars, rounded down — matches the pricing page headline ($18, not $18.75).
+  const effMonthly = Math.floor(annual / 12);
 
   const subject = `Save $${savings}/year on your ${label} plan`;
   const bodyHtml = `

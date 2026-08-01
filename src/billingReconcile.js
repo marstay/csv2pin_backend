@@ -84,6 +84,8 @@ export async function runBillingReconciliation({
   const nowIso = () => new Date().toISOString();
 
   const { data: subs } = await db.from('billing_subscriptions').select('*');
+  // Added by a manual migration; `select('*')` simply omits it on an un-migrated schema.
+  const hasProductIdColumn = Boolean(subs?.length) && 'dodo_product_id' in subs[0];
   const { data: profiles } = await db.from('profiles').select('id, plan_type');
   const dodoSubs = await listAllDodo(dodoBase, dodoKey, '/subscriptions');
 
@@ -118,6 +120,16 @@ export async function runBillingReconciliation({
       // subscription mislabelled 'month' would key its bucket to the period start and not
       // reset until the period ends — one year's worth of pins in a single month's allowance.
       const intervalWrong = trueInterval && r.billing_interval !== trueInterval;
+
+      // The stored product id is what tells the app which PRICE this customer pays. A missed
+      // webhook leaves it stale, which silently misprices them everywhere it is read.
+      if (hasProductIdColumn && r.dodo_product_id !== d.product_id) {
+        act('MED', 'product-id-drift', `${d.customer?.email}: dodo_product_id ${r.dodo_product_id || '(null)'} -> ${d.product_id}`, async () =>
+          db.from('billing_subscriptions')
+            .update({ dodo_product_id: d.product_id, updated_at: nowIso() })
+            .eq('id', r.id)
+        );
+      }
 
       if (planWrong) {
         act('CRITICAL', 'plan-drift', `${d.customer?.email}: local ${r.plan_type}/${r.pins_limit_per_month} -> ${truePlan}/${PLAN_LIMITS[truePlan]}`, async () =>

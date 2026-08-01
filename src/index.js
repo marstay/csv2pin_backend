@@ -754,9 +754,10 @@ async function getActiveSubscriptionForUser(userId) {
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_subscriptions')
-      .select(
-        'id, plan_type, pins_limit_per_month, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
-      )
+      // `*` rather than a column list: dodo_product_id is added by a manual migration, and naming
+      // a column that does not exist yet makes PostgREST fail the whole query — which would take
+      // the account page down for every user until the migration ran.
+      .select('*')
       .eq('user_id', userId)
       .eq('status', 'active')
       .order('created_at', { ascending: false })
@@ -797,9 +798,7 @@ async function getLatestPastDueSubscriptionForUser(userId) {
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_subscriptions')
-      .select(
-        'id, plan_type, pins_limit_per_month, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, usage_baseline_pins_used, usage_baseline_user_photo_pins_used'
-      )
+      .select('*') // see getActiveSubscriptionForUser: tolerates the pre/post-migration schema
       .eq('user_id', userId)
       .eq('status', 'past_due')
       .order('created_at', { ascending: false })
@@ -902,11 +901,96 @@ function buildDodoProductIndex() {
   return index;
 }
 
+/**
+ * Does billing_subscriptions have the dodo_product_id column yet?
+ *
+ * The column is added by a manual migration, so code must run correctly on both schemas: writing
+ * a column that does not exist makes PostgREST reject the WHOLE update, which on the webhook path
+ * would mean a paying customer never gets activated. Probed once, then cached.
+ *
+ *   ALTER TABLE billing_subscriptions ADD COLUMN dodo_product_id text;
+ */
+let _hasProductIdColumn = null;
+async function hasDodoProductIdColumn() {
+  if (_hasProductIdColumn !== null) return _hasProductIdColumn;
+  try {
+    const { error } = await supabaseAdmin.from('billing_subscriptions').select('dodo_product_id').limit(1);
+    _hasProductIdColumn = !error;
+    if (error) {
+      console.warn(
+        '💳 billing_subscriptions.dodo_product_id missing — pricing-generation features degraded. ' +
+          'Run: ALTER TABLE billing_subscriptions ADD COLUMN dodo_product_id text;'
+      );
+    }
+  } catch {
+    _hasProductIdColumn = false;
+  }
+  return _hasProductIdColumn;
+}
+
+/** `{ dodo_product_id }` when the column exists and we have a value, else `{}` to spread into a write. */
+async function dodoProductIdPatch(productId) {
+  const id = String(productId || '').trim();
+  if (!id) return {};
+  return (await hasDodoProductIdColumn()) ? { dodo_product_id: id } : {};
+}
+
 /** True when this product is superseded pricing (customer grandfathered at the old rate). */
 function isLegacyDodoProductId(productId) {
   const id = String(productId || '').trim();
   if (!id) return false;
   return Boolean(buildDodoProductIndex().get(id)?.legacy);
+}
+
+// Canonical USD price tables — the single source of truth for what a plan costs. 2026 pricing
+// applies to every new checkout and plan change; LEGACY_* is what grandfathered subscriptions
+// still bill at. Anything reporting a specific customer's price must go through
+// subscriptionPriceUsd() so it resolves the right generation.
+const PLAN_PRICE_USD = { starter: 12, creator: 25, pro: 55, agency: 129 };
+const PLAN_ANNUAL_PRICE_USD = { starter: 108, creator: 225, pro: 495, agency: 1161 };
+const LEGACY_PLAN_PRICE_USD = { starter: 9, creator: 19, pro: 39, agency: 79 };
+const LEGACY_PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
+
+/**
+ * What this subscription actually bills per period, in USD.
+ *
+ * Returns null when `productId` is unknown — callers must treat that as "cannot determine"
+ * rather than falling back to list price, which would misreport every grandfathered customer.
+ */
+function subscriptionPriceUsd(planType, billingInterval, productId) {
+  const p = String(planType || '').toLowerCase();
+  if (!PLAN_PRICE_USD[p]) return null;
+  if (!String(productId || '').trim()) return null;
+  const yearly = normalizeBillingInterval(billingInterval) === 'year';
+  const legacy = isLegacyDodoProductId(productId);
+  const table = legacy
+    ? yearly
+      ? LEGACY_PLAN_ANNUAL_PRICE_USD
+      : LEGACY_PLAN_PRICE_USD
+    : yearly
+      ? PLAN_ANNUAL_PRICE_USD
+      : PLAN_PRICE_USD;
+  return table[p] ?? null;
+}
+
+/**
+ * The "switch to annual and save" offer for a monthly subscriber, or null when there isn't an
+ * honest one. Grandfathered customers usually have none: legacy Starter breaks even and legacy
+ * Pro would pay $27/yr MORE, so this must never be computed from list price.
+ */
+function annualOfferForSubscription(planType, billingInterval, productId) {
+  const p = String(planType || '').toLowerCase();
+  if (normalizeBillingInterval(billingInterval) === 'year') return null;
+  const currentUsd = subscriptionPriceUsd(p, 'month', productId);
+  const annualUsd = PLAN_ANNUAL_PRICE_USD[p];
+  if (!currentUsd || !annualUsd) return null;
+  const saving = Math.round((currentUsd * 12 - annualUsd) * 100) / 100;
+  if (saving < currentUsd) return null; // less than one month free isn't worth pitching
+  return {
+    annual_usd: annualUsd,
+    effective_monthly_usd: Math.floor(annualUsd / 12),
+    saving_per_year_usd: saving,
+  };
 }
 
 function inferPlanTypeFromDodoProductId(productId) {
@@ -1071,6 +1155,8 @@ async function applyPlanActivationForUser(
       cancel_at_period_end: false,
       cancelled_at: null,
       dodo_subscription_id: dodoSubscriptionId,
+      // Records which pricing generation this subscription is billed on; see hasDodoProductIdColumn.
+      ...(await dodoProductIdPatch(opts?.dodoProductId)),
       usage_baseline_pins_used: 0,
       usage_baseline_user_photo_pins_used: 0,
     });
@@ -2454,6 +2540,28 @@ async function getCurrentUsageSnapshot(userId, req = null) {
       user_photo_pins_limit_per_month: planUserPhotoPinsLimit,
       metadata_limit_per_month: planMetaLimit,
     },
+    // What this customer actually pays, resolved from the product their subscription sits on.
+    // Every field is null when the product is unknown (pre-migration, or a row the webhook never
+    // stamped) so the UI shows nothing rather than guessing at list price.
+    billing:
+      subscriptionActive && subscription
+        ? {
+            current_price_usd: subscriptionPriceUsd(
+              planType,
+              subscription.billing_interval,
+              subscription.dodo_product_id
+            ),
+            interval: normalizeBillingInterval(subscription.billing_interval),
+            is_legacy_pricing: subscription.dodo_product_id
+              ? isLegacyDodoProductId(subscription.dodo_product_id)
+              : null,
+            annual_offer: annualOfferForSubscription(
+              planType,
+              subscription.billing_interval,
+              subscription.dodo_product_id
+            ),
+          }
+        : null,
     usage: {
       year_month: pinUsageBucket,
       pins_reset_policy: resetPolicy,
@@ -13661,15 +13769,13 @@ app.post('/api/admin/affiliates/:id/disable', requireUser, requireAffiliateAdmin
 // because the Dodo list endpoints are paginated.
 // ===========================================================================
 
-// Canonical USD pricing + per-sale monthly profit (provided by the founder).
-// 2026 pricing. Grandfathered customers are still billed the LEGACY prices below, so anything
-// that reports revenue per customer must resolve the price from the product they actually sit
-// on (founderMonthlyPriceUsd) rather than reading these maps directly.
-const FOUNDER_PLAN_PRICE_USD = { starter: 12, creator: 25, pro: 55, agency: 129 };
-const FOUNDER_PLAN_ANNUAL_PRICE_USD = { starter: 108, creator: 225, pro: 495, agency: 1161 };
-// Superseded pricing, kept because ~17 subscriptions are still billed at these rates.
-const FOUNDER_LEGACY_PLAN_PRICE_USD = { starter: 9, creator: 19, pro: 39, agency: 79 };
-const FOUNDER_LEGACY_PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
+// Aliases of the canonical price tables defined near subscriptionPriceUsd(). Kept as separate
+// names only because the dashboard code below reads them heavily; do NOT redefine the numbers
+// here — a second copy is how the My Account banner ended up quoting prices that no longer existed.
+const FOUNDER_PLAN_PRICE_USD = PLAN_PRICE_USD;
+const FOUNDER_PLAN_ANNUAL_PRICE_USD = PLAN_ANNUAL_PRICE_USD;
+const FOUNDER_LEGACY_PLAN_PRICE_USD = LEGACY_PLAN_PRICE_USD;
+const FOUNDER_LEGACY_PLAN_ANNUAL_PRICE_USD = LEGACY_PLAN_ANNUAL_PRICE_USD;
 // Per-sale profit is DERIVED (profit = revenue - MoR fees - image COGS) rather than hardcoded,
 // so it stays correct across pricing generations and for grandfathered customers. The previous
 // hardcoded map {starter:5.67, creator:11.74, pro:17.91, agency:33.34} was calibrated to the
@@ -13891,29 +13997,41 @@ async function founderComputeMetrics() {
   const months24 = founderLastNMonths(24);
 
   // ---- Load everything in parallel ----
+  // Resolved first: it decides both which columns are safe to name and whether the Dodo
+  // subscriptions fallback below is needed at all.
+  const hasProductId = await hasDodoProductIdColumn();
+  const subColumns =
+    'id, user_id, plan_type, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, created_at' +
+    (hasProductId ? ', dodo_product_id' : '');
+
   const [subs, profiles, authUsers, expenses, acquisitionMap, payments, refunds, dodoSubs] =
     await Promise.all([
-      founderFetchAll(
-        'billing_subscriptions',
-        'id, user_id, plan_type, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, created_at'
-      ),
+      founderFetchAll('billing_subscriptions', subColumns),
       founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug, created_at'),
       founderFetchAuthUsers(),
       founderLoadExpenses(),
       founderLoadAcquisition(),
       founderDodoList('/payments'),
       founderDodoList('/refunds'),
-      // Only Dodo knows which PRODUCT each subscription sits on, and the product is what
-      // determines the price. billing_subscriptions stores plan_type but no product id, so
-      // without this every grandfathered customer would be counted at 2026 rates.
-      founderDodoList('/subscriptions'),
+      // Fallback only. Product ids normally come from billing_subscriptions.dodo_product_id
+      // (written by the webhook, repaired nightly by reconciliation); this extra page-through of
+      // Dodo runs solely on the un-migrated schema, where the column does not exist yet.
+      hasProductId ? Promise.resolve([]) : founderDodoList('/subscriptions'),
     ]);
 
   const productIdBySubId = new Map();
-  (dodoSubs || []).forEach((d) => {
-    const id = d?.subscription_id || d?.id;
-    if (id && d?.product_id) productIdBySubId.set(id, d.product_id);
-  });
+  if (hasProductId) {
+    subs.forEach((s) => {
+      if (s.dodo_subscription_id && s.dodo_product_id) {
+        productIdBySubId.set(s.dodo_subscription_id, s.dodo_product_id);
+      }
+    });
+  } else {
+    (dodoSubs || []).forEach((d) => {
+      const id = d?.subscription_id || d?.id;
+      if (id && d?.product_id) productIdBySubId.set(id, d.product_id);
+    });
+  }
 
   // ---- Identity maps ----
   const emailByUser = new Map();
@@ -15428,6 +15546,8 @@ app.post('/api/dodo/webhook', async (req, res) => {
               ...(periodStartRaw ? { current_period_start: periodStartRaw } : {}),
               ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
               billing_interval: billingInterval,
+              // The product is the only durable record of which price this customer pays.
+              ...(await dodoProductIdPatch(productIdFromEvent)),
               ...(isRenewal
                 ? {
                     usage_baseline_pins_used: 0,
@@ -15461,6 +15581,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
               billing_interval: billingInterval,
               ...(periodStartRaw ? { current_period_start: periodStartRaw } : {}),
               ...(periodEndRaw ? { current_period_end: periodEndRaw } : {}),
+              ...(await dodoProductIdPatch(productIdFromEvent)),
               updated_at: nowIso,
             })
             .eq('id', existing.id)
@@ -15491,6 +15612,7 @@ app.post('/api/dodo/webhook', async (req, res) => {
           periodStart: periodStartRaw || null,
           periodEnd: periodEndRaw || null,
           dodoSubscriptionId: dodoSubId,
+          dodoProductId: productIdFromEvent || null,
           billingInterval,
         });
       if (!activated.ok) {
