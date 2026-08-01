@@ -14259,10 +14259,18 @@ async function founderComputeMetrics() {
   // One interval per paid subscription row: [start, end).
   const subIntervals = [];
   const subsByUser = new Map();
+  const compedUserIds = new Set();
   subs.forEach((s) => {
     const plan = String(s.plan_type || '').toLowerCase();
     if (!FOUNDER_PLAN_PRICE_USD[plan]) return; // skip free/unknown
     if (isExcludedUser(s.user_id)) return;
+    // Comped grants (comp:*) are free access we handed out — reviewers, influencer trials. They
+    // pay nothing, so counting them as customers overstated MRR by their LIST price (~$130/mo
+    // across 3 accounts) and inflated the customer count. Tracked separately below instead.
+    if (String(s.dodo_subscription_id || '').startsWith('comp:')) {
+      if (['active', 'trialing', 'past_due'].includes(String(s.status))) compedUserIds.add(s.user_id);
+      return;
+    }
     const startMs = s.created_at ? new Date(s.created_at).getTime() : (s.current_period_start ? new Date(s.current_period_start).getTime() : null);
     if (startMs == null || Number.isNaN(startMs)) return;
     const cpe = s.current_period_end ? new Date(s.current_period_end).getTime() : null;
@@ -14769,6 +14777,146 @@ async function founderComputeMetrics() {
   const arr = currentMrr * 12;
   const valuation = [3, 5, 8, 10].map((mult) => ({ multiple: mult, value: Math.round(arr * mult) }));
 
+  // ---- Profitability: am I profitable, and if not, when? ----
+  //
+  // Deliberately built from RECURRING economics rather than this month's cash, because one-off
+  // payment timing (an annual sale landing, a refund clearing) swings a single month enough to
+  // make the answer meaningless. Every input below is per-month at the CURRENT customer base.
+  //
+  // Affiliate commission is a real cost of revenue and was previously missing entirely. Only
+  // pending/approved/paid count — `held` is still inside the refund window and `void` was
+  // refunded or charged back.
+  const affiliateCostByCurrency = {};
+  let affiliateMonthlyUsd = 0;
+  try {
+    const { data: commissionRows } = await supabaseAdmin
+      .from('affiliate_commissions')
+      .select('commission_cents, currency, status, created_at')
+      .in('status', ['pending', 'approved', 'paid']);
+    const sinceMs = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    let recentUsdCents = 0;
+    let recentMonths = 0;
+    const monthsSeen = new Set();
+    for (const c of commissionRows || []) {
+      const code = String(c.currency || 'usd').toLowerCase();
+      affiliateCostByCurrency[code] = (affiliateCostByCurrency[code] || 0) + (Number(c.commission_cents) || 0);
+      const t = new Date(c.created_at).getTime();
+      if (Number.isFinite(t) && t >= sinceMs) {
+        // Only USD is summed into the headline; other currencies are reported separately rather
+        // than converted at a rate we do not have.
+        if (code === 'usd') recentUsdCents += Number(c.commission_cents) || 0;
+        monthsSeen.add(founderMonthKey(t));
+      }
+    }
+    recentMonths = Math.max(1, monthsSeen.size);
+    affiliateMonthlyUsd = round2(recentUsdCents / 100 / recentMonths);
+  } catch {
+    /* table may be empty; costs stay zero */
+  }
+
+  // Image COGS at the current base, worst case (every customer burns their full AI allowance).
+  const cogsMonthly = round2(
+    current.perUser.size
+      ? [...current.perUser.values()].reduce(
+          (sum, iv) => sum + (FOUNDER_PLAN_AI_PINS[iv.plan] || 0) * FOUNDER_AI_PIN_COST_USD,
+          0
+        )
+      : 0
+  );
+  // MoR fees at the current base (annual subs incur the flat fee once a year).
+  const feesMonthly = round2(
+    [...current.perUser.values()].reduce(
+      (sum, iv) =>
+        sum +
+        iv.mrr * FOUNDER_MOR_FEE_RATE +
+        (normalizeBillingInterval(iv.interval) === 'year'
+          ? FOUNDER_MOR_FEE_FLAT_USD / 12
+          : FOUNDER_MOR_FEE_FLAT_USD),
+      0
+    )
+  );
+  // Fixed costs are entered by hand and lag: nothing was logged for the current month as of
+  // Aug 2026, and treating that as $0 makes the business look profitable purely because the bills
+  // have not been typed in. Fall back to the most recent month that HAS entries, and say so.
+  let fixedMonthly = round2(fixedThis);
+  let fixedCostsMonth = thisMonth;
+  let fixedCostsStale = false;
+  if (!(fixedMonthly > 0)) {
+    const recorded = [...fixedByMonth.entries()]
+      .filter(([, v]) => Number(v) > 0)
+      .sort((a, b) => String(b[0]).localeCompare(String(a[0])));
+    if (recorded.length) {
+      fixedMonthly = round2(Number(recorded[0][1]));
+      fixedCostsMonth = recorded[0][0];
+      fixedCostsStale = true;
+    }
+  }
+  const variableCostMonthly = round2(cogsMonthly + feesMonthly + affiliateMonthlyUsd);
+  const contributionMonthly = round2(currentMrr - variableCostMonthly);
+  const netMonthly = round2(contributionMonthly - fixedMonthly);
+  // Share of each new revenue dollar that survives variable costs — drives every projection.
+  const contributionMarginPct = currentMrr > 0 ? round2((contributionMonthly / currentMrr) * 100) : 0;
+  const mrrToBreakeven = contributionMarginPct > 0 ? round2(fixedMonthly / (contributionMarginPct / 100)) : null;
+
+  /**
+   * Months until MRR reaches `target`, compounding at the configured net growth rate.
+   * Null when growth is flat or negative (it never gets there), so the UI can say so plainly
+   * instead of rendering Infinity.
+   */
+  const monthsToMrr = (target) => {
+    if (currentMrr >= target) return 0;
+    const g = fGrowth - fChurn;
+    if (!(g > 0) || currentMrr <= 0) return null;
+    return Math.ceil(Math.log(target / currentMrr) / Math.log(1 + g));
+  };
+  const projectMonths = (n) => (n === null || n === undefined ? null : n);
+  const milestoneTargets = [1000, 3000, 5000, 10000];
+
+  const profitability = {
+    isProfitable: netMonthly > 0,
+    mrr: round2(currentMrr),
+    payingCustomers: current.perUser.size,
+    compedCustomers: compedUserIds.size,
+    costs: {
+      imageCogs: cogsMonthly,
+      dodoFees: feesMonthly,
+      affiliateCommissions: affiliateMonthlyUsd,
+      affiliateByCurrencyCents: affiliateCostByCurrency,
+      fixed: fixedMonthly,
+      fixedCostsMonth,
+      fixedCostsStale,
+      totalVariable: variableCostMonthly,
+      total: round2(variableCostMonthly + fixedMonthly),
+    },
+    contributionMonthly,
+    contributionMarginPct,
+    netMonthly,
+    breakeven: {
+      mrrNeeded: mrrToBreakeven,
+      mrrGap: mrrToBreakeven === null ? null : round2(Math.max(0, mrrToBreakeven - currentMrr)),
+      customersNeeded:
+        mrrToBreakeven === null || !arpu ? null : Math.max(0, Math.ceil((mrrToBreakeven - currentMrr) / arpu)),
+      monthsAway: projectMonths(mrrToBreakeven === null ? null : monthsToMrr(mrrToBreakeven)),
+    },
+    milestones: milestoneTargets.map((m) => ({
+      mrr: m,
+      reached: currentMrr >= m,
+      monthsAway: projectMonths(monthsToMrr(m)),
+      netAtMilestone: round2(m * (contributionMarginPct / 100) - fixedMonthly),
+      customersNeeded: arpu ? Math.max(0, Math.ceil((m - currentMrr) / arpu)) : null,
+    })),
+    assumptions: {
+      monthlyGrowthPct: round2(fGrowth * 100),
+      monthlyChurnPct: round2(fChurn * 100),
+      netGrowthPct: round2((fGrowth - fChurn) * 100),
+      aiPinCostUsd: FOUNDER_AI_PIN_COST_USD,
+      morFeeRate: FOUNDER_MOR_FEE_RATE,
+      note:
+        'COGS assumes every customer uses 100% of their AI pin allowance (worst case). Growth ' +
+        'and churn come from dashboard settings, not measured history.',
+    },
+  };
+
   // ---- Founder scorecard ----
   const targets = settings.targets || FOUNDER_DEFAULT_SETTINGS.targets;
   const milestones = [1000, 3000, 5000, 10000, 25000, 50000].map((m) => ({ mrr: m, reached: currentMrr >= m }));
@@ -14876,6 +15024,7 @@ async function founderComputeMetrics() {
     cashFlow,
     forecast: { months12: forecast12, months24: forecast24, assumptions: { monthlyGrowthPct: settings.forecast?.monthlyGrowthPct, monthlyChurnPct: settings.forecast?.monthlyChurnPct } },
     valuation: { arr: round2(arr), scenarios: valuation },
+    profitability,
     scorecard,
     settings,
   };
