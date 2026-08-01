@@ -7791,6 +7791,65 @@ async function generatePinterestAltText(
 
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const NANO_BANANA_API_URL = process.env.NANO_BANANA_API_URL;
+
+/**
+ * Image-provider adapters.
+ *
+ * Kie.ai and crun.ai are the same platform lineage (both async createTask + task-id polling), so
+ * the differences are purely naming: path casing, auth header, snake_case vs camelCase, and where
+ * the result URL lives. Everything else — retries, timeouts, the stuck-task abandon logic — is
+ * shared, so switching providers cannot change generation behaviour.
+ *
+ * Switch with IMAGE_PROVIDER=crun (default: kie). NANO_BANANA_API_URL must point at the matching
+ * base: https://api.kie.ai/api/v1/jobs  or  https://api.crun.ai/api/v1/client/job
+ */
+const IMAGE_PROVIDERS = {
+  kie: {
+    label: 'Kie.ai',
+    createPath: 'createTask',
+    pollPath: 'recordInfo',
+    pollParam: 'taskId',
+    model: 'nano-banana-2',
+    imagesField: 'image_input',
+    authHeaders: (key) => ({ Authorization: `Bearer ${key}` }),
+    extractTaskId: (json) => json?.data?.taskId || null,
+    extractState: (data) => data?.state,
+    // Kie returns resultJson as a JSON *string* that must be parsed.
+    extractUrl: (data) => {
+      try {
+        const urls = JSON.parse(data?.resultJson || '{}')?.resultUrls;
+        return Array.isArray(urls) && typeof urls[0] === 'string' ? urls[0] : null;
+      } catch {
+        return null;
+      }
+    },
+    describeFailure: (data) => `${data?.failCode ?? ''} ${data?.failMsg ?? ''}`.trim(),
+  },
+  crun: {
+    label: 'crun.ai',
+    createPath: 'CreateTask',
+    pollPath: 'TaskInfo',
+    pollParam: 'task_id',
+    // google/nano-banana-2-v2 is ~40% cheaper but slower and IGNORES output_format, so png is not
+    // guaranteed. Opt in deliberately via NANO_BANANA_MODEL rather than defaulting to it.
+    model: 'google/nano-banana-2',
+    imagesField: 'img_urls',
+    authHeaders: (key) => ({ 'X-API-KEY': key }),
+    extractTaskId: (json) => json?.data?.task_id || null,
+    extractState: (data) => data?.status,
+    extractUrl: (data) => {
+      const urls = data?.result?.media_urls;
+      return Array.isArray(urls) && typeof urls[0] === 'string' ? urls[0] : null;
+    },
+    describeFailure: (data) => `${data?.result?.code ?? ''} ${data?.result?.message ?? ''}`.trim(),
+  },
+};
+
+const IMAGE_PROVIDER =
+  IMAGE_PROVIDERS[String(process.env.IMAGE_PROVIDER || 'kie').trim().toLowerCase()] ||
+  IMAGE_PROVIDERS.kie;
+/** Model id override, so a cheaper variant can be tried without a code change. */
+const IMAGE_PROVIDER_MODEL = String(process.env.NANO_BANANA_MODEL || '').trim() || IMAGE_PROVIDER.model;
 const NANO_BANANA_API_KEY = process.env.NANO_BANANA_API_KEY;
 
 /**
@@ -7967,22 +8026,22 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
 
       // 1) Create async generation task (with timeout to prevent hangs)
       const createRes = await fetchWithTimeout(
-        `${baseUrl}/createTask`,
+        `${baseUrl}/${IMAGE_PROVIDER.createPath}`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${NANO_BANANA_API_KEY}`,
+            ...IMAGE_PROVIDER.authHeaders(NANO_BANANA_API_KEY),
           },
           body: JSON.stringify({
-            model: 'nano-banana-2',
+            model: IMAGE_PROVIDER_MODEL,
             input: {
               prompt,
               aspect_ratio: '2:3',
               google_search: false,
               resolution: '1K',
               output_format: 'png',
-              ...(imageInput.length > 0 ? { image_input: imageInput } : {}),
+              ...(imageInput.length > 0 ? { [IMAGE_PROVIDER.imagesField]: imageInput } : {}),
             },
           }),
         },
@@ -7990,13 +8049,12 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
       );
 
       const createJson = await createRes.json().catch(() => ({}));
-      if (!createRes.ok || createJson.code !== 200 || !createJson.data?.taskId) {
-        console.error('Nano Banana 2 createTask error:', createRes.status, createJson);
+      const taskId = IMAGE_PROVIDER.extractTaskId(createJson);
+      if (!createRes.ok || createJson.code !== 200 || !taskId) {
+        console.error(`${IMAGE_PROVIDER.label} createTask error:`, createRes.status, createJson);
         if (retry < maxRetries - 1 && (createRes.status >= 500 || createRes.status === 429)) continue;
         return null;
       }
-
-      const taskId = createJson.data.taskId;
 
       // 2) Poll recordInfo until success / fail / timeout (defaults ~4 min at 120 * 2s)
       let lastProgressState = null;
@@ -8011,10 +8069,10 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
         for (let pollRetry = 0; pollRetry < maxPollRetries; pollRetry++) {
           try {
             infoRes = await fetchWithTimeout(
-              `${baseUrl}/recordInfo?taskId=${encodeURIComponent(taskId)}`,
+              `${baseUrl}/${IMAGE_PROVIDER.pollPath}?${IMAGE_PROVIDER.pollParam}=${encodeURIComponent(taskId)}`,
               {
                 method: 'GET',
-                headers: { 'Authorization': `Bearer ${NANO_BANANA_API_KEY}` },
+                headers: IMAGE_PROVIDER.authHeaders(NANO_BANANA_API_KEY),
               },
               recordInfoTimeoutMs
             );
@@ -8035,7 +8093,7 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
           continue;
         }
 
-        const stateNorm = normalizeNanoBananaState(infoJson.data.state);
+        const stateNorm = normalizeNanoBananaState(IMAGE_PROVIDER.extractState(infoJson.data));
 
         if (isNanoBananaStateInProgress(stateNorm)) {
           if (stateNorm === lastProgressState) {
@@ -8072,28 +8130,20 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
         sameProgressStateCount = 0;
 
         if (stateNorm === 'fail' || stateNorm === 'failed' || stateNorm === 'error') {
-          console.error('Nano Banana 2 generation failed:', infoJson.data.failCode, infoJson.data.failMsg);
+          console.error(`${IMAGE_PROVIDER.label} generation failed:`, IMAGE_PROVIDER.describeFailure(infoJson.data));
           return null; // Don't retry on explicit API failure
         }
 
         if (stateNorm === 'success' || stateNorm === 'succeeded' || stateNorm === 'completed' || stateNorm === 'done') {
-          try {
-            const resultJsonStr = infoJson.data.resultJson || '{}';
-            const parsed = JSON.parse(resultJsonStr);
-            const urls = parsed.resultUrls;
-            if (Array.isArray(urls) && urls.length > 0 && typeof urls[0] === 'string') {
-              return urls[0];
-            }
-          } catch (e) {
-            console.error('Nano Banana 2 resultJson parse error:', e);
-          }
-          console.warn('Nano Banana 2 success but no resultUrls found');
+          const url = IMAGE_PROVIDER.extractUrl(infoJson.data);
+          if (url) return url;
+          console.warn(`${IMAGE_PROVIDER.label} reported success but returned no image URL`);
           return null;
         }
 
         console.warn(
-          'Nano Banana 2 unexpected state after poll:',
-          infoJson.data.state,
+          `${IMAGE_PROVIDER.label} unexpected state after poll:`,
+          IMAGE_PROVIDER.extractState(infoJson.data),
           infoJson.data
         );
       }
@@ -18859,12 +18909,22 @@ process.on('SIGINT', () => {
 app.listen(PORT, () => {
   console.log(`🚀 Backend listening on port ${PORT}`);
   
+  logDodoProductConfig();
+
+  // Background jobs act on PRODUCTION data regardless of where the process runs. A second
+  // instance started locally against the same .env would double-post customers' scheduled pins
+  // and send duplicate onboarding emails, because Render is already running these.
+  // Set BACKGROUND_JOBS_DISABLED=1 for local development (see backend/.env).
+  if (process.env.BACKGROUND_JOBS_DISABLED === '1') {
+    console.log('⏸️  Background jobs disabled (BACKGROUND_JOBS_DISABLED=1) — API only, safe for local dev');
+    return;
+  }
+
   // Start the scheduled pin processor
   startScheduler();
   startAnalyticsSync();
   startRefImageCleanup();
   startTrendsScheduler();
   startOnboardingEmails();
-  logDodoProductConfig();
   startBillingReconciliation();
 }); 
