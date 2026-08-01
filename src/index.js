@@ -13985,6 +13985,9 @@ const FOUNDER_LEGACY_PLAN_ANNUAL_PRICE_USD = LEGACY_PLAN_ANNUAL_PRICE_USD;
  */
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
+/** Subscription statuses that mean "no longer a customer", however the period dates read. */
+const FOUNDER_TERMINAL_SUB_STATUSES = new Set(['cancelled', 'canceled', 'expired', 'refunded', 'paused']);
+
 const FOUNDER_AI_PIN_COST_USD = Number(process.env.FOUNDER_AI_PIN_COST_USD || 0.0425);
 const FOUNDER_PLAN_AI_PINS = { starter: 60, creator: 150, pro: 450, agency: 1000 };
 const FOUNDER_MOR_FEE_RATE = Number(process.env.FOUNDER_MOR_FEE_RATE || 0.04);
@@ -13999,7 +14002,23 @@ const FOUNDER_ONGOING_MS = Date.UTC(2999, 0, 1);
 // Default config; overridden by admin_settings row 'founder_dashboard'.
 const FOUNDER_DEFAULT_SETTINGS = {
   // USD value of 1 unit of each currency (Dodo amounts are in minor units / cents).
-  exchangeRates: { USD: 1, EUR: 1.08, CAD: 0.73, AUD: 0.66, BRL: 0.18 },
+  // USD per 1 unit of the currency. Any code missing here is counted 1:1, which is catastrophic
+  // for weak currencies — two NGN failed payments were reported as $25,858 of lost revenue when
+  // the true figure was about $17. Keep every currency Dodo has ever settled in listed.
+  exchangeRates: {
+    USD: 1,
+    EUR: 1.08,
+    GBP: 1.27,
+    CAD: 0.73,
+    AUD: 0.66,
+    BRL: 0.18,
+    CNY: 0.14,
+    NGN: 0.00065,
+    ZMW: 0.037,
+    INR: 0.012,
+    MXN: 0.05,
+    ZAR: 0.055,
+  },
   startingCashUsd: 0,
   targets: { mrr: 10000, customers: 500, profit: 5000 },
   forecast: { monthlyGrowthPct: 10, monthlyChurnPct: 5 },
@@ -14050,11 +14069,23 @@ function founderMonthlyPriceUsd(planType, billingInterval, productId) {
   return monthly[p] || 0;
 }
 
+/**
+ * Minor units in `currency` -> major units in USD.
+ *
+ * A missing rate falls back to 1:1, which silently overstates weak currencies by orders of
+ * magnitude (NGN was counted at ~1500x its value). Unrated codes are recorded in
+ * `founderUnratedCurrencies` so the dashboard can surface them instead of quietly lying.
+ */
+const founderUnratedCurrencies = new Map();
 function founderConvertToUsd(minorAmount, currency, rates) {
   const n = Number(minorAmount);
   if (!Number.isFinite(n) || n === 0) return 0;
   const code = String(currency || 'USD').toUpperCase();
-  const rate = rates && Number.isFinite(Number(rates[code])) ? Number(rates[code]) : 1;
+  const known = rates && Number.isFinite(Number(rates[code]));
+  if (!known) {
+    founderUnratedCurrencies.set(code, (founderUnratedCurrencies.get(code) || 0) + 1);
+  }
+  const rate = known ? Number(rates[code]) : 1;
   return (n / 100) * rate; // minor units -> major, then -> USD
 }
 
@@ -14190,8 +14221,11 @@ let founderMetricsCache = { at: 0, payload: null };
 const FOUNDER_CACHE_TTL_MS = 5 * 60 * 1000;
 
 async function founderComputeMetrics() {
+  founderUnratedCurrencies.clear(); // module-scoped tally; must not accumulate across requests
   const settings = await founderLoadSettings();
-  const rates = settings.exchangeRates || FOUNDER_DEFAULT_SETTINGS.exchangeRates;
+  // Merge over the defaults: a settings row saved before a currency was added would otherwise
+  // drop that rate and silently reintroduce 1:1 conversion.
+  const rates = { ...FOUNDER_DEFAULT_SETTINGS.exchangeRates, ...(settings.exchangeRates || {}) };
   const now = new Date();
   const nowMs = now.getTime();
   const thisMonth = founderMonthKey(now);
@@ -14288,8 +14322,13 @@ async function founderComputeMetrics() {
     //  - active + renewing     -> ONGOING (it auto-renews; do NOT cap at period end,
     //                             otherwise every monthly sub looks "churned" each month)
     let endMs;
-    if (s.status === 'cancelled') {
-      endMs = s.cancelled_at ? new Date(s.cancelled_at).getTime() : (cpe || startMs);
+    if (FOUNDER_TERMINAL_SUB_STATUSES.has(String(s.status || '').toLowerCase())) {
+      // A terminal row is NOT active now, whatever its period end says. Two real cases were being
+      // counted as live customers: `cancelled` rows with a null cancelled_at (fell back to a
+      // future current_period_end) and `expired` rows (matched no branch at all, so they landed in
+      // the ONGOING default and inflated MRR forever).
+      const explicitEnd = s.cancelled_at ? new Date(s.cancelled_at).getTime() : cpe || startMs;
+      endMs = Math.min(Number.isFinite(explicitEnd) ? explicitEnd : nowMs, nowMs);
     } else if (cpe && cpe <= nowMs) {
       endMs = cpe; // active row whose period already lapsed (not yet cleaned up)
     } else if (s.cancel_at_period_end) {
@@ -14905,13 +14944,55 @@ async function founderComputeMetrics() {
         mrrToBreakeven === null || !arpu ? null : Math.max(0, Math.ceil((mrrToBreakeven - currentMrr) / arpu)),
       monthsAway: projectMonths(mrrToBreakeven === null ? null : monthsToMrr(mrrToBreakeven)),
     },
-    milestones: milestoneTargets.map((m) => ({
-      mrr: m,
-      reached: currentMrr >= m,
-      monthsAway: projectMonths(monthsToMrr(m)),
-      netAtMilestone: round2(m * (contributionMarginPct / 100) - fixedMonthly),
-      customersNeeded: arpu ? Math.max(0, Math.ceil((m - currentMrr) / arpu)) : null,
-    })),
+    milestones: milestoneTargets.map((m) => {
+      const customersTotal = arpu ? Math.ceil(m / arpu) : null;
+      const customersNeeded = arpu ? Math.max(0, Math.ceil((m - currentMrr) / arpu)) : null;
+      // Image COGS scales with customers, not revenue — a plan's pin allowance is fixed. Use the
+      // current average per customer rather than a revenue ratio, which would understate it if
+      // growth skews toward cheaper plans.
+      const cogsPerCustomer = current.perUser.size ? cogsMonthly / current.perUser.size : 0;
+      const cogsAt = round2(cogsPerCustomer * (customersTotal || 0));
+      const feesAt = round2(m * FOUNDER_MOR_FEE_RATE + FOUNDER_MOR_FEE_FLAT_USD * (customersTotal || 0));
+      // Affiliate cost is assumed to stay the same share of revenue it is today.
+      const affiliateShare = currentMrr > 0 ? affiliateMonthlyUsd / currentMrr : 0;
+      const affiliateAt = round2(m * affiliateShare);
+      const netAt = round2(m - cogsAt - feesAt - affiliateAt - fixedMonthly);
+
+      // How many customers must be ADDED each month to arrive in N months — and, separately, how
+      // many must be SIGNED, because churn eats into the base every month. The gross number is
+      // the one that matters for planning acquisition.
+      const pace = [12, 24, 36].map((horizon) => {
+        const netAdds = customersNeeded ? Math.ceil(customersNeeded / horizon) : 0;
+        const avgBase = current.perUser.size + (customersNeeded || 0) / 2;
+        const churnedPerMonth = Math.round(avgBase * fChurn);
+        return { months: horizon, netAddsPerMonth: netAdds, grossAddsPerMonth: netAdds + churnedPerMonth };
+      });
+
+      return {
+        mrr: m,
+        reached: currentMrr >= m,
+        monthsAway: projectMonths(monthsToMrr(m)),
+        netAtMilestone: netAt,
+        customersNeeded,
+        customersTotal,
+        // Same target reached with a single plan — shows how much the mix matters.
+        planMix: FOUNDER_PLAN_ORDER.map((plan) => ({
+          plan,
+          price: PLAN_PRICE_USD[plan],
+          customers: PLAN_PRICE_USD[plan] ? Math.ceil(m / PLAN_PRICE_USD[plan]) : null,
+        })),
+        economics: {
+          revenue: m,
+          imageCogs: cogsAt,
+          dodoFees: feesAt,
+          affiliate: affiliateAt,
+          fixed: fixedMonthly,
+          net: netAt,
+          marginPct: m > 0 ? round2((netAt / m) * 100) : 0,
+        },
+        pace,
+      };
+    }),
     assumptions: {
       monthlyGrowthPct: round2(fGrowth * 100),
       monthlyChurnPct: round2(fChurn * 100),
@@ -14950,6 +15031,8 @@ async function founderComputeMetrics() {
       realRefundsCounted: countedRefunds.length,
       failedRetriesIgnored,
       duplicateActiveSubsDeduped,
+      // Non-empty means some money was counted at 1:1 because no rate is configured for it.
+      unratedCurrencies: [...founderUnratedCurrencies.entries()].map(([code, count]) => ({ code, count })),
       note: 'Test/admin accounts excluded by email. Refunds within 24h (or reason=test) void the underlying sale and are not counted as losses. Duplicate failed-payment retries are collapsed to one per subscription per month. Upgrade/downgrade chains and duplicate subscriptions are deduped to one (highest) active sub per customer.',
     },
     executive: {
