@@ -13978,6 +13978,13 @@ const FOUNDER_LEGACY_PLAN_ANNUAL_PRICE_USD = LEGACY_PLAN_ANNUAL_PRICE_USD;
 // old $9/$19/$39/$79 prices and silently understated profit once 2026 pricing shipped.
 // COGS assumes the full AI-pin allowance is generated (worst case). Pin limits are identical
 // across pricing generations, so the COGS term does not depend on the customer's product.
+/**
+ * Round to cents. Module scope on purpose: it used to be declared partway down
+ * founderComputeMetrics, so any code added ABOVE that point hit the temporal dead zone
+ * ("Cannot access 'round2' before initialization") and the whole endpoint 500'd.
+ */
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
 const FOUNDER_AI_PIN_COST_USD = Number(process.env.FOUNDER_AI_PIN_COST_USD || 0.0425);
 const FOUNDER_PLAN_AI_PINS = { starter: 60, creator: 150, pro: 450, agency: 1000 };
 const FOUNDER_MOR_FEE_RATE = Number(process.env.FOUNDER_MOR_FEE_RATE || 0.04);
@@ -14926,8 +14933,6 @@ async function founderComputeMetrics() {
     profit: { current: Math.round(totalMonthlyProfit), target: targets.profit, gap: Math.round((targets.profit || 0) - totalMonthlyProfit) },
     milestones,
   };
-
-  const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
   // ---- Data hygiene summary (dedup / ignore rules applied) ----
   const rawActiveSubRows = subIntervals.filter((iv) => activeAtMs(iv, nowMs)).length;
