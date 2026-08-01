@@ -871,40 +871,54 @@ function resolveDodoProductIdForPlan(planType, billingInterval) {
  * once at checkout and is NOT updated on plan change — trusting it caused paying Agency customers
  * to be silently served Creator limits on renewal.
  */
+/**
+ * Every Dodo product this app has ever sold, keyed by product id.
+ *
+ * Built by scanning the environment rather than listing vars by hand, so a pricing generation can
+ * be added purely as config. Both naming shapes are recognised:
+ *
+ *   DODO_PRODUCT_CREATOR_ID                 current monthly   (new checkouts use this)
+ *   DODO_PRODUCT_CREATOR_ANNUAL_ID          current annual
+ *   DODO_PRODUCT_CREATOR_LEGACY_ID          superseded monthly (grandfathered customers)
+ *   DODO_PRODUCT_CREATOR_ANNUAL_LEGACY_ID   superseded annual
+ *   DODO_PRODUCT_CREATOR_LEGACY2_ID         older still — any number of slots
+ *
+ * This MUST include legacy ids. Reverse lookups drive the renewal webhook and the reconciliation
+ * job, so a product they cannot resolve means a grandfathered customer gets treated as unknown —
+ * previously that meant being reverted to the wrong plan on renewal. Every repricing turns the
+ * current ids into legacy ids: move them to a free _LEGACYn_ slot, never delete them.
+ */
+function buildDodoProductIndex() {
+  const index = new Map(); // productId -> { plan, interval, legacy }
+  for (const [k, v] of Object.entries(process.env)) {
+    const m = String(k).match(/^DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?(_LEGACY\d*)?_ID$/);
+    if (!m || !v) continue;
+    const plan = m[1].toLowerCase();
+    if (plan === 'free') continue;
+    const id = String(v).trim();
+    if (!id) continue;
+    index.set(id, { plan, interval: m[2] ? 'year' : 'month', legacy: Boolean(m[3]) });
+  }
+  return index;
+}
+
+/** True when this product is superseded pricing (customer grandfathered at the old rate). */
+function isLegacyDodoProductId(productId) {
+  const id = String(productId || '').trim();
+  if (!id) return false;
+  return Boolean(buildDodoProductIndex().get(id)?.legacy);
+}
+
 function inferPlanTypeFromDodoProductId(productId) {
   const id = String(productId || '').trim();
   if (!id) return null;
-  const pairs = [
-    ['starter', process.env.DODO_PRODUCT_STARTER_ID],
-    ['creator', process.env.DODO_PRODUCT_CREATOR_ID],
-    ['pro', process.env.DODO_PRODUCT_PRO_ID],
-    ['agency', process.env.DODO_PRODUCT_AGENCY_ID],
-    ['starter', process.env.DODO_PRODUCT_STARTER_ANNUAL_ID],
-    ['creator', process.env.DODO_PRODUCT_CREATOR_ANNUAL_ID],
-    ['pro', process.env.DODO_PRODUCT_PRO_ANNUAL_ID],
-    ['agency', process.env.DODO_PRODUCT_AGENCY_ANNUAL_ID],
-  ];
-  for (const [plan, pid] of pairs) {
-    if (pid && String(pid).trim() === id) return plan;
-  }
-  return null;
+  return buildDodoProductIndex().get(id)?.plan || null;
 }
 
 function inferBillingIntervalFromDodoProductId(productId) {
   const id = String(productId || '').trim();
   if (!id) return 'month';
-  const annualIds = new Set(
-    [
-      process.env.DODO_PRODUCT_STARTER_ANNUAL_ID,
-      process.env.DODO_PRODUCT_CREATOR_ANNUAL_ID,
-      process.env.DODO_PRODUCT_PRO_ANNUAL_ID,
-      process.env.DODO_PRODUCT_AGENCY_ANNUAL_ID,
-    ]
-      .map((x) => String(x || '').trim())
-      .filter(Boolean)
-  );
-  if (annualIds.has(id)) return 'year';
-  return 'month';
+  return buildDodoProductIndex().get(id)?.interval || 'month';
 }
 
 async function fetchDodoProductExists(productId) {
@@ -13612,9 +13626,24 @@ app.post('/api/admin/affiliates/:id/disable', requireUser, requireAffiliateAdmin
 // ===========================================================================
 
 // Canonical USD pricing + per-sale monthly profit (provided by the founder).
-const FOUNDER_PLAN_PRICE_USD = { starter: 9, creator: 19, pro: 39, agency: 79 };
-const FOUNDER_PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
-const FOUNDER_PLAN_MONTHLY_PROFIT_USD = { starter: 5.67, creator: 11.74, pro: 17.91, agency: 33.34 };
+// 2026 pricing. Grandfathered customers are still billed the LEGACY prices below, so anything
+// that reports revenue per customer must resolve the price from the product they actually sit
+// on (founderMonthlyPriceUsd) rather than reading these maps directly.
+const FOUNDER_PLAN_PRICE_USD = { starter: 12, creator: 25, pro: 55, agency: 129 };
+const FOUNDER_PLAN_ANNUAL_PRICE_USD = { starter: 108, creator: 225, pro: 495, agency: 1161 };
+// Superseded pricing, kept because ~17 subscriptions are still billed at these rates.
+const FOUNDER_LEGACY_PLAN_PRICE_USD = { starter: 9, creator: 19, pro: 39, agency: 79 };
+const FOUNDER_LEGACY_PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
+// Per-sale profit is DERIVED (profit = revenue - MoR fees - image COGS) rather than hardcoded,
+// so it stays correct across pricing generations and for grandfathered customers. The previous
+// hardcoded map {starter:5.67, creator:11.74, pro:17.91, agency:33.34} was calibrated to the
+// old $9/$19/$39/$79 prices and silently understated profit once 2026 pricing shipped.
+// COGS assumes the full AI-pin allowance is generated (worst case). Pin limits are identical
+// across pricing generations, so the COGS term does not depend on the customer's product.
+const FOUNDER_AI_PIN_COST_USD = Number(process.env.FOUNDER_AI_PIN_COST_USD || 0.0425);
+const FOUNDER_PLAN_AI_PINS = { starter: 60, creator: 150, pro: 450, agency: 1000 };
+const FOUNDER_MOR_FEE_RATE = Number(process.env.FOUNDER_MOR_FEE_RATE || 0.04);
+const FOUNDER_MOR_FEE_FLAT_USD = Number(process.env.FOUNDER_MOR_FEE_FLAT_USD || 0.4);
 const FOUNDER_PLAN_ORDER = ['starter', 'creator', 'pro', 'agency'];
 const FOUNDER_PLAN_DISPLAY = { starter: 'Starter', creator: 'Creator', pro: 'Pro', agency: 'Agency' };
 const FOUNDER_EXPENSE_CATEGORIES = ['openai', 'hosting', 'domains', 'email', 'ads', 'contractors', 'other'];
@@ -13658,13 +13687,22 @@ function founderLastNMonths(n, endMonthKey) {
   return out;
 }
 
-function founderMonthlyPriceUsd(planType, billingInterval) {
+/**
+ * Monthly USD a subscription actually bills, normalised (annual is divided by 12).
+ *
+ * `productId` selects the pricing generation. Grandfathered customers keep the legacy rate for
+ * the life of the subscription, so omitting it overstates MRR for every pre-2026 customer.
+ */
+function founderMonthlyPriceUsd(planType, billingInterval, productId) {
   const p = String(planType || '').toLowerCase();
   if (!FOUNDER_PLAN_PRICE_USD[p]) return 0;
+  const legacy = isLegacyDodoProductId(productId);
+  const monthly = legacy ? FOUNDER_LEGACY_PLAN_PRICE_USD : FOUNDER_PLAN_PRICE_USD;
+  const annual = legacy ? FOUNDER_LEGACY_PLAN_ANNUAL_PRICE_USD : FOUNDER_PLAN_ANNUAL_PRICE_USD;
   if (normalizeBillingInterval(billingInterval) === 'year') {
-    return (FOUNDER_PLAN_ANNUAL_PRICE_USD[p] || 0) / 12;
+    return (annual[p] || 0) / 12;
   }
-  return FOUNDER_PLAN_PRICE_USD[p] || 0;
+  return monthly[p] || 0;
 }
 
 function founderConvertToUsd(minorAmount, currency, rates) {
@@ -13817,18 +13855,29 @@ async function founderComputeMetrics() {
   const months24 = founderLastNMonths(24);
 
   // ---- Load everything in parallel ----
-  const [subs, profiles, authUsers, expenses, acquisitionMap, payments, refunds] = await Promise.all([
-    founderFetchAll(
-      'billing_subscriptions',
-      'id, user_id, plan_type, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, created_at'
-    ),
-    founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug, created_at'),
-    founderFetchAuthUsers(),
-    founderLoadExpenses(),
-    founderLoadAcquisition(),
-    founderDodoList('/payments'),
-    founderDodoList('/refunds'),
-  ]);
+  const [subs, profiles, authUsers, expenses, acquisitionMap, payments, refunds, dodoSubs] =
+    await Promise.all([
+      founderFetchAll(
+        'billing_subscriptions',
+        'id, user_id, plan_type, status, billing_interval, current_period_start, current_period_end, cancel_at_period_end, cancelled_at, dodo_subscription_id, created_at'
+      ),
+      founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug, created_at'),
+      founderFetchAuthUsers(),
+      founderLoadExpenses(),
+      founderLoadAcquisition(),
+      founderDodoList('/payments'),
+      founderDodoList('/refunds'),
+      // Only Dodo knows which PRODUCT each subscription sits on, and the product is what
+      // determines the price. billing_subscriptions stores plan_type but no product id, so
+      // without this every grandfathered customer would be counted at 2026 rates.
+      founderDodoList('/subscriptions'),
+    ]);
+
+  const productIdBySubId = new Map();
+  (dodoSubs || []).forEach((d) => {
+    const id = d?.subscription_id || d?.id;
+    if (id && d?.product_id) productIdBySubId.set(id, d.product_id);
+  });
 
   // ---- Identity maps ----
   const emailByUser = new Map();
@@ -13887,7 +13936,7 @@ async function founderComputeMetrics() {
       userId: s.user_id,
       plan,
       interval: s.billing_interval,
-      mrr: founderMonthlyPriceUsd(plan, s.billing_interval),
+      mrr: founderMonthlyPriceUsd(plan, s.billing_interval, productIdBySubId.get(s.dodo_subscription_id)),
       startMs,
       endMs: Math.max(endMs, startMs),
       status: s.status,
@@ -14175,14 +14224,30 @@ async function founderComputeMetrics() {
   const planAnalytics = FOUNDER_PLAN_ORDER.map((plan) => {
     let custs = 0;
     let mrr = 0;
-    current.perUser.forEach((iv) => { if (iv.plan === plan) { custs += 1; mrr += iv.mrr; } });
+    // Annual subscribers incur the flat MoR fee once a year, not once a month.
+    let flatFeesMonthly = 0;
+    current.perUser.forEach((iv) => {
+      if (iv.plan !== plan) return;
+      custs += 1;
+      mrr += iv.mrr;
+      flatFeesMonthly +=
+        normalizeBillingInterval(iv.interval) === 'year'
+          ? FOUNDER_MOR_FEE_FLAT_USD / 12
+          : FOUNDER_MOR_FEE_FLAT_USD;
+    });
     // churned this month on this plan
     let planChurned = 0;
     snapStart.perUser.forEach((iv, userId) => {
       if (iv.plan !== plan) return;
       if (churnedCustomers.includes(userId)) planChurned += 1;
     });
-    const profit = (FOUNDER_PLAN_MONTHLY_PROFIT_USD[plan] || 0) * custs;
+    // mrr already reflects each customer's real (possibly grandfathered) price.
+    const profit = Math.max(
+      0,
+      mrr * (1 - FOUNDER_MOR_FEE_RATE) -
+        flatFeesMonthly -
+        (FOUNDER_PLAN_AI_PINS[plan] || 0) * FOUNDER_AI_PIN_COST_USD * custs
+    );
     return {
       plan: FOUNDER_PLAN_DISPLAY[plan],
       slug: plan,

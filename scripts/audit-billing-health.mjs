@@ -48,9 +48,11 @@ const PLAN_LIMITS = { free: 10, starter: 60, creator: 150, pro: 450, agency: 100
 const ACTIVE_STATES = new Set(['active', 'trialing', 'past_due']);
 const productToPlan = {};
 const productToInterval = {};
-for (const m of envRaw.matchAll(/DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?_ID\s*=\s*(\S+)/g)) {
-  productToPlan[m[3].trim()] = m[1].toLowerCase();
-  productToInterval[m[3].trim()] = m[2] ? 'year' : 'month';
+// _LEGACYn ids map grandfathered customers on superseded pricing; without them every customer
+// still on old products reads as an unknown plan.
+for (const m of envRaw.matchAll(/DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?(_LEGACY\d*)?_ID\s*=\s*(\S+)/g)) {
+  productToPlan[m[4].trim()] = m[1].toLowerCase();
+  productToInterval[m[4].trim()] = m[2] ? 'year' : 'month';
 }
 
 async function listAll(path) {

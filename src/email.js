@@ -40,8 +40,12 @@ const ACCENT = '#1A237E';
 // Personal founder voice: emails are signed by the founder and invite replies.
 const FOUNDER_NAME = String(process.env.FOUNDER_NAME || 'Aristomenis').trim();
 const PLAN_LABELS = { free: 'Free', starter: 'Starter', creator: 'Creator', pro: 'Pro', agency: 'Agency' };
-const PLAN_PRICES_USD = { free: 0, starter: 9, creator: 19, pro: 39, agency: 79 };
-const PLAN_ANNUAL_PRICE_USD = { starter: 84, creator: 180, pro: 384, agency: 780 };
+// 2026 pricing. These are the prices a reader would actually be charged if they act on the email:
+// both new checkouts and plan changes resolve to the CURRENT products, so a grandfathered $9
+// Starter customer who upgrades to Creator pays $25, not the old $19. Never quote legacy prices
+// in an outbound email — quote what the checkout will charge.
+const PLAN_PRICES_USD = { free: 0, starter: 12, creator: 25, pro: 55, agency: 129 };
+const PLAN_ANNUAL_PRICE_USD = { starter: 108, creator: 225, pro: 495, agency: 1161 };
 const PLAN_AI_PIN_LIMITS = { free: 10, starter: 60, creator: 150, pro: 450, agency: 1000 };
 const NEXT_PLAN = { free: 'starter', starter: 'creator', creator: 'pro', pro: 'agency', agency: null };
 
@@ -339,14 +343,28 @@ export async function sendDay3TipEmail({ to } = {}) {
 
 // --- Annual-plan push (to current monthly subscribers) ---
 
-/** Build the "switch to annual and save" email for a given monthly plan. */
-export function renderAnnualUpgradeEmail({ planType } = {}) {
+/**
+ * Build the "switch to annual and save" email for a given monthly plan.
+ *
+ * `currentMonthlyUsd` is what THIS customer pays today, which is not always the list price:
+ * grandfathered subscribers are still billed the pre-2026 rate. A legacy $9 Starter switching to
+ * the $108 annual plan saves nothing, so quoting the list-price saving ($36) would be a false
+ * claim. Callers that know the customer's real rate should pass it; when the saving works out to
+ * zero or less, this returns null and the send is skipped.
+ */
+export function renderAnnualUpgradeEmail({ planType, currentMonthlyUsd } = {}) {
   const plan = String(planType || '').toLowerCase();
-  const monthly = PLAN_PRICES_USD[plan];
+  const listMonthly = PLAN_PRICES_USD[plan];
   const annual = PLAN_ANNUAL_PRICE_USD[plan];
-  if (!monthly || !annual) return null;
+  if (!listMonthly || !annual) return null;
+  const parsed = Number(currentMonthlyUsd);
+  const monthly = Number.isFinite(parsed) && parsed > 0 ? parsed : listMonthly;
   const label = PLAN_LABELS[plan] || plan;
-  const savings = monthly * 12 - annual;
+  const savings = Math.round((monthly * 12 - annual) * 100) / 100;
+  // Require at least one month free. Legacy rates make this campaign a bad deal — a $39 Pro
+  // customer moving to the $495 annual plan would pay $27 MORE per year — and a token few
+  // dollars is not worth an email either.
+  if (savings < monthly) return null;
   const monthsFree = Math.round((savings / monthly) * 10) / 10;
   const effMonthly = Math.round((annual / 12) * 100) / 100;
 
@@ -366,9 +384,9 @@ export function renderAnnualUpgradeEmail({ planType } = {}) {
   return { subject, html };
 }
 
-export async function sendAnnualUpgradeEmail({ to, planType } = {}) {
-  const rendered = renderAnnualUpgradeEmail({ planType });
-  if (!rendered) return { ok: false, skipped: true, reason: 'no_annual_for_plan' };
+export async function sendAnnualUpgradeEmail({ to, planType, currentMonthlyUsd } = {}) {
+  const rendered = renderAnnualUpgradeEmail({ planType, currentMonthlyUsd });
+  if (!rendered) return { ok: false, skipped: true, reason: 'no_annual_saving_for_plan' };
   return sendEmail({ to, subject: rendered.subject, html: rendered.html, replyTo: SUPPORT_EMAIL });
 }
 

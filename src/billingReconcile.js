@@ -21,15 +21,28 @@ const DODO_OK = new Set(['active', 'trialing']);
 /** Comped/manual grants are intentional and must never be reconciled away. */
 const isComped = (row) => String(row?.dodo_subscription_id || '').startsWith('comp:');
 
-/** Build product_id -> {plan, interval} from any env-shaped object. */
+/**
+ * Build product_id -> {plan, interval} from any env-shaped object.
+ *
+ * Recognises superseded products via a `_LEGACYn` suffix so grandfathered customers still resolve:
+ *   DODO_PRODUCT_CREATOR_ID · DODO_PRODUCT_CREATOR_ANNUAL_ID
+ *   DODO_PRODUCT_CREATOR_LEGACY_ID · DODO_PRODUCT_CREATOR_ANNUAL_LEGACY_ID
+ *   DODO_PRODUCT_CREATOR_LEGACY2_ID · ... (any number of generations)
+ *
+ * Without the legacy ids, every customer still on old pricing would look like an unrecognised
+ * product and get reported as drift — false CRITICALs on paying customers. Kept in sync with
+ * buildDodoProductIndex() in src/index.js.
+ */
 export function buildProductMaps(env) {
   const productToPlan = {};
   const productToInterval = {};
   for (const [k, v] of Object.entries(env || {})) {
-    const m = String(k).match(/^DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?_ID$/);
+    const m = String(k).match(/^DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?(_LEGACY\d*)?_ID$/);
     if (!m || !v) continue;
-    productToPlan[String(v).trim()] = m[1].toLowerCase();
-    productToInterval[String(v).trim()] = m[2] ? 'year' : 'month';
+    const id = String(v).trim();
+    if (!id) continue;
+    productToPlan[id] = m[1].toLowerCase();
+    productToInterval[id] = m[2] ? 'year' : 'month';
   }
   return { productToPlan, productToInterval };
 }

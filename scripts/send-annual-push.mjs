@@ -21,10 +21,45 @@ dotenv.config({ path: resolve(__dirname, '../.env') });
 const SEND = process.argv.includes('--send');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-const ANNUAL_PRICE = { starter: 84, creator: 180, pro: 384, agency: 780 };
-const MONTHLY_PRICE = { starter: 9, creator: 19, pro: 39, agency: 79 };
+const ANNUAL_PRICE = { starter: 108, creator: 225, pro: 495, agency: 1161 };
+const MONTHLY_PRICE = { starter: 12, creator: 25, pro: 55, agency: 129 };
+// Grandfathered rates. These customers are NOT good targets for this campaign: at legacy prices
+// the new annual plans are break-even or worse (legacy Pro would pay $27/yr MORE), so the email
+// renderer refuses to make a savings claim for them and they get skipped.
+const LEGACY_MONTHLY_PRICE = { starter: 9, creator: 19, pro: 39, agency: 79 };
 
 const { sendAnnualUpgradeEmail, isEmailEnabled } = await import('../src/email.js');
+
+/** product_id -> true when that product is superseded pricing (any DODO_PRODUCT_*_LEGACYn_ID). */
+function legacyProductIds() {
+  const out = new Set();
+  for (const [k, v] of Object.entries(process.env)) {
+    if (/^DODO_PRODUCT_[A-Z]+?(_ANNUAL)?_LEGACY\d*_ID$/.test(k) && v) out.add(String(v).trim());
+  }
+  return out;
+}
+
+/** dodo_subscription_id -> product_id, so we can tell which price a customer is really on. */
+async function loadDodoProductBySub() {
+  const key = process.env.DODO_API_KEY;
+  const base = process.env.DODO_BASE_URL;
+  const map = new Map();
+  if (!key || !base) return map;
+  for (let p = 0; p < 50; p += 1) {
+    const r = await fetch(`${base}/subscriptions?page_size=100&page_number=${p}`, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    if (!r.ok) break;
+    const j = await r.json();
+    const items = Array.isArray(j) ? j : j.items || j.data || [];
+    for (const d of items) {
+      const id = d?.subscription_id || d?.id;
+      if (id && d?.product_id) map.set(id, d.product_id);
+    }
+    if (items.length < 100) break;
+  }
+  return map;
+}
 
 function isMonthly(interval) {
   const i = String(interval || 'month').toLowerCase();
@@ -44,7 +79,7 @@ async function emailForUser(userId) {
 
 const { data: subs, error } = await supabase
   .from('billing_subscriptions')
-  .select('user_id, plan_type, status, billing_interval')
+  .select('user_id, plan_type, status, billing_interval, dodo_subscription_id')
   .eq('status', 'active');
 
 if (error) {
@@ -56,6 +91,24 @@ const targets = (subs || []).filter(
   (s) => isMonthly(s.billing_interval) && ANNUAL_PRICE[String(s.plan_type || '').toLowerCase()]
 );
 
+const LEGACY_IDS = legacyProductIds();
+const productBySub = await loadDodoProductBySub();
+/**
+ * What this customer pays today, or null if we cannot prove it.
+ *
+ * Never guess: assuming list price for an unresolvable subscription is how a grandfathered
+ * customer ends up receiving a savings claim that is false for them. Comped rows (`comp:` ids)
+ * pay nothing and must never receive a billing campaign.
+ */
+const currentMonthlyFor = (s) => {
+  const plan = String(s.plan_type || '').toLowerCase();
+  const subId = String(s.dodo_subscription_id || '');
+  if (!subId || subId.startsWith('comp:')) return null;
+  const productId = productBySub.get(subId);
+  if (!productId) return null; // not found in Dodo — unknown pricing generation
+  return (LEGACY_IDS.has(productId) ? LEGACY_MONTHLY_PRICE : MONTHLY_PRICE)[plan] || null;
+};
+
 console.log(`Mode: ${SEND ? 'SEND' : 'DRY RUN'} | Email enabled: ${isEmailEnabled()}`);
 console.log(`Active monthly subscribers eligible for annual push: ${targets.length}\n`);
 
@@ -63,11 +116,25 @@ let sent = 0, skipped = 0, failed = 0;
 for (const s of targets) {
   const plan = String(s.plan_type).toLowerCase();
   const email = await emailForUser(s.user_id);
-  const savings = MONTHLY_PRICE[plan] * 12 - ANNUAL_PRICE[plan];
+  const currentMonthlyUsd = currentMonthlyFor(s);
   if (!email) { console.log(`  (no email)  user=${s.user_id}  plan=${plan}`); skipped += 1; continue; }
+  if (!currentMonthlyUsd) {
+    console.log(`  SKIP  ${email}  plan=${plan}  comped or price unknown — not billed on a Dodo product`);
+    skipped += 1;
+    continue;
+  }
+  const savings = Math.round((currentMonthlyUsd * 12 - ANNUAL_PRICE[plan]) * 100) / 100;
+  const grandfathered = currentMonthlyUsd !== MONTHLY_PRICE[plan];
+
+  // Mirrors the renderer's guard so the dry run reports exactly what a real run would do.
+  if (savings < currentMonthlyUsd) {
+    console.log(`  SKIP  ${email}  plan=${plan}  $${currentMonthlyUsd}/mo${grandfathered ? ' (grandfathered)' : ''}  no real saving (${savings >= 0 ? '$' : '-$'}${Math.abs(savings)}/yr)`);
+    skipped += 1;
+    continue;
+  }
 
   if (!SEND) {
-    console.log(`  WOULD EMAIL  ${email}  plan=${plan}  saves $${savings}/yr`);
+    console.log(`  WOULD EMAIL  ${email}  plan=${plan}  $${currentMonthlyUsd}/mo  saves $${savings}/yr`);
     continue;
   }
 
@@ -79,7 +146,7 @@ for (const s of targets) {
   if (claimErr) { console.log(`  ERROR claim  ${email}: ${claimErr.message}`); failed += 1; continue; }
   if (!Array.isArray(claim) || claim.length === 0) { console.log(`  already sent  ${email}`); skipped += 1; continue; }
 
-  const r = await sendAnnualUpgradeEmail({ to: email, planType: plan });
+  const r = await sendAnnualUpgradeEmail({ to: email, planType: plan, currentMonthlyUsd });
   if (r?.ok) { console.log(`  SENT  ${email}  plan=${plan}  saves $${savings}/yr`); sent += 1; }
   else {
     // Roll back the claim so a future run can retry.
