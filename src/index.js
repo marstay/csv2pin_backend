@@ -7259,6 +7259,42 @@ async function processBillingReconciliation() {
   }
 }
 
+/**
+ * Log which Dodo pricing generations this deploy can resolve.
+ *
+ * There is no other way to confirm the product env vars landed correctly on the host: a missing
+ * _LEGACY id fails SILENTLY — reconciliation skips those customers (rule 1 needs productToPlan)
+ * and change-plan falls back to 'month', which would bill an annual upgrade at the full new price
+ * with no proration credit. Logs counts only, never the ids.
+ */
+function logDodoProductConfig() {
+  const index = buildDodoProductIndex();
+  if (!index.size) {
+    console.error('💳 Dodo products: NONE configured — billing plan resolution is broken');
+    return;
+  }
+  const current = [];
+  const legacy = [];
+  for (const [, v] of index) {
+    (v.legacy ? legacy : current).push(`${v.plan}/${v.interval}`);
+  }
+  const fmt = (a) => (a.length ? [...a].sort().join(' ') : '(none)');
+  console.log(`💳 Dodo products: ${index.size} mapped | current: ${fmt(current)}`);
+  console.log(`💳 Dodo products: grandfathered: ${fmt(legacy)}`);
+  const missing = ['starter', 'creator', 'pro', 'agency'].flatMap((p) =>
+    ['month', 'year'].filter((i) => !current.includes(`${p}/${i}`)).map((i) => `${p}/${i}`)
+  );
+  if (missing.length) {
+    console.warn(`💳 Dodo products: no CURRENT product for ${missing.join(' ')} — checkout will fail for these`);
+  }
+  if (!legacy.length) {
+    console.warn(
+      '💳 Dodo products: no _LEGACY ids configured. If any customer still bills on superseded ' +
+        'pricing, they will be skipped by reconciliation and mis-prorated on upgrade.'
+    );
+  }
+}
+
 function startBillingReconciliation() {
   if (billingReconcileInterval) clearInterval(billingReconcileInterval);
   if (process.env.BILLING_RECONCILE_DISABLED === '1') {
@@ -18250,5 +18286,6 @@ app.listen(PORT, () => {
   startRefImageCleanup();
   startTrendsScheduler();
   startOnboardingEmails();
+  logDodoProductConfig();
   startBillingReconciliation();
 }); 
