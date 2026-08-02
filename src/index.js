@@ -7852,6 +7852,22 @@ const IMAGE_PROVIDERS = {
   },
 };
 
+/**
+ * Is a provider-reported task failure worth another attempt?
+ *
+ * Gateway/capacity faults (524 timeouts, 5xx, "busy", "overloaded") clear on a retry. Content
+ * rejections, policy blocks and invalid prompts never will — retrying those wastes a paid
+ * generation and makes the user wait longer for the same failure.
+ */
+function isTransientImageProviderFailure(detail) {
+  const d = String(detail || '').toLowerCase();
+  if (!d) return true; // unexplained failure — one more try is cheap
+  if (/(policy|safety|blocked|violat|nsfw|prohibit|invalid|unsupported|not allowed|content)/.test(d)) {
+    return false;
+  }
+  return /(timeout|timed out|5\d\d|429|busy|overload|capacity|unavailable|try again|internal error)/.test(d);
+}
+
 const IMAGE_PROVIDER =
   IMAGE_PROVIDERS[String(process.env.IMAGE_PROVIDER || 'kie').trim().toLowerCase()] ||
   IMAGE_PROVIDERS.kie;
@@ -8137,8 +8153,19 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
         sameProgressStateCount = 0;
 
         if (stateNorm === 'fail' || stateNorm === 'failed' || stateNorm === 'error') {
-          console.error(`${IMAGE_PROVIDER.label} generation failed:`, IMAGE_PROVIDER.describeFailure(infoJson.data));
-          return null; // Don't retry on explicit API failure
+          const failDetail = IMAGE_PROVIDER.describeFailure(infoJson.data);
+          console.error(`${IMAGE_PROVIDER.label} generation failed:`, failDetail);
+          // Not every reported failure is permanent. Under load Kie returns
+          // `524 generate task timeout` — a gateway/capacity fault that succeeds on a second
+          // attempt. Treating those as final was silently costing anonymous previews, which
+          // (unlike /generate) have no outer retry to fall back on.
+          // Content rejections and invalid prompts still stop immediately: retrying those just
+          // burns money and time.
+          if (isTransientImageProviderFailure(failDetail) && retry < maxRetries - 1) {
+            console.warn(`${IMAGE_PROVIDER.label} failure looks transient — retrying`);
+            break; // leave the poll loop; the outer retry loop starts a fresh task
+          }
+          return null;
         }
 
         if (stateNorm === 'success' || stateNorm === 'succeeded' || stateNorm === 'completed' || stateNorm === 'done') {
