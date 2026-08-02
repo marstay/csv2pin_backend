@@ -12232,7 +12232,7 @@ async function fetchUserProductPinStats(userId, asin) {
  * Winning Product Finder — score an Amazon product's Pinterest opportunity before pin creation.
  * Body: { url: string }
  */
-async function buildWinningProductReport(rawUrl, { userId = null } = {}) {
+async function buildWinningProductReport(rawUrl, { userId = null, searchQueryOverride = '' } = {}) {
   const trimmed = String(rawUrl || '').trim();
   if (!trimmed) {
     const err = new Error('Paste an Amazon product URL.');
@@ -12250,7 +12250,7 @@ async function buildWinningProductReport(rawUrl, { userId = null } = {}) {
 
   const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, null);
   if (!isAmazonProductPageForNanoReference(amazonCtxUrl)) {
-    const err = new Error('Supported: Amazon product URLs (including amzn.to links).');
+    const err = new Error('This checker works on Amazon product links (amazon.com/dp/... or amzn.to/... short links). Paste the link to a single product page.');
     err.status = 400;
     throw err;
   }
@@ -12268,14 +12268,14 @@ async function buildWinningProductReport(rawUrl, { userId = null } = {}) {
     language: 'en',
   });
   if (!rapid) {
-    const err = new Error('Could not fetch product data from Amazon. Check the link and try again.');
+    const err = new Error('Amazon did not return data for that product. It may be out of stock, region-locked, or the link may point to a category rather than a single product. Try opening the product on Amazon and copying the URL from the address bar.');
     err.status = 502;
     throw err;
   }
 
   const product = normalizeAmazonProduct(rapid, amazonCtxUrl);
   if (!product) {
-    const err = new Error('Amazon returned incomplete product data for this link.');
+    const err = new Error('That Amazon link resolved, but the product page had no title we could read — usually a variant, bundle, or storefront link. Try the main product page URL.');
     err.status = 502;
     throw err;
   }
@@ -12289,9 +12289,53 @@ async function buildWinningProductReport(rawUrl, { userId = null } = {}) {
   const report = await analyzeWinningProduct(product, {
     getPinterestAccessToken,
     userPinHistory,
+    searchQueryOverride,
+    resolveProductType: resolvePinterestProductType,
   });
 
   return { ok: true, ...report };
+}
+
+/**
+ * What IS this product, in the words someone would type into Pinterest?
+ *
+ * Amazon titles are keyword soup ("Amazon Echo Dot (newest model) - Vibrant sounding speaker,
+ * Designed for..."), and the category leaf is a shelf name, not a product. Both fooled the old
+ * heuristic. Demand and competition are 50 of the 100 points and are measured entirely against
+ * this string, so it is worth one cheap model call to get right.
+ *
+ * Returns '' on any failure — the caller keeps its heuristic result.
+ */
+async function resolvePinterestProductType(product) {
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      max_tokens: 20,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You map Amazon products to the search term a real person would type into Pinterest. ' +
+            'Reply with ONLY that term: 1-3 words, lowercase, no brand names, no punctuation. ' +
+            'Describe the product type, not the category or use case. ' +
+            'Examples: "Amazon Echo Dot smart speaker alexa" -> smart speaker. ' +
+            '"STANLEY Quencher H2.0 Tumbler 40oz" -> tumbler. ' +
+            '"Anker USB-C to Lightning Cable 6ft" -> phone charger cable.',
+        },
+        { role: 'user', content: String(product?.title || '').slice(0, 300) },
+      ],
+    });
+    return String(completion.choices?.[0]?.message?.content || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, ' ')
+      .slice(0, 60);
+  } catch (e) {
+    console.warn('resolvePinterestProductType failed, using heuristic:', e?.message || e);
+    return '';
+  }
 }
 
 app.post('/api/urltopin/winning-product-analyze', requireUser, async (req, res) => {
@@ -12318,7 +12362,9 @@ app.post('/api/tools/pin-worth-checker', async (req, res) => {
     if (!rateLimitTool(req, 'pin-worth-checker', { windowMs: 60_000, max: 12 })) {
       return res.status(429).json({ error: 'Too many checks. Please wait a minute and try again.' });
     }
-    const report = await buildWinningProductReport(req.body?.url);
+    const report = await buildWinningProductReport(req.body?.url, {
+      searchQueryOverride: req.body?.searchQuery,
+    });
     return res.json(report);
   } catch (err) {
     console.error('pin-worth-checker tool error:', err);

@@ -241,6 +241,32 @@ function tokenizeTitle(title) {
  * Derive generic Pinterest/Amazon search terms — strips brand names and colors.
  * e.g. "Versailtex Sage Green Bathroom Rug" → primary "bath rug" (from Amazon category)
  */
+/**
+ * Amazon leaf categories that describe a STORE SECTION, not a product. Blindly trusting the leaf
+ * is how an Echo Dot came out as "offices" — the tool then scored Pinterest demand for
+ * "offices interior design" and reported it as the product's opportunity.
+ */
+const GENERIC_LEAF_CATEGORIES = new Set([
+  'office', 'offices', 'office product', 'office products', 'product', 'products', 'accessory',
+  'accessories', 'electronic', 'electronics', 'all', 'home', 'home kitchen', 'tool', 'tools',
+  'supply', 'supplies', 'equipment', 'part', 'parts', 'item', 'items', 'good', 'goods',
+  'device', 'devices', 'gadget', 'gadgets', 'new', 'featured', 'deal', 'deals', 'category',
+  'categories', 'best seller', 'best sellers', 'store', 'stores', 'shop', 'brand', 'brands',
+  'accessories supplies', 'industrial scientific', 'sports outdoors', 'clothing', 'other',
+  // Singularised forms — the leaf is passed through singularizePhrase() before this check, so
+  // "Accessories & Supplies" arrives as "accessory supply" and would otherwise slip past.
+  'accessory supply', 'office product', 'home kitchen', 'industrial scientific', 'sport outdoor',
+  'electronic accessory', 'general', 'misc', 'miscellaneous',
+]);
+
+/** A leaf is usable only if it names a thing you could actually search Pinterest for. */
+function isUsableLeafCategory(leaf) {
+  if (!leaf || leaf.length < 4) return false;
+  if (GENERIC_LEAF_CATEGORIES.has(leaf)) return false;
+  // Single generic nouns are too broad to score against; multi-word leaves are usually specific.
+  return leaf.includes(' ') || leaf.length >= 6;
+}
+
 export function derivePinterestSearchTerms(title, categoryId = 'general', amazonCategories = []) {
   const leafRaw = amazonCategories?.length ? String(amazonCategories[amazonCategories.length - 1]).trim() : '';
   const leafPhrase = singularizePhrase(
@@ -253,7 +279,9 @@ export function derivePinterestSearchTerms(title, categoryId = 'general', amazon
   }
 
   const candidates = [];
-  if (leafPhrase.length >= 4) candidates.push({ q: leafPhrase, score: 12 });
+  // Scored BELOW title-derived bigrams (9): the title names the product, the category names the
+  // shelf it sits on. The leaf only wins when the title yields nothing usable.
+  if (isUsableLeafCategory(leafPhrase)) candidates.push({ q: leafPhrase, score: 8 });
 
   for (let i = 0; i < words.length - 1; i++) {
     const bg = `${words[i]} ${words[i + 1]}`;
@@ -287,7 +315,15 @@ export function derivePinterestSearchTerms(title, categoryId = 'general', amazon
     ranked.push(c.q);
   }
 
-  const primary = ranked[0] || leafPhrase || words.slice(0, 2).join(' ') || 'product';
+  // Fallback order matters: a leaf rejected as generic above must NOT reappear here. Falling back
+  // to it is what produced "offices" for an Echo Dot even after the candidate list excluded it.
+  const titleFallback = tokenizeTitle(title).slice(0, 2).join(' ');
+  const primary =
+    ranked[0] ||
+    (isUsableLeafCategory(leafPhrase) ? leafPhrase : '') ||
+    words.slice(0, 2).join(' ') ||
+    titleFallback ||
+    'product';
   return { primary, seeds: ranked.slice(0, 8) };
 }
 
@@ -474,23 +510,33 @@ function scoreDemand({ trendMatches, typeaheadSuggestions, seasonalHits, pintere
   return clamp(Math.round(score), 0, 30);
 }
 
+/**
+ * How favourable the competitive picture is, 0-20 (higher = easier to rank).
+ *
+ * Calibration matters here. "High" competition is the NORMAL state on Pinterest for consumer
+ * products — there are billions of pins. The previous version scored High as saturation 14, which
+ * after the additive penalties floored almost every product at 2/20. That made a fifth of the
+ * total score a flat penalty carrying no information, and capped realistic totals around 83.
+ *
+ * Levels now occupy distinct bands (High 6-10, Medium 10-14, Low 14-18) so the dimension actually
+ * separates products, and demand signals nudge rather than dominate.
+ */
 function scoreCompetition({ amazonSearchCount, trendMatches, typeaheadSuggestions, pinterestSnapshot }) {
-  let saturation = 0;
+  let favorability;
 
   if (pinterestSnapshot?.available && pinterestSnapshot.stats?.competitionLevel) {
     const level = pinterestSnapshot.stats.competitionLevel;
-    if (level === 'High') saturation += 14;
-    else if (level === 'Medium') saturation += 8;
-    else saturation += 3;
+    favorability = level === 'Low' ? 18 : level === 'Medium' ? 14 : 10;
   } else {
-    saturation += clamp(Math.round(amazonSearchCount * 0.7), 0, 12);
+    // No Pinterest snapshot — fall back to Amazon listing saturation as a proxy.
+    favorability = 18 - clamp(Math.round(amazonSearchCount * 0.4), 0, 10);
   }
 
-  saturation += clamp(trendMatches.length * 1.0, 0, 4);
-  saturation += clamp(typeaheadSuggestions.length * 0.35, 0, 3);
+  // More demand means more competitors, but this is a nudge (max -4), not the main signal.
+  favorability -= clamp(trendMatches.length * 0.5, 0, 2.5);
+  favorability -= clamp(typeaheadSuggestions.length * 0.2, 0, 1.5);
 
-  const favorability = 20 - clamp(Math.round(saturation), 0, 18);
-  return clamp(favorability, 2, 20);
+  return clamp(Math.round(favorability), 3, 20);
 }
 
 function scoreVisualAppeal({ title, categoryId, imageCount }) {
@@ -672,15 +718,43 @@ const BOARD_TEMPLATES = {
 
 // --- Main analyzer ---
 
-export async function analyzeWinningProduct(product, { getPinterestAccessToken, userPinHistory } = {}) {
+export async function analyzeWinningProduct(
+  product,
+  { getPinterestAccessToken, userPinHistory, resolveProductType = null, searchQueryOverride = '' } = {}
+) {
   if (!product || !product.title) {
     throw new Error('Invalid product data');
   }
-  const { primary: searchQuery, seeds } = derivePinterestSearchTerms(
+  const heuristic = derivePinterestSearchTerms(
     product.title,
     product.categoryId,
     product.amazonCategories
   );
+  let searchQuery = heuristic.primary;
+  let seeds = heuristic.seeds;
+  let searchQuerySource = 'heuristic';
+
+  // A user-supplied query always wins — they can see the product, we're inferring it.
+  const override = String(searchQueryOverride || '').trim().toLowerCase().slice(0, 60);
+  if (override.length >= 3) {
+    searchQuery = override;
+    seeds = [override, ...seeds.filter((s) => s !== override)].slice(0, 8);
+    searchQuerySource = 'user';
+  } else if (typeof resolveProductType === 'function') {
+    // The score is only as good as this query: demand and competition (50 of 100 points) are both
+    // measured against it. Heuristics read the title left-to-right and often surface a brand or a
+    // shelf name, so ask a model what the thing actually IS.
+    try {
+      const llm = String((await resolveProductType(product)) || '').trim().toLowerCase();
+      if (llm.length >= 3 && llm.length <= 60) {
+        searchQuery = llm;
+        seeds = [llm, ...seeds.filter((s) => s !== llm)].slice(0, 8);
+        searchQuerySource = 'ai';
+      }
+    } catch {
+      /* keep heuristic */
+    }
+  }
   const expandedKeywords = expandPinterestKeywords(seeds, product.categoryId);
   const suggestionSeed = searchQuery.split(/\s+/)[0] || searchQuery;
 
@@ -827,10 +901,17 @@ export async function analyzeWinningProduct(product, { getPinterestAccessToken, 
     },
     analysis: {
       searchQuery,
+      // 'ai' | 'heuristic' | 'user'. Surfaced so the UI can show what was actually measured and
+      // let the user correct it — a wrong query silently invalidates half the score.
+      searchQuerySource,
       seeds,
       pinterestSuggestions: typeaheadSuggestions.slice(0, 10),
       relatedKeywords: expandedKeywords.slice(0, 12),
       matchingTrends: relatedTrendKeywords,
+      // relatedTrendKeywords came back empty even when the evidence text cited rising trends;
+      // expose the raw match count so the UI can tell "no data" from "no trend".
+      trendMatchCount: trendMatches.length,
+      trendsSource,
       seasonalInterest: seasonalHits > 0,
       evidence,
       pinterestSnapshot,
