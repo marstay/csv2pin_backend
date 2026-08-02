@@ -2815,6 +2815,10 @@ const URL_SHORTENER_HOSTNAMES = new Set([
   // Amazon affiliate / Genius-style short links (must expand so ASIN + Amazon flows run)
   'amzlink.to',
   'amznlink.to',
+  // Amazon's own .amazon gTLD short links, used by the Influencer/Associates share button.
+  // Chain observed 2026-08-02: link.amazon/XXXX -> amzlinks.in/XXXX -> amazon.com/dp/ASIN
+  'link.amazon',
+  'amzlinks.in',
   // Walmart official share/affiliate short links (expand → walmart.com/ip/...)
   'walmrt.us',
   'netlify.app',
@@ -3265,6 +3269,9 @@ function isAmazonRelatedHost(host) {
   if (h === 'amznlink.to' || h.endsWith('.amznlink.to')) return true;
   if (h.startsWith('amazon.')) return true;
   if (h.endsWith('.amazon.com')) return true;
+  // Amazon owns the `.amazon` gTLD — link.amazon short links have "amazon" as the TLD, not the
+  // second-level domain, so the startsWith/.amazon.com checks above both miss them.
+  if (h === 'amazon' || h.endsWith('.amazon')) return true;
   return false;
 }
 
