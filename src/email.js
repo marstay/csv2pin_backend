@@ -8,7 +8,8 @@
  *   RESEND_API_KEY        Resend API key (re_...). Without it, emails are skipped.
  * Optional env:
  *   EMAIL_FROM            From header. Prefer a personal, monitored sender (NOT "no-reply"),
- *                         e.g. "Aristomenis from URL2Pin <aristomenis@url2pin.com>".
+ *                         e.g. "Aristomenis from URL2Pin <hello@url2pin.com>". Use a mailbox
+ *                         that exists and is read — this is the address recipients reply to.
  *                         Defaults to Resend's shared test sender for early testing.
  *   FRONTEND_URL          Base app URL (used to build recovery links).
  *   BILLING_RECOVERY_URL  Where dunning links point. Defaults to `${FRONTEND_URL}/my-account`
