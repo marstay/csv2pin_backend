@@ -10635,6 +10635,29 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           }
         }
       }
+      // eBay: RapidAPI item photos. /generate builds its own reference images and does NOT call
+      // harvestNanoBananaReferenceImagesForUrlToPin (that runs only for the logged-out preview),
+      // so the eBay branch has to exist in both places or real generations silently fall through
+      // to a text-only prompt and invent a product.
+      if (nanoBananaReferenceInputs.length === 0) {
+        const rapidEbayUrls = Array.isArray(base?.ebay_rapidapi_image_urls) ? base.ebay_rapidapi_image_urls : [];
+        if (rapidEbayUrls.length > 0) {
+          try {
+            nanoBananaReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(
+              rapidEbayUrls.slice(0, 3),
+              req.user.id
+            );
+            if (nanoBananaReferenceInputs.length > 0) {
+              nanoBananaReferenceSource = 'ebay_product';
+              console.log(
+                `urltopin: Nano Banana eBay reference images (RapidAPI): ${nanoBananaReferenceInputs.length}`
+              );
+            }
+          } catch (e) {
+            console.warn('urltopin eBay RapidAPI images mirror error:', e.message || e);
+          }
+        }
+      }
     }
     // Manual recovery: user uploaded a product photo because the page couldn't be scraped.
     if (
@@ -11817,6 +11840,27 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
           } catch (e) {
             console.warn('urltopin regenerate Etsy oEmbed thumbnail mirror error:', e.message || e);
           }
+        }
+      }
+    }
+    // eBay: RapidAPI item photos. Every path that builds reference images needs its own merchant
+    // branches — /generate, the preview harvester and this regenerate endpoint each construct
+    // them independently. Missing it here would mean a regenerated eBay pin silently drops the
+    // product reference and invents an image, even though the first generation was correct.
+    if (regenNanoReferenceInputs.length === 0 && isEbayHost(new URL(effectiveUrl).hostname)) {
+      const rapidEbayUrls = Array.isArray(base?.ebay_rapidapi_image_urls) ? base.ebay_rapidapi_image_urls : [];
+      if (rapidEbayUrls.length > 0) {
+        try {
+          regenNanoReferenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(
+            rapidEbayUrls.slice(0, 3),
+            req.user.id
+          );
+          if (regenNanoReferenceInputs.length > 0) {
+            regenNanoReferenceSource = 'ebay_product';
+            console.log(`urltopin regenerate: eBay reference images: ${regenNanoReferenceInputs.length}`);
+          }
+        } catch (e) {
+          console.warn('urltopin regenerate eBay RapidAPI images mirror error:', e.message || e);
         }
       }
     }
