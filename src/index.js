@@ -6351,6 +6351,43 @@ function hasUrlToPinProductImage(base, html, pageUrl) {
 }
 
 /**
+ * Titles that prove the scrape landed on a wall rather than a product.
+ *
+ * These pass hasUrlToPinScrapeContent() — they are real strings of real length, and the page they
+ * came from usually has images — so without this check a rendered login gate reads as a successful
+ * scrape. Observed live 2026-08-04: a ShopMy link to Temu returns an empty page to plain fetch, the
+ * browser fallback renders it, and we come back with "Temu | Login" and told the user we had found
+ * their product.
+ *
+ * Kept to whole segments so a genuine product title is never caught: "Plum Berry Wreath -
+ * Threshold™ designed with Studio McGee : Target" has no segment that is merely "login".
+ */
+const UNUSABLE_SCRAPE_TITLE_SEGMENTS = new Set([
+  'login', 'log in', 'sign in', 'signin', 'sign up', 'signup', 'register',
+  'page not found', 'not found', '404', '404 not found', 'dead end',
+  'error', 'oops', 'blocked', 'request blocked', 'forbidden',
+  'access denied', 'service unavailable', 'security check', 'captcha',
+]);
+
+function looksLikeUnusableScrapeTitle(title) {
+  const t = String(title || '').trim().toLowerCase();
+  if (!t) return true;
+  if (
+    /robot or human|are you a human|are you human|access denied|attention required|just a moment|pardon our interruption|request blocked|enable javascript|checking your browser|security check|captcha/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  // Split on title separators only — NOT a bare hyphen, which is ordinary inside product names.
+  const segments = t
+    .split(/\s*[|•·—–:]\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return segments.some((s) => UNUSABLE_SCRAPE_TITLE_SEGMENTS.has(s));
+}
+
+/**
  * Why we still need the user to paste a direct product URL — or null when we don't.
  *
  * Measured across 33 real ShopMy/Mavely links from production (2026-08-04): 82% resolve to a
@@ -6373,6 +6410,8 @@ function productPageUrlNeedReason(rawInputUrl, base) {
   if (!inScope) return null;
   if (base?.affiliateHopScrapeFallback) return 'no_content';
   if (!hasUrlToPinScrapeContent(base)) return 'no_content';
+  // A bot wall or login gate is not a product, however real its title and images look.
+  if (looksLikeUnusableScrapeTitle(base?.title)) return 'no_content';
   if (!base?.productImageReady) return 'no_images';
   return null;
 }
