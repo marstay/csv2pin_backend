@@ -2956,6 +2956,14 @@ function isCreatorAffiliatePlatformRedirectHost(host) {
   if (h === 'mavely.app' || h.endsWith('.mavely.app')) return true;
   if (h === 'mavely.app.link' || h.endsWith('.mavely.app.link')) return true;
   if (h === 'mavelyinfluencer.com' || h.endsWith('.mavelyinfluencer.com')) return true;
+  if (h === 'joinmavely.com' || h.endsWith('.joinmavely.com')) return true;
+  // LTK (LIKEtoKNOW.it) — creators routinely hold LTK links alongside ShopMy/Mavely, so these must
+  // behave identically: follow the hop for product data, keep the LTK URL on the pin for commission.
+  if (h === 'rstyle.me' || h.endsWith('.rstyle.me')) return true;
+  if (h === 'liketk.it' || h.endsWith('.liketk.it')) return true;
+  if (h === 'liketoknow.it' || h.endsWith('.liketoknow.it')) return true;
+  if (h === 'shopltk.com' || h.endsWith('.shopltk.com')) return true;
+  if (h === 'ltk.app.link' || h.endsWith('.ltk.app.link')) return true;
   return false;
 }
 
@@ -3629,7 +3637,7 @@ function assessUrlBrandingGate(urlString) {
         requiresManualBrandOrCta: true,
         brandingGateReason: 'creator_affiliate_link',
         brandingGateMessage:
-          'This looks like a ShopMy or Mavely affiliate link. Pins should show your brand in the footer, not the network name. Enter your brand name or CTA in Pin footer (required) below (e.g. your site name or “Shop my picks”).',
+          'This looks like a ShopMy, Mavely, or LTK affiliate link. Pins should show your brand in the footer, not the network name. Enter your brand name or CTA in Pin footer (required) below (e.g. your site name or “Shop my picks”).',
       };
     }
 
@@ -6300,6 +6308,75 @@ function applyAffiliateHopScrapeFallback(rawInputUrl, workingUrl, base) {
   return true;
 }
 
+/**
+ * ShopMy / Mavely only — the two platforms the "Product page URL" probe covers.
+ *
+ * Deliberately narrower than isCreatorAffiliatePlatformRedirectHost(): Benable links are curated
+ * list pages rather than redirects (no hop to follow, no single product behind them), and LTK has
+ * no measured usage yet. Both keep the old always-visible field until they're looked at properly.
+ */
+function isProbeScopedCreatorAffiliateHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  if (h === 'go.shopmy.us' || h === 'shopmy.us' || h.endsWith('.shopmy.us')) return true;
+  if (h === 'mavely.app' || h.endsWith('.mavely.app')) return true;
+  if (h === 'mavely.app.link' || h.endsWith('.mavely.app.link')) return true;
+  if (h === 'mavelyinfluencer.com' || h.endsWith('.mavelyinfluencer.com')) return true;
+  if (h === 'joinmavely.com' || h.endsWith('.joinmavely.com')) return true;
+  return false;
+}
+
+/**
+ * Did the scrape come back with a product photo we could actually build a pin from?
+ *
+ * Uses the SAME extractor the pin pipeline will use, not a cheaper approximation.
+ * htmlLacksUsableImages() only sees absolute-URL og:image and <img src> — it is deliberately
+ * conservative because it gates an expensive Chromium launch. Reusing it here would call
+ * Shopify/WooCommerce pages image-less whenever they emit relative paths, srcset, or JSON-LD
+ * images, and we would ask for a product URL the user never needed to supply.
+ */
+function hasUrlToPinProductImage(base, html, pageUrl) {
+  if (!base) return false;
+  if (String(base.imageUrl || '').trim()) return true;
+  if (String(base.etsy_oembed_thumbnail || '').trim()) return true;
+  for (const key of ['etsy_rapidapi_image_urls', 'ebay_rapidapi_image_urls']) {
+    if (Array.isArray(base[key]) && base[key].length > 0) return true;
+  }
+  for (const data of [base.amazon_rapidapi_data, base.walmart_rapidapi_data]) {
+    if (Array.isArray(data?.images) && data.images.length > 0) return true;
+  }
+  if (!html) return false;
+  if (pageUrl) return extractGenericPageImageUrlsFromHtml(html, pageUrl).length > 0;
+  return !htmlLacksUsableImages(html);
+}
+
+/**
+ * Why we still need the user to paste a direct product URL — or null when we don't.
+ *
+ * Measured across 33 real ShopMy/Mavely links from production (2026-08-04): 82% resolve to a
+ * retailer we can read unaided, either by scrape (Target and friends) or by the paid API when the
+ * HTML is walled (Walmart). The field used to show for 100% of them because the UI only checked
+ * the hostname. Ask only when following the link ourselves genuinely came back empty.
+ *
+ * 'no_content' — we read nothing real (placeholder title in play).
+ * 'no_images'  — copy is fine, only the photos are missing. Fatal for AI imagery, irrelevant when
+ *                the user supplies their own photos or builds text-only pins, so the caller weighs
+ *                it against how the pin is being made.
+ */
+function productPageUrlNeedReason(rawInputUrl, base) {
+  let inScope = false;
+  try {
+    inScope = isProbeScopedCreatorAffiliateHost(new URL(String(rawInputUrl || '').trim()).hostname);
+  } catch {
+    inScope = false;
+  }
+  if (!inScope) return null;
+  if (base?.affiliateHopScrapeFallback) return 'no_content';
+  if (!hasUrlToPinScrapeContent(base)) return 'no_content';
+  if (!base?.productImageReady) return 'no_images';
+  return null;
+}
+
 function hasUrlToPinScrapeContent(base) {
   return (
     (base.title && String(base.title).trim().length >= 3) ||
@@ -6597,6 +6674,12 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
     base.productPageUrl = productPageOverride;
     base.pinDestinationUrl = rawInputUrl;
   }
+
+  // Did we get pictures, not just words? Drives whether the UI asks for a direct product URL.
+  base.productImageReady = hasUrlToPinProductImage(base, html, workingUrl);
+  // An override IS the answer to this question, so never ask again once one is supplied.
+  base.productPageUrlNeedReason = productPageOverride ? null : productPageUrlNeedReason(rawInputUrl, base);
+  base.needsProductPageUrl = !!base.productPageUrlNeedReason;
 
   return { base, articleSummary };
 }
@@ -9927,6 +10010,10 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (base.affiliateHostedProductPage) meta.affiliateHostedProductPage = true;
     if (base.underlyingProductUrl) meta.underlyingProductUrl = base.underlyingProductUrl;
     if (base.affiliateHopScrapeFallback) meta.affiliateHopScrapeFallback = true;
+    if (base.needsProductPageUrl) {
+      meta.needsProductPageUrl = true;
+      meta.productPageUrlNeedReason = base.productPageUrlNeedReason;
+    }
     if (articleSummary && String(articleSummary).trim().length > 0) {
       meta.articleSummary = articleSummary;
     }

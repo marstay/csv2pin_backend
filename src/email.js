@@ -444,4 +444,73 @@ export async function sendAnnualUpgradeEmail({ to, planType, currentMonthlyUsd }
   return sendEmail({ to, subject: rendered.subject, html: rendered.html, replyTo: SUPPORT_EMAIL });
 }
 
+// --- One-off outreach (2026-08). Driven by scripts/send-outreach.mjs, not by the app. ---
+
+/**
+ * A paying customer who has never scheduled a pin. They are being billed for the one feature
+ * (scheduling/publishing) they have never touched — usually because Pinterest was never connected.
+ * Deliberately short, no upsell, single question: this is a retention save, not a campaign.
+ */
+export function renderPaidNotStartedEmail({ planType, generated = 0 } = {}) {
+  const label = PLAN_LABELS[String(planType || '').toLowerCase()] || 'paid';
+  const madePins = Number(generated) > 0;
+  const subject = `Is something blocking you in ${BRAND}?`;
+  const bodyHtml = `
+    <p style="margin:0 0 14px;">Hi there,</p>
+    <p style="margin:0 0 14px;">I was going through ${BRAND} accounts and noticed yours: you're on the <strong>${label}</strong> plan, but you haven't scheduled or published a pin yet${
+      madePins ? ` — even though you've generated ${generated} pins` : ''
+    }.</p>
+    <p style="margin:0 0 14px;">That usually means one thing: <strong>Pinterest isn't connected yet.</strong> Publishing and scheduling only work once your account is linked and a board is selected, so until that's done the part you're paying for sits idle.</p>
+    <p style="margin:0 0 14px;">It takes about a minute, and I'm happy to walk you through it — or just do it with you on a quick call if that's easier.</p>`;
+  const html = emailLayout({
+    heading: 'Can I help you get started?',
+    bodyHtml,
+    ctaText: 'Connect Pinterest',
+    ctaUrl: `${APP_URL}/scheduled-pins`,
+    ps: `If ${BRAND} isn't the right fit, tell me and I'll refund you — I'd rather do that than bill someone who isn't getting value from it.`,
+    footerNote: `You're receiving this because you have an active ${BRAND} subscription.`,
+  });
+  return { subject, html };
+}
+
+export async function sendPaidNotStartedEmail({ to, planType, generated } = {}) {
+  const { subject, html } = renderPaidNotStartedEmail({ planType, generated });
+  return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });
+}
+
+/**
+ * Free user who used their whole free allowance AND connected Pinterest — then hit the paywall,
+ * because scheduling and post-now are both paid-only. They got all the way to the last step and
+ * received nothing for it, so the email leads by acknowledging that rather than pretending.
+ */
+export function renderConnectedPaywallEmail({ generated = 0 } = {}) {
+  const starter = PLAN_PRICES_USD.starter;
+  const starterPins = PLAN_AI_PIN_LIMITS.starter;
+  const subject = `You connected Pinterest — here's the last step`;
+  const bodyHtml = `
+    <p style="margin:0 0 14px;">Hi there,</p>
+    <p style="margin:0 0 14px;">You generated ${generated > 0 ? `<strong>${generated} pins</strong>` : 'your pins'} in ${BRAND} and connected your Pinterest account — which means you got all the way to the final step and then hit a wall. Publishing and scheduling are on the paid plans, and I don't think that was obvious enough before you connected. Sorry about that.</p>
+    <p style="margin:0 0 8px;">Here's what the <strong>Starter</strong> plan ($${starter}/mo) actually changes:</p>
+    <ul style="margin:0 0 16px 18px;padding:0;color:#3a3a3a;">
+      <li style="margin-bottom:6px;">Your pins post to Pinterest automatically, on a schedule you set.</li>
+      <li style="margin-bottom:6px;">${starterPins} AI pins a month instead of ${PLAN_AI_PIN_LIMITS.free} total.</li>
+      <li>Spread a batch across days or weeks in one go, instead of posting by hand.</li>
+    </ul>
+    <p style="margin:0 0 14px;">The pins you already made are still in your account, ready to schedule.</p>`;
+  const html = emailLayout({
+    heading: 'Your pins are ready to publish',
+    bodyHtml,
+    ctaText: 'See plans',
+    ctaUrl: PRICING_URL,
+    ps: `Not sure it's worth it yet? Reply and tell me what you're promoting — I'll tell you honestly whether ${BRAND} will move the needle for your niche.`,
+    footerNote: `You're receiving this because you created a ${BRAND} account and connected Pinterest.`,
+  });
+  return { subject, html };
+}
+
+export async function sendConnectedPaywallEmail({ to, generated } = {}) {
+  const { subject, html } = renderConnectedPaywallEmail({ generated });
+  return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });
+}
+
 export const emailConfig = { EMAIL_FROM, FRONTEND_URL, APP_URL, BILLING_RECOVERY_URL, UPGRADE_URL, PRICING_URL, SUPPORT_EMAIL };
