@@ -4412,6 +4412,16 @@ async function harvestNanoBananaReferenceImagesForUrlToPin({
       console.warn('harvestNanoBananaReferenceImagesForUrlToPin Etsy RapidAPI:', e.message || e);
     }
   }
+
+  const rapidEbayUrls = Array.isArray(base?.ebay_rapidapi_image_urls) ? base.ebay_rapidapi_image_urls : [];
+  if (result.images.length === 0 && rapidEbayUrls.length > 0) {
+    try {
+      result.images = await mirrorGenericPageImageUrlsForNanoBanana(rapidEbayUrls.slice(0, 3), userId);
+      if (result.images.length > 0) result.source = 'ebay_product';
+    } catch (e) {
+      console.warn('harvestNanoBananaReferenceImagesForUrlToPin eBay RapidAPI:', e.message || e);
+    }
+  }
   if (result.images.length === 0) {
     const etsyThumb = String(base?.etsy_oembed_thumbnail || '').trim();
     if (etsyThumb) {
@@ -5030,6 +5040,118 @@ async function fetchEtsyProductDataViaRapidApi(listingId) {
   }
 }
 
+const EBAY_RAPIDAPI_CACHE_TTL_MS = 2 * 60 * 1000;
+const ebayRapidApiCache = new Map();
+const ebayRapidApiInFlight = new Map();
+
+function isEbayHost(host) {
+  const h = normalizeUrlHostname(host);
+  if (!h) return false;
+  return h === 'ebay.com' || h.endsWith('.ebay.com') || /^ebay\.[a-z.]{2,}$/i.test(h) || /\.ebay\.[a-z.]{2,}$/i.test(h);
+}
+
+/** eBay item id from /itm/<id> or /itm/<slug>/<id>, plus the ?item= query form. */
+function extractEbayItemIdFromUrl(urlString) {
+  const raw = String(urlString || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!isEbayHost(u.hostname)) return '';
+    const q = u.searchParams.get('item') || u.searchParams.get('itemId') || '';
+    if (/^\d{9,15}$/.test(q)) return q;
+    // /itm/123456789012 and /itm/Some-Product-Title/123456789012 both occur.
+    const segs = (u.pathname || '').split('/').filter(Boolean);
+    for (let i = segs.length - 1; i >= 0; i -= 1) {
+      if (/^\d{9,15}$/.test(segs[i])) return segs[i];
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * eBay product data via RapidAPI (ebay-data-hub → eBay Trading API GetItem).
+ *
+ * eBay hard-blocks scraping: plain fetch AND headless Chrome both receive a 403 error page
+ * (verified 2026-08-04). Without this, generation ran with no reference image and the model
+ * invented an unrelated product photo — which is what a customer reported before churning.
+ *
+ * Response shape is eBay's Trading API: PictureDetails.PictureURL[], Title, SellingStatus.
+ */
+async function fetchEbayProductDataViaRapidApi(itemId) {
+  let cacheKey = '';
+  try {
+    const key = String(process.env.RAPIDAPI_KEY || '').trim();
+    const host = String(process.env.RAPIDAPI_EBAY_HOST || '').trim() || 'ebay-data-hub.p.rapidapi.com';
+    const id = String(itemId || '').trim();
+    if (!key || !/^\d{9,15}$/.test(id)) return null;
+
+    cacheKey = `${host}::ebay::${id}`;
+    const cached = ebayRapidApiCache.get(cacheKey);
+    if (cached && cached.data && Date.now() - cached.ts < EBAY_RAPIDAPI_CACHE_TTL_MS) return cached.data;
+    const inflight = ebayRapidApiInFlight.get(cacheKey);
+    if (inflight) return await inflight;
+
+    const p = (async () => {
+      const resp = await fetchWithTimeout(
+        `https://${host}/EbayGetItem?ItemID=${encodeURIComponent(id)}`,
+        { headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': host, Accept: 'application/json' } },
+        20000
+      );
+      if (!resp.ok) return null;
+      const json = await resp.json().catch(() => null);
+      if (!json || typeof json !== 'object') return null;
+      // Guard against the API's default/demo item being returned for a bad id.
+      if (String(json.ItemID || '').trim() !== id) return null;
+      ebayRapidApiCache.set(cacheKey, { ts: Date.now(), data: json });
+      return json;
+    })();
+    ebayRapidApiInFlight.set(cacheKey, p);
+    return await p;
+  } catch (e) {
+    console.warn('fetchEbayProductDataViaRapidApi:', e.message || e);
+    return null;
+  } finally {
+    if (cacheKey) {
+      try { ebayRapidApiInFlight.delete(cacheKey); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** Enrich `base` for eBay item URLs. Mirrors enrichEtsyListingBaseFromApis. */
+async function enrichEbayItemBaseFromApis(base, pageUrlString) {
+  try {
+    const itemId = extractEbayItemIdFromUrl(pageUrlString);
+    if (!itemId || !String(process.env.RAPIDAPI_KEY || '').trim()) return;
+
+    const data = await fetchEbayProductDataViaRapidApi(itemId);
+    if (!data) return;
+
+    // The API title ALWAYS wins for eBay. Unlike Etsy, the scraped page is never real content —
+    // eBay serves a 403 error page, so `base.title` is "Error Page | eBay", which is long enough
+    // to survive a naive length check and would end up as the pin's headline.
+    const title = typeof data.Title === 'string' ? decodeHtmlEntitiesBasic(data.Title.trim()) : '';
+    if (title) base.title = title.slice(0, 180);
+
+    const raw = data?.PictureDetails?.PictureURL;
+    const imgs = (Array.isArray(raw) ? raw : raw ? [raw] : [])
+      .map((u) => String(u || '').trim())
+      .filter((u) => /^https?:\/\//i.test(u))
+      .slice(0, 8);
+    if (imgs.length) {
+      base.ebay_rapidapi_image_urls = imgs;
+      if (!base.imageUrl) base.imageUrl = imgs[0];
+    }
+    base.ebayLanding = true;
+    const price = Number(data?.SellingStatus?.CurrentPrice?.Value);
+    if (Number.isFinite(price) && price > 0) base.ebay_price = price;
+    console.log(`urltopin: eBay RapidAPI item ${itemId} — ${imgs.length} images`);
+  } catch (e) {
+    console.warn('enrichEbayItemBaseFromApis:', e.message || e);
+  }
+}
+
 /**
  * Enrich `base` for Etsy listing URLs: RapidAPI when `RAPIDAPI_KEY` + listing id, else oEmbed for title/thumb gaps.
  * Sets `etsy_rapidapi_image_urls` for Nano Banana mirroring when RapidAPI returns images.
@@ -5429,6 +5551,44 @@ function extractMetaFromHtml(html, url) {
 }
 
 /** Browser-like headers — bare Node fetch gets 403 from Medium and similar CDNs */
+/**
+ * Does this HTML contain anything we could use as a product image?
+ *
+ * Deliberately cheap and conservative — it gates an expensive Puppeteer launch (~100-250MB of
+ * Chromium), so it must only fire on pages that are genuinely image-free, not merely image-poor.
+ * A client-rendered storefront returns zero of both; a normal page returns at least one.
+ */
+function htmlLacksUsableImages(html) {
+  const h = String(html || '');
+  if (!h) return true;
+  if (/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]*content=["']https?:/i.test(h)) {
+    return false;
+  }
+  const imgCount = (h.match(/<img\b[^>]*\bsrc=["']https?:/gi) || []).length;
+  return imgCount === 0;
+}
+
+/**
+ * Does this look like an UNRENDERED client-side shell, rather than a page that genuinely has no
+ * images? Only shells are worth re-fetching through a browser.
+ *
+ * Measured 2026-08-04: uncommongoods.com ships 116KB of HTML containing ZERO characters of
+ * visible text (everything is built by JS). A text-only blog post had 8,867. Without this check
+ * every image-free article — a legitimate and supported use case — would launch Chromium,
+ * spend up to 45s, and return the identical HTML.
+ */
+function htmlLooksLikeUnrenderedShell(html) {
+  const h = String(html || '');
+  if (!h) return false;
+  const visibleText = h
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return visibleText.length < 1200;
+}
+
 const URL_SCRAPE_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -5935,7 +6095,15 @@ async function fetchArticleHtml(url) {
     hostIsAmazon = isAmazonRelatedHost(u.hostname);
     hostIsWalmart = isWalmartRelatedHost(u.hostname);
     skipPuppeteerFallback =
-      isAffiliateTrackingRedirectHost(u.hostname) || isCreatorAffiliatePlatformRedirectHost(u.hostname);
+      isAffiliateTrackingRedirectHost(u.hostname) ||
+      isCreatorAffiliatePlatformRedirectHost(u.hostname) ||
+      // Merchants that block headless Chrome as hard as they block fetch, AND for which we
+      // already have an API path. The browser attempt is pure cost. Measured 2026-08-04:
+      //   eBay  — burns the full 45s navigation timeout, still returns the 403 error page
+      //   Etsy  — fails fast (1.1s) with a 1.5KB bot wall titled "etsy.com", zero images
+      // Amazon and Walmart are excluded separately below via hostIsAmazon / hostIsWalmart.
+      isEbayHost(u.hostname) ||
+      isEtsyHost(u.hostname);
   } catch {
     hostIsAmazon = false;
     hostIsWalmart = false;
@@ -5951,6 +6119,23 @@ async function fetchArticleHtml(url) {
       }
       if (hostIsWalmart && /robot or human|activate and hold the button/i.test(html)) {
         return '';
+      }
+      // A 200 is not the same as usable content. Client-rendered stores (React/Next shops such as
+      // uncommongoods.com) return a full HTML shell with NO og:image and NO <img> tags — the
+      // images only exist after JavaScript runs. The old code returned that shell, the scraper
+      // found no product image, and generation proceeded anyway and invented one. That is what
+      // produced "pins with wrong images" for a real customer on 2026-08-03.
+      // Measured: uncommongoods 119KB/0 images via fetch vs 353KB/10 images via Puppeteer.
+      if (
+        !skipPuppeteerFallback &&
+        !hostIsAmazon &&
+        !hostIsWalmart &&
+        htmlLacksUsableImages(html) &&
+        htmlLooksLikeUnrenderedShell(html)
+      ) {
+        console.warn('fetchArticleHtml: 200 but no usable images, trying browser render:', String(url).slice(0, 96));
+        const puppetHtml = await fetchArticleHtmlViaPuppeteer(url);
+        if (puppetHtml && !htmlLacksUsableImages(puppetHtml)) return puppetHtml;
       }
       return html;
     }
@@ -6344,6 +6529,8 @@ async function fetchArticleBaseAndSummary(url, clientArticleData, opts = null) {
 
   // Etsy: RapidAPI listing payload when configured; else oEmbed for missing title/thumbnail.
   await enrichEtsyListingBaseFromApis(base, workingUrl);
+  // eBay blocks both fetch and headless Chrome, so the API is the ONLY way to get its photos.
+  await enrichEbayItemBaseFromApis(base, workingUrl);
 
   if (base.title) {
     base.title = await maybeShortenPageTitleForUrlToPin(workingUrl, base.title, openai, base.canonicalUrl);
