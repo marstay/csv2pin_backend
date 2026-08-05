@@ -20,6 +20,8 @@ import {
   getStrategyReason,
   PIN_COPY_ANTI_CLICHE_INSTRUCTION,
   usesProductAffiliatePinMix,
+  STRATEGY_LAYOUT_MAP,
+  STRATEGY_COPY_RULES,
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
@@ -4258,6 +4260,23 @@ const AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS = [
   'clean_appetizing',
 ];
 
+/**
+ * Which strategy naturally produces this layout?
+ *
+ * Used when a layout is swapped out, so the COPY rules follow the image. Prefers a strategy that
+ * is not list_value — the whole point of a swap is that we no longer have a multi-panel layout to
+ * justify "5 Best …" copy.
+ */
+function strategyForLayoutId(layoutId) {
+  const id = String(layoutId || '').trim();
+  if (!id) return null;
+  const owners = Object.keys(STRATEGY_LAYOUT_MAP || {}).filter((s) =>
+    (STRATEGY_LAYOUT_MAP[s] || []).includes(id)
+  );
+  if (owners.length === 0) return null;
+  return owners.find((s) => s !== 'list_value') || owners[0];
+}
+
 function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategicPlan) {
   if (!Array.isArray(effectiveStyles) || effectiveStyles.length === 0) {
     return { styles: effectiveStyles, plan: strategicPlan };
@@ -4271,7 +4290,18 @@ function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategic
       AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[fb % AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS.length];
     fb++;
     styles[i] = replacement;
-    if (plan && plan[i]) plan[i].layoutId = replacement;
+    if (plan && plan[i]) {
+      plan[i].layoutId = replacement;
+      // The strategy has to move with the layout. It drives the copy rules downstream, so leaving
+      // list_value on a single-hero pin produced "5 Best …" headlines over one product photo —
+      // the copy promising a list the image never delivers.
+      const nextStrategy = strategyForLayoutId(replacement);
+      if (nextStrategy && nextStrategy !== plan[i].strategy) {
+        plan[i].strategy = nextStrategy;
+        const nextGoal = STRATEGY_COPY_RULES?.[nextStrategy]?.goal;
+        if (nextGoal) plan[i].goal = nextGoal;
+      }
+    }
   }
   return { styles, plan };
 }
@@ -8669,6 +8699,50 @@ function promptTier(longText, shortText) {
   return NANO_BANANA_SIMPLE_PROMPTS ? shortText : longText;
 }
 
+/**
+ * Brand palette instruction for the image model.
+ *
+ * Listing the colors and naming three possible places to use them ("backgrounds, accents, or
+ * typography") let the model scatter them: a tinted band here, a colored word there, none of it
+ * relating to the product photo. Giving each color an explicit ROLE and a size budget is what
+ * turns three hex codes into something that reads as one designed layout.
+ *
+ * Two constraints matter as much as the roles: everything else must stay neutral (otherwise the
+ * model invents a fourth and fifth color that fight the brand), and the product's own colors must
+ * be left alone (the reference photos are the real product — recoloring it makes the pin a lie).
+ *
+ * Deliberately not tiered: the instruction IS the value here, not the hex codes.
+ */
+function buildBrandPaletteHint(brand) {
+  const hex = (v) => String(v || '').trim();
+  const primary = hex(brand?.primaryColor);
+  const secondary = hex(brand?.secondaryColor);
+  const accent = hex(brand?.accentColor);
+  const roles = [];
+  if (primary) {
+    roles.push(`${primary} leads — headline type, a slim band or frame, or a soft tinted wash`);
+  }
+  if (secondary) {
+    roles.push(`${secondary} supports — a subtle secondary element or a gentle gradient partner`);
+  }
+  if (accent) {
+    roles.push(`${accent} accents — small high-emphasis details only, such as a badge or underline`);
+  }
+  if (!roles.length) return '';
+  return (
+    ` BRAND PALETTE — treat these as an accent system layered ON TOP of a premium editorial design, ` +
+    `never as a replacement for it: ${roles.join('; ')}. ` +
+    `CRITICAL: keep the sophisticated base you would use with no palette at all — photographic or softly textured backgrounds, ` +
+    `natural light, depth and shadow, generous negative space. Do NOT flood the pin with flat saturated color, ` +
+    `do NOT replace a textured or photographic background with a solid block of brand color, and do NOT add thick colored bars. ` +
+    `Prefer muted, tinted and desaturated versions of these colors so they sit naturally in the scene; ` +
+    `restrained use looks more expensive than heavy use. ` +
+    `Any other colored element should stay neutral — cream, white, off-black, or soft grey. ` +
+    `Keep the product's real colors accurate and never recolor the product itself. ` +
+    `Headline and footer text must stay clearly legible against whatever sits behind them.`
+  );
+}
+
 const NICHE_VISUAL_HINTS = {
   recipe: 'Prioritize food, ingredients, kitchen scenes, storage containers, and real cooking or prep visuals rather than abstract icons.',
   finance: 'Prioritize money-related visuals like bills, receipts, budgets, calculators, and simple charts instead of generic office imagery.',
@@ -8752,13 +8826,7 @@ function correctHeadlineCount(text, count) {
 function buildMultiProductPinPrompt({ mode, headline, items, footer, brand }) {
   const safeItems = Array.isArray(items) ? items.filter((it) => it && (it.title || it.imageUrl)) : [];
   const n = Math.max(1, safeItems.length);
-  const brandColorParts = [];
-  if (brand?.primaryColor) brandColorParts.push(`primary ${brand.primaryColor}`);
-  if (brand?.secondaryColor) brandColorParts.push(`secondary ${brand.secondaryColor}`);
-  if (brand?.accentColor) brandColorParts.push(`accent ${brand.accentColor}`);
-  const paletteHint = brandColorParts.length
-    ? ` Use this brand color palette for the header band, number badges, and accents: ${brandColorParts.join(', ')}.`
-    : '';
+  const paletteHint = buildBrandPaletteHint(brand);
   const footerLine = String(footer || '').trim();
   const footerHint = footerLine ? ` At the very bottom, add a small footer band with the text "${footerLine}".` : '';
 
@@ -8808,16 +8876,7 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
   const source = overlayText?.source || domain;
-  const brandColorParts = [];
-  if (brand?.primaryColor) brandColorParts.push(`primary ${brand.primaryColor}`);
-  if (brand?.secondaryColor) brandColorParts.push(`secondary ${brand.secondaryColor}`);
-  if (brand?.accentColor) brandColorParts.push(`accent ${brand.accentColor}`);
-  const brandColorHint = brandColorParts.length
-    ? promptTier(
-        ` Use this brand color palette in backgrounds, accents, or typography: ${brandColorParts.join(', ')}.`,
-        ` Palette: ${brandColorParts.join(', ')}.`
-      )
-    : '';
+  const brandColorHint = buildBrandPaletteHint(brand);
   const footerSourceOnly = overlayText?.footerSourceOnly === true;
   const footerLineTrim = String(source || '').trim();
   const brandTrim = String(brand?.brandName || '').trim();
@@ -10221,6 +10280,15 @@ app.post('/api/urltopin/preview', async (req, res) => {
       assessUrlBrandingGate(workingUrl)
     );
     const brandName = String(brand?.brandName || '').trim() || null;
+    const brandColorsForPreview = (() => {
+      const hex = (v) => String(v || '').trim().slice(0, 32) || null;
+      const colors = {
+        primaryColor: hex(brand?.primaryColor),
+        secondaryColor: hex(brand?.secondaryColor),
+        accentColor: hex(brand?.accentColor),
+      };
+      return Object.values(colors).some(Boolean) ? colors : null;
+    })();
     if (brandingGate.requiresManualBrandOrCta && !brandName) {
       if (consumedGlobal) refundGlobalFreePreview();
       return res.status(400).json({
@@ -10306,7 +10374,9 @@ app.post('/api/urltopin/preview', async (req, res) => {
       keyword,
       year: new Date().getFullYear(),
       overlayText,
-      brand: brandName ? { brandName } : null,
+      // Pass the colors through, not just the name — the preview is the first pin anyone sees, so
+      // showing it unbranded made the brand kit look like it does nothing.
+      brand: brandName || brandColorsForPreview ? { ...(brandColorsForPreview || {}), brandName } : null,
       stepCount: meta.step_count ?? null,
       niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
     });
@@ -10937,7 +11007,6 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const brandSecondary = brand?.secondaryColor || null;
     const brandAccent = brand?.accentColor || null;
     const brandName = brand?.brandName || null;
-    const brandLogoUrl = brand?.logoUrl || null;
 
     const styleMeta = {
       clean_appetizing:
@@ -11198,7 +11267,6 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       primaryColor: brandPrimary || null,
       secondaryColor: brandSecondary || null,
       accentColor: brandAccent || null,
-      logoUrl: brandLogoUrl || null,
     };
 
     /** Bottom-of-pin line: user brand/CTA replaces raw URL when set (AI prompt + overlays stay consistent). */
@@ -12406,7 +12474,9 @@ app.delete('/api/custom-templates/:id', requireUser, async (req, res) => {
   }
 });
 
-/** Normalize a brand kit payload to a small, safe shape we persist. */
+const BRAND_PRESET_LIMIT = 10;
+
+/** The brand fields themselves — shared by the legacy flat kit and each preset. */
 function sanitizeBrandKit(raw) {
   const obj = raw && typeof raw === 'object' ? raw : {};
   const str = (v, max) => {
@@ -12415,10 +12485,75 @@ function sanitizeBrandKit(raw) {
   };
   return {
     brandName: str(obj.brandName, 80),
-    logoUrl: str(obj.logoUrl, 1000),
     primaryColor: str(obj.primaryColor, 32),
     secondaryColor: str(obj.secondaryColor, 32),
     accentColor: str(obj.accentColor, 32),
+  };
+}
+
+function brandKitFieldsAreEmpty(fields) {
+  return !['brandName', 'primaryColor', 'secondaryColor', 'accentColor'].some(
+    (k) => String(fields?.[k] || '').trim()
+  );
+}
+
+function sanitizeBrandPreset(raw, index) {
+  const obj = raw && typeof raw === 'object' ? raw : {};
+  return {
+    id: String(obj.id ?? '').trim().slice(0, 64) || `p${index + 1}-${Date.now().toString(36)}`,
+    name: String(obj.name ?? '').trim().slice(0, 40) || `Brand ${index + 1}`,
+    ...sanitizeBrandKit(obj),
+  };
+}
+
+/**
+ * Accepts either shape and returns what we persist: { presets, activePresetId }.
+ *
+ * A legacy flat kit is wrapped as a single preset rather than discarded — every existing user has
+ * one, and dropping it would read as losing their brand.
+ */
+function normalizeBrandKit(raw) {
+  const obj = raw && typeof raw === 'object' ? raw : {};
+  let presets = Array.isArray(obj.presets) ? obj.presets : null;
+  // An EMPTY array counts as "no presets", not as "the user has none on purpose". A user who has
+  // never created one still sets colors in the plain fields, and the client sends those alongside
+  // presets: []. Trusting the empty array would throw the colors away on every save.
+  if (!presets || presets.length === 0) {
+    const flat = sanitizeBrandKit(obj);
+    presets = brandKitFieldsAreEmpty(flat) ? [] : [{ id: 'default', name: 'My brand', ...flat }];
+  }
+  const seenIds = new Set();
+  presets = presets
+    .slice(0, BRAND_PRESET_LIMIT)
+    .map((p, i) => sanitizeBrandPreset(p, i))
+    .map((p, i) => {
+      // Ids come from the client, so a duplicate would make two presets indistinguishable.
+      let id = p.id;
+      while (seenIds.has(id)) id = `${p.id}-${i}`;
+      seenIds.add(id);
+      return { ...p, id };
+    });
+
+  let activePresetId = String(obj.activePresetId ?? '').trim();
+  if (!presets.some((p) => p.id === activePresetId)) activePresetId = presets[0]?.id || '';
+  return { presets, activePresetId };
+}
+
+/**
+ * What we send back: the active preset's fields flattened at the top level PLUS the presets array.
+ *
+ * The flat copy is what keeps already-loaded browsers working after deploy — the old frontend
+ * reads brandName/colors and is oblivious to presets. Without it, those users would open the app
+ * and find their brand fields blank, which reads as data loss.
+ */
+function brandKitResponseShape(stored) {
+  const kit = normalizeBrandKit(stored);
+  const active = kit.presets.find((p) => p.id === kit.activePresetId) || kit.presets[0] || null;
+  return {
+    ...sanitizeBrandKit(active || {}),
+    presets: kit.presets,
+    activePresetId: kit.activePresetId,
+    presetLimit: BRAND_PRESET_LIMIT,
   };
 }
 
@@ -12435,7 +12570,11 @@ app.get('/api/account/brand-kit', requireUser, async (req, res) => {
       console.warn('brand-kit fetch error (column may be missing):', error.message || error);
       return res.json({ ok: true, brandKit: null, persisted: false });
     }
-    return res.json({ ok: true, brandKit: data?.brand_kit || null, persisted: true });
+    return res.json({
+      ok: true,
+      brandKit: data?.brand_kit ? brandKitResponseShape(data.brand_kit) : null,
+      persisted: true,
+    });
   } catch (e) {
     console.warn('brand-kit fetch unexpected error:', e?.message || e);
     return res.json({ ok: true, brandKit: null, persisted: false });
@@ -12444,10 +12583,36 @@ app.get('/api/account/brand-kit', requireUser, async (req, res) => {
 
 app.put('/api/account/brand-kit', requireUser, async (req, res) => {
   try {
-    const brandKit = sanitizeBrandKit(req.body?.brandKit ?? req.body);
+    const body = req.body?.brandKit ?? req.body;
+    let stored;
+    if (Array.isArray(body?.presets)) {
+      // New frontend: it owns the whole list.
+      stored = normalizeBrandKit(body);
+    } else {
+      // Legacy flat save — from a browser still running the old bundle after deploy. Treating it
+      // as the whole kit would collapse every preset into one, so merge the fields into the active
+      // preset and leave the rest of the list alone.
+      const { data: existingRow } = await supabaseAdmin
+        .from('profiles')
+        .select('brand_kit')
+        .eq('id', req.user.id)
+        .maybeSingle();
+      const existing = normalizeBrandKit(existingRow?.brand_kit || null);
+      const fields = sanitizeBrandKit(body);
+      if (existing.presets.length === 0) {
+        stored = normalizeBrandKit(fields);
+      } else {
+        const activeId = existing.activePresetId || existing.presets[0].id;
+        stored = {
+          presets: existing.presets.map((p) => (p.id === activeId ? { ...p, ...fields } : p)),
+          activePresetId: activeId,
+        };
+      }
+    }
+    const brandKit = brandKitResponseShape(stored);
     const { error } = await supabaseAdmin
       .from('profiles')
-      .update({ brand_kit: brandKit, updated_at: new Date().toISOString() })
+      .update({ brand_kit: stored, updated_at: new Date().toISOString() })
       .eq('id', req.user.id);
     if (error) {
       console.warn('brand-kit save error (column may be missing):', error.message || error);
