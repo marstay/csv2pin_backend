@@ -15997,6 +15997,8 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
       dodoSubId = await fetchDodoSubscriptionIdFromCheckoutSessionWithRetry(checkoutId, 20000);
     }
     const canVerifyViaCheckout = Boolean(checkoutId && dodoSubId);
+    // Set only when Dodo itself confirms the subscription is paid. Checked before activation.
+    let providerPaymentVerified = false;
 
     if (!pending.ok && !canVerifyViaCheckout) {
       console.warn('activate-plan blocked (no verified pending checkout and no verifiable checkout session)', {
@@ -16038,6 +16040,30 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
             details: getJson,
           });
         } else {
+          // The provider's own verdict on whether this subscription is paid for. Checking only the
+          // metadata below is not enough: metadata is written at checkout creation and matches
+          // perfectly even when the charge is later declined. Observed 2026-08-05 — an Apple Pay
+          // INSUFFICIENT_FUNDS decline left Dodo reporting status "failed" while we granted a full
+          // month of Starter. The webhook path (payment.succeeded / subscription.active) is the
+          // authoritative activator, so refusing here costs nothing: a payment that does go through
+          // still activates a moment later.
+          const providerStatus = String(getJson?.status || '').trim().toLowerCase();
+          const ACTIVATABLE_PROVIDER_STATUSES = new Set(['active', 'trialing', 'trial']);
+          if (providerStatus && !ACTIVATABLE_PROVIDER_STATUSES.has(providerStatus)) {
+            console.warn('activate-plan blocked: provider subscription is not paid', {
+              userId: req.user.id,
+              subId: dodoSubId,
+              providerStatus,
+              planType,
+            });
+            return res.status(409).json({
+              error: 'payment_not_completed',
+              code: 'payment_not_completed',
+              providerStatus,
+              message:
+                'Your payment has not completed yet. If your card or wallet was declined, please try a different payment method — nothing has been charged.',
+            });
+          }
           const md = getJson?.metadata || {};
           const mdUserId = String(md?.supabase_user_id || '').trim();
           const mdPlan = String(md?.app_plan_type || md?.plan_type || '').trim();
@@ -16063,6 +16089,8 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
               message: 'This payment does not match the selected billing interval. Please contact support.',
             });
           }
+          // Provider says active/trialing and the metadata is ours — the only path that may activate.
+          providerPaymentVerified = true;
         }
       } catch (e) {
         console.warn('activate-plan: Dodo GET subscription metadata check error (continuing)', e?.message || e);
@@ -16139,6 +16167,30 @@ app.post('/api/account/activate-plan', requireUser, async (req, res) => {
           message: 'This subscription is already linked to a different account. Please contact support.',
         });
       }
+    }
+
+    // Nothing below this point may run without a positive "this subscription is paid" answer from
+    // the provider. Every verification failure above logs "continuing" and used to fall through to
+    // activation, so an unresolvable checkout id, a Dodo 5xx, a network error, or a missing API key
+    // all granted a paid plan on the strength of an in-memory record that only proves the user
+    // STARTED a checkout — not that the charge went through.
+    //
+    // Refusing is safe: the webhook (payment.succeeded / subscription.active) is the authoritative
+    // activator and runs on a separate channel, so a genuine payment still lands moments later. The
+    // worst case here is a short delay for a paying customer; the alternative is free plans.
+    if (!providerPaymentVerified) {
+      console.warn('activate-plan blocked: could not verify payment with provider', {
+        userId: req.user.id,
+        planType,
+        checkoutId: checkoutId || null,
+        dodoSubId: dodoSubId || null,
+        hasApiKey: !!DODO_API_KEY,
+      });
+      return res.status(409).json({
+        error: 'Payment could not be verified yet. If it went through, your plan will activate automatically in a moment.',
+        code: 'activation_not_yet_verifiable',
+        reason: 'provider_not_verified',
+      });
     }
 
     const result = await applyPlanActivationForUser(req.user.id, planType, 'payment_success_fallback', {
