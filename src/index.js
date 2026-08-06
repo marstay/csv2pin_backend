@@ -8790,8 +8790,56 @@ function promptTier(longText, shortText) {
  *
  * Deliberately not tiered: the instruction IS the value here, not the hex codes.
  */
+/**
+ * Plain-English name for a hex colour, for use in image prompts.
+ *
+ * Hex codes must never reach the image model. Observed 2026-08-06: a pin came back with the badge
+ * "#364e3f" drawn onto the artwork — the model treated the colour code as content to render. A hex
+ * buys no precision from a diffusion model anyway (it approximates either way), but it is a
+ * printable string, so the safest prompt contains no hex at all.
+ */
+function describeHexColor(hexInput) {
+  const raw = String(hexInput || '').trim();
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(raw);
+  if (!m) return '';
+  let h = m[1];
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const r = parseInt(h.slice(0, 2), 16) / 255;
+  const g = parseInt(h.slice(2, 4), 16) / 255;
+  const b = parseInt(h.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  let hue = 0;
+  if (d !== 0) {
+    if (max === r) hue = ((g - b) / d) % 6;
+    else if (max === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue = (hue * 60 + 360) % 360;
+  }
+
+  if (s < 0.08) {
+    if (l < 0.12) return 'near-black';
+    if (l < 0.32) return 'charcoal grey';
+    if (l < 0.62) return 'mid grey';
+    if (l < 0.88) return 'light grey';
+    return 'off-white';
+  }
+  const HUES = [
+    [15, 'red'], [42, 'orange'], [65, 'golden yellow'], [95, 'yellow-green'], [150, 'green'],
+    [185, 'teal'], [210, 'sky blue'], [250, 'blue'], [280, 'indigo'], [310, 'purple'],
+    [340, 'pink'], [360, 'red'],
+  ];
+  const base = (HUES.find(([max_]) => hue <= max_) || HUES[HUES.length - 1])[1];
+  const lightness = l < 0.22 ? 'very dark ' : l < 0.42 ? 'deep ' : l > 0.82 ? 'pale ' : l > 0.65 ? 'light ' : '';
+  const sat = s < 0.3 ? 'muted ' : s > 0.75 ? 'vivid ' : '';
+  return `${lightness}${sat}${base}`.trim();
+}
+
 function buildBrandPaletteHint(brand) {
-  const hex = (v) => String(v || '').trim();
+  const hex = (v) => describeHexColor(v);
   const primary = hex(brand?.primaryColor);
   const secondary = hex(brand?.secondaryColor);
   const accent = hex(brand?.accentColor);
@@ -8816,7 +8864,9 @@ function buildBrandPaletteHint(brand) {
     `restrained use looks more expensive than heavy use. ` +
     `Any other colored element should stay neutral — cream, white, off-black, or soft grey. ` +
     `Keep the product's real colors accurate and never recolor the product itself. ` +
-    `Headline and footer text must stay clearly legible against whatever sits behind them.`
+    `Headline and footer text must stay clearly legible against whatever sits behind them. ` +
+    `These palette notes are styling direction only — never draw, print, letter, or label any of ` +
+    `this wording, any color name, or any color code anywhere on the pin.`
   );
 }
 
