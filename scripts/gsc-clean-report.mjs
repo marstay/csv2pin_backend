@@ -139,6 +139,33 @@ console.log(`site total (Devices.csv) : ${siteClicks} clicks / ${siteImpr} impre
 console.log(`named in Queries.csv     : ${totalClicks} clicks / ${totalImpr} impressions`);
 console.log(`anonymised by Google     : ${hiddenClicks} clicks / ${hiddenImpr} impressions (${pct(hiddenClicks, siteClicks)} of clicks)`);
 
+// --- tier-1 gate ------------------------------------------------------------
+// Decision 2026-08-06: tier-3 traffic (Pakistan, India, Morocco, Turkey, Algeria,
+// Nigeria, Kenya, Bangladesh) is explicitly NOT counted as a win — those visitors
+// will not buy a USD SaaS subscription. Tier-1 is the headline number now.
+const TIER1 = new Set(['United States', 'United Kingdom', 'Canada', 'Australia', 'Germany', 'Netherlands', 'France', 'Sweden', 'Norway', 'Denmark', 'Switzerland', 'Ireland', 'New Zealand', 'Austria', 'Belgium', 'Finland', 'Japan', 'Singapore']);
+
+const countries = loadCsv('Countries.csv');
+const cKey = countries.length ? Object.keys(countries[0])[0] : null;
+let tier1 = { clicks: 0, impressions: 0 };
+let tier3 = { clicks: 0, impressions: 0 };
+const tier3Top = [];
+for (const r of countries) {
+  const name = r[cKey];
+  const t = TIER1.has(name) ? tier1 : tier3;
+  t.clicks += num(r.Clicks);
+  t.impressions += num(r.Impressions);
+  if (!TIER1.has(name) && num(r.Clicks) > 0) tier3Top.push({ name, clicks: num(r.Clicks) });
+}
+
+console.log('\n--- HEADLINE (tier-1 only) ---');
+console.log(`tier-1 clicks       : ${tier1.clicks} / ${tier1.impressions} impr (CTR ${pct(tier1.clicks, tier1.impressions)})`);
+console.log(`tier-1 share        : ${pct(tier1.clicks, tier1.clicks + tier3.clicks)} of all clicks`);
+console.log(`excluded (non-tier-1): ${tier3.clicks} clicks — not counted as wins by decision`);
+// Countries.csv cannot be split by query, so brand cannot be netted out per country.
+// Report brand separately rather than inventing a precise "tier-1 non-brand" figure.
+console.log(`for reference, brand clicks across ALL geos: ${buckets.brand?.clicks || 0}`);
+
 console.log('\n--- CLEAN SCOREBOARD ---');
 console.log(`named real non-brand clicks : ${real.clicks}  (CTR ${pct(real.clicks, real.impressions)} over ${real.impressions} impr)`);
 console.log(`junk clicks                 : ${junkClicks}  <-- if 0, the junk is provably non-human`);
@@ -164,23 +191,9 @@ real.rows
 
 // --- geography ------------------------------------------------------------
 
-const TIER1 = new Set(['United States', 'United Kingdom', 'Canada', 'Australia', 'Germany', 'Netherlands', 'France', 'Sweden', 'Norway', 'Denmark', 'Switzerland', 'Ireland', 'New Zealand', 'Austria', 'Belgium', 'Finland', 'Japan', 'Singapore']);
-
-const countries = loadCsv('Countries.csv');
 if (countries.length) {
-  const cKey = Object.keys(countries[0])[0];
-  let t1 = { clicks: 0, impressions: 0 };
-  let rest = { clicks: 0, impressions: 0 };
-  const restTop = [];
-  for (const r of countries) {
-    const name = r[cKey];
-    const t = TIER1.has(name) ? t1 : rest;
-    t.clicks += num(r.Clicks);
-    t.impressions += num(r.Impressions);
-    if (!TIER1.has(name) && num(r.Clicks) > 0) restTop.push({ name, clicks: num(r.Clicks) });
-  }
   console.log('\n--- GEOGRAPHY (all queries incl. brand) ---');
-  console.log(`tier-1 : ${t1.clicks} clicks / ${t1.impressions} impr (${pct(t1.clicks, t1.clicks + rest.clicks)} of clicks)`);
-  console.log(`rest   : ${rest.clicks} clicks / ${rest.impressions} impr (${pct(rest.clicks, t1.clicks + rest.clicks)} of clicks)`);
-  console.log('top non-tier-1 by clicks:', restTop.sort((a, b) => b.clicks - a.clicks).slice(0, 8).map((c) => `${c.name} ${c.clicks}`).join(', '));
+  console.log(`tier-1 : ${tier1.clicks} clicks / ${tier1.impressions} impr (${pct(tier1.clicks, tier1.clicks + tier3.clicks)} of clicks)`);
+  console.log(`rest   : ${tier3.clicks} clicks / ${tier3.impressions} impr (${pct(tier3.clicks, tier1.clicks + tier3.clicks)} of clicks)`);
+  console.log('top non-tier-1 by clicks:', tier3Top.sort((a, b) => b.clicks - a.clicks).slice(0, 8).map((c) => `${c.name} ${c.clicks}`).join(', '));
 }

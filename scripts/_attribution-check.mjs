@@ -29,7 +29,7 @@ console.log('attribution columns: PRESENT');
 
 const { data: rows } = await db
   .from('profiles')
-  .select('attribution_channel, attribution_landing, plan_type')
+  .select('attribution_channel, attribution_source, attribution_landing, plan_type')
   .not('attribution_channel', 'is', null);
 
 console.log(`attributed profiles: ${rows.length} / ${total}`);
@@ -48,7 +48,22 @@ for (const r of rows) {
 }
 
 console.log('\nchannel    | signups | paid | conv');
-for (const [channel, b] of [...byChannel].sort((a, b2) => b2[1].paid - a[1].paid)) {
+for (const [channel, b] of [...byChannel].sort((a, b2) => b2[1].signups - a[1].signups)) {
   const conv = b.signups ? ((b.paid / b.signups) * 100).toFixed(1) + '%' : '—';
   console.log(`${channel.padEnd(10)} | ${String(b.signups).padStart(7)} | ${String(b.paid).padStart(4)} | ${conv.padStart(5)}`);
+}
+
+// Channel is too coarse for a launch: Product Hunt and Reddit both land in "other".
+const bySource = new Map();
+for (const r of rows) {
+  const s = r.attribution_source || '(none)';
+  if (!bySource.has(s)) bySource.set(s, { signups: 0, paid: 0 });
+  const b = bySource.get(s);
+  b.signups += 1;
+  if (r.plan_type && r.plan_type !== 'free') b.paid += 1;
+}
+
+console.log('\nreferrer / utm_source          | signups | paid');
+for (const [src, b] of [...bySource].sort((a, b2) => b2[1].signups - a[1].signups).slice(0, 15)) {
+  console.log(`${src.slice(0, 30).padEnd(30)} | ${String(b.signups).padStart(7)} | ${String(b.paid).padStart(4)}`);
 }

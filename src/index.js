@@ -16045,12 +16045,21 @@ app.post('/api/attribution', requireUser, async (req, res) => {
 
     const { data: profile } = await supabaseAdmin
       .from('profiles')
-      .select('attribution_channel, created_at')
+      .select('attribution_channel, created_at, referred_by_affiliate_slug')
       .eq('id', req.user.id)
       .maybeSingle();
 
     if (profile?.attribution_channel) {
       return res.json({ ok: true, alreadySet: true, channel: profile.attribution_channel });
+    }
+
+    // The client calls anything carrying ?ref=/?via=/?partner= "affiliate", but it cannot
+    // tell a real affiliate slug from an arbitrary campaign tag someone pasted into a link.
+    // Only the server knows whether a slug actually resolved, so downgrade unbacked claims
+    // rather than inflating affiliate credit.
+    let channelToStore = String(channel);
+    if (channelToStore === 'affiliate' && !profile?.referred_by_affiliate_slug) {
+      channelToStore = 'other';
     }
 
     const trim = (v, max) => (v ? String(v).trim().slice(0, max) : null);
@@ -16069,7 +16078,7 @@ app.post('/api/attribution', requireUser, async (req, res) => {
     const { error } = await supabaseAdmin
       .from('profiles')
       .update({
-        attribution_channel: String(channel),
+        attribution_channel: channelToStore,
         attribution_source: trim(source, 200),
         attribution_landing: trim(landing, 300),
         attribution_campaign: trim(campaign, 120),
@@ -16084,9 +16093,109 @@ app.post('/api/attribution', requireUser, async (req, res) => {
     }
 
     founderMetricsCache = { at: 0, payload: null };
-    return res.json({ ok: true, channel: String(channel) });
+    return res.json({ ok: true, channel: channelToStore });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to save attribution' });
+  }
+});
+
+// --- Customer reviews -------------------------------------------------------
+// Collected in-product after real usage. See supabase/reviews.sql for why moderation
+// and the approved-only rule exist: rating schema built on anything else is review fraud.
+
+app.post('/api/reviews', requireUser, async (req, res) => {
+  try {
+    const { rating, body, display_name: displayName, source } = req.body || {};
+    const score = Number(rating);
+    if (!Number.isInteger(score) || score < 1 || score > 5) {
+      return res.status(400).json({ error: 'rating must be an integer 1-5' });
+    }
+
+    const trim = (v, max) => (v ? String(v).trim().slice(0, max) : null);
+    const { error } = await supabaseAdmin.from('reviews').upsert(
+      {
+        user_id: req.user.id,
+        rating: score,
+        body: trim(body, 2000),
+        display_name: trim(displayName, 80),
+        source: trim(source, 60),
+        // Editing an existing review sends it back for moderation rather than silently
+        // republishing changed text that was approved in a different form.
+        status: 'pending',
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'user_id' }
+    );
+
+    if (error) {
+      console.warn('review upsert failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save review (is the reviews table created?)' });
+    }
+    return res.json({ ok: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to save review' });
+  }
+});
+
+/** Whether this user already reviewed — lets the client stay quiet instead of nagging. */
+app.get('/api/reviews/mine', requireUser, async (req, res) => {
+  try {
+    const { data } = await supabaseAdmin
+      .from('reviews')
+      .select('rating, body, status, created_at')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    return res.json({ ok: true, review: data || null });
+  } catch {
+    return res.json({ ok: true, review: null });
+  }
+});
+
+app.get('/api/admin/reviews', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('reviews')
+      .select('id, user_id, rating, body, display_name, status, source, created_at')
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (error) throw error;
+
+    const rows = data || [];
+    const approved = rows.filter((r) => r.status === 'approved');
+    // Deliberately computed over approved rows only. If this ever feeds AggregateRating
+    // markup, the number on the page must equal the number of real, moderated reviews.
+    const average = approved.length
+      ? Number((approved.reduce((s, r) => s + r.rating, 0) / approved.length).toFixed(2))
+      : null;
+    return res.json({
+      ok: true,
+      reviews: rows,
+      summary: {
+        total: rows.length,
+        pending: rows.filter((r) => r.status === 'pending').length,
+        approved: approved.length,
+        averageApproved: average,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load reviews (is the reviews table created?)' });
+  }
+});
+
+app.post('/api/admin/reviews/moderate', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const { id, status } = req.body || {};
+    if (!id || !['pending', 'approved', 'rejected'].includes(String(status))) {
+      return res.status(400).json({ error: 'id and a valid status are required' });
+    }
+    const { error } = await supabaseAdmin
+      .from('reviews')
+      .update({ status: String(status), updated_at: new Date().toISOString() })
+      .eq('id', String(id));
+    if (error) throw error;
+    return res.json({ ok: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to moderate review' });
   }
 });
 
@@ -16101,11 +16210,12 @@ app.get('/api/admin/metrics/attribution', requireUser, requireAffiliateAdmin, as
   try {
     const profiles = await founderFetchAll(
       'profiles',
-      'id, plan_type, attribution_channel, attribution_landing, attribution_first_seen'
+      'id, plan_type, attribution_channel, attribution_source, attribution_landing, attribution_first_seen'
     );
 
     const isPaid = (p) => p.plan_type && p.plan_type !== 'free';
     const byChannel = new Map();
+    const bySource = new Map();
     const landings = new Map();
 
     for (const p of profiles) {
@@ -16116,6 +16226,14 @@ app.get('/api/admin/metrics/attribution', requireUser, requireAffiliateAdmin, as
       const row = byChannel.get(channel);
       row.signups += 1;
       if (isPaid(p)) row.paid += 1;
+
+      // Channel alone hides launches: a Product Hunt or Reddit spike both land in "other".
+      // The raw referrer host is what tells them apart.
+      const src = p.attribution_source || '(none)';
+      if (!bySource.has(src)) bySource.set(src, { source: src, channel, signups: 0, paid: 0 });
+      const s = bySource.get(src);
+      s.signups += 1;
+      if (isPaid(p)) s.paid += 1;
 
       const key = `${channel}|${p.attribution_landing || '/'}`;
       if (!landings.has(key)) {
@@ -16139,6 +16257,9 @@ app.get('/api/admin/metrics/attribution', requireUser, requireAffiliateAdmin, as
         percent: profiles.length ? Number(((attributed / profiles.length) * 100).toFixed(1)) : 0,
       },
       channels,
+      sources: [...bySource.values()]
+        .sort((a, b) => b.paid - a.paid || b.signups - a.signups)
+        .slice(0, 25),
       landingPages: [...landings.values()]
         .sort((a, b) => b.paid - a.paid || b.signups - a.signups)
         .slice(0, 25),

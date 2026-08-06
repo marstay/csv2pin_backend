@@ -216,9 +216,54 @@ async function cmdTable(dimension, label, mapKey) {
   console.log(`\n${rows.length} rows total | ${clicks} clicks / ${impr} impressions`);
 }
 
+/**
+ * Queries for ONE page. The bulk export cannot do this — Queries.csv and Pages.csv are
+ * separate dimensions with no join — so this is the only way to see what a specific page
+ * actually ranks for, and therefore whether its impressions are real demand or phantom.
+ *
+ *   node backend/scripts/gsc-api.mjs page-queries --page=/blog/foo [--days=90]
+ */
+async function cmdPageQueries() {
+  const page = flag('page', '');
+  if (!page) {
+    console.error('Pass --page=/some/path');
+    process.exit(1);
+  }
+  const api = await client();
+  const siteUrl = await resolveSite(api);
+  const days = Number(flag('days', 90));
+  const full = page.startsWith('http') ? page : `https://url2pin.com${page}`;
+
+  const rows = await queryAll(api, siteUrl, {
+    ...dateRange(days),
+    dimensions: ['query'],
+    dimensionFilterGroups: [
+      { filters: [{ dimension: 'page', operator: 'equals', expression: full }] },
+    ],
+  });
+
+  rows.sort((a, b) => b.impressions - a.impressions);
+  console.log(`${full} — last ${days}d\n`);
+  console.log('  impr | clk |   pos | query');
+  for (const r of rows.slice(0, Number(flag('limit', 30)))) {
+    console.log(
+      [
+        String(r.impressions).padStart(6),
+        String(r.clicks).padStart(3),
+        r.position.toFixed(1).padStart(5),
+        r.keys[0],
+      ].join(' | ')
+    );
+  }
+  const clicks = rows.reduce((s, r) => s + r.clicks, 0);
+  const impr = rows.reduce((s, r) => s + r.impressions, 0);
+  console.log(`\n${rows.length} named queries | ${clicks} clicks / ${impr} impressions`);
+}
+
 const commands = {
   sites: cmdSites,
   fetch: cmdFetch,
+  'page-queries': cmdPageQueries,
   pages: () => cmdTable('page', 'page', (k) => k.replace(/^https?:\/\/[^/]+/, '') || '/'),
   queries: () => cmdTable('query', 'query', (k) => k),
   countries: () => cmdTable('country', 'country', countryName),
