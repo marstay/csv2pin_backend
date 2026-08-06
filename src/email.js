@@ -168,6 +168,39 @@ export async function sendPaymentFailedEmail({ to, planType, recoveryUrl } = {})
 }
 
 /**
+ * A FIRST payment that was declined — someone trying to subscribe, not an existing customer.
+ *
+ * Deliberately separate from renderPaymentFailedEmail: that one says "we tried to charge your card"
+ * and "your account features are paused", which is alarming and untrue here. Nobody has been
+ * charged and nothing has been taken away — they simply stayed on the free plan. Getting this
+ * wrong costs a sale, because the reader concludes they have been billed and locked out.
+ */
+export function renderSignupPaymentFailedEmail({ planType, retryUrl } = {}) {
+  const plan = PLAN_LABELS[String(planType || '').toLowerCase()] || '';
+  const url = String(retryUrl || PRICING_URL);
+  const planPhrase = plan ? `the <strong>${plan}</strong> plan` : 'a paid plan';
+  const subject = `Your ${BRAND} payment didn't go through — nothing was charged`;
+  const bodyHtml = `
+    <p style="margin:0 0 14px;">Hi there,</p>
+    <p style="margin:0 0 14px;">Your payment for ${planPhrase} on ${BRAND} didn't go through — your bank declined it, so <strong>nothing was charged</strong>.</p>
+    <p style="margin:0 0 14px;">Banks often decline a first international payment without giving a reason. It usually works on a second attempt, or with a different card:</p>`;
+  const html = emailLayout({
+    heading: "Your payment didn't go through",
+    bodyHtml,
+    ctaText: 'Try again',
+    ctaUrl: url,
+    ps: `Your account and everything you've already made are untouched — you're simply still on the free plan. If it keeps failing, just reply to this email and I'll sort it out with you personally.`,
+    footerNote: `You're receiving this because a payment you started for ${BRAND} was declined.`,
+  });
+  return { subject, html };
+}
+
+export async function sendSignupPaymentFailedEmail({ to, planType, retryUrl } = {}) {
+  const { subject, html } = renderSignupPaymentFailedEmail({ planType, retryUrl });
+  return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });
+}
+
+/**
  * Build the "your Pinterest connection expired" email.
  *
  * A dead Pinterest token fails silently today: analytics stop updating AND scheduled pins stop

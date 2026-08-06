@@ -44,6 +44,7 @@ import {
 } from './affiliateProductPages.js';
 import {
   sendPaymentFailedEmail,
+  sendSignupPaymentFailedEmail,
   sendUpgradeNudgeEmail,
   sendPinterestReconnectEmail,
   nextPlanFor,
@@ -2154,6 +2155,78 @@ async function triggerPinterestReconnectEmail({ userId, account }) {
  * Send a "your payment failed — update your card" email, deduped per subscription.
  * `emailHint` (from the webhook payload) is used first to avoid an extra lookup.
  */
+/**
+ * A declined FIRST payment — someone trying to subscribe who has no active plan to lose.
+ *
+ * These never reached the dunning path: it needs a local subscription row, and we deliberately
+ * never create one for a failed charge. Two customers were declined on consecutive days (2026-08-05
+ * and 2026-08-06, $12 Starter each) and heard nothing at all, which is the worst possible moment to
+ * go quiet — they wanted to pay and hit a wall.
+ *
+ * Kept separate from triggerDunningEmail because the wording matters: nothing was charged and
+ * nothing was suspended, so the "your plan is paused, update your card" email would be a lie.
+ */
+async function triggerSignupPaymentFailedEmail({ userId, dodoSubId, planType, emailHint, logReason }) {
+  if (!isEmailEnabled()) return { ok: false, skipped: true, reason: 'email_disabled' };
+  const uid = String(userId || '').trim();
+  // Keyed by USER only — deliberately not by subscription id. Every retry at checkout creates a
+  // brand-new Dodo subscription, so a per-subscription key dedupes nothing: one customer retrying
+  // three times in five minutes received four "your payment failed" emails on 2026-08-06. Someone
+  // who has just been declined twice does not need to be told twice.
+  const dedupeKey = `signup:${uid}`;
+  const last = recentDunningEmails.get(dedupeKey);
+  const nowMs = Date.now();
+  if (last && nowMs - last < DUNNING_EMAIL_DEDUPE_MS) {
+    return { ok: false, skipped: true, reason: 'recently_emailed' };
+  }
+  // Reserve the slot BEFORE awaiting anything. Dodo fires payment.failed, subscription.failed and
+  // subscription.on_hold within the same second; with the write left until after the send, all
+  // three passed the check above and three emails went out.
+  recentDunningEmails.set(dedupeKey, nowMs);
+
+  let email = String(emailHint || '').trim();
+  if (!email && uid) email = await getUserEmailById(uid);
+  if (!email) {
+    recentDunningEmails.delete(dedupeKey); // nothing sent — let a later event try again
+    console.warn('signup-decline: no email for user — skipping', { userId: uid, dodoSubId, logReason });
+    return { ok: false, skipped: true, reason: 'no_email' };
+  }
+
+  const result = await sendSignupPaymentFailedEmail({ to: email, planType: String(planType || '').trim() });
+  if (result.ok) {
+    console.log('signup-decline: payment-failed email sent', { userId: uid, dodoSubId, planType, logReason });
+  } else {
+    recentDunningEmails.delete(dedupeKey);
+  }
+  return result;
+}
+
+/**
+ * Does this user currently hold a paid plan we could suspend?
+ *
+ * Decides which email a failed charge deserves: an existing subscriber gets dunning ("update your
+ * card, your plan is paused"), a would-be subscriber gets the signup-decline note ("nothing was
+ * charged"). Sending the wrong one either alarms someone who owes nothing or under-reacts to a
+ * real lapse.
+ */
+async function userHasLivePaidSubscription(userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return false;
+  try {
+    const { data } = await supabaseAdmin
+      .from('billing_subscriptions')
+      .select('id')
+      .eq('user_id', uid)
+      .in('status', ['active', 'past_due', 'on_hold'])
+      .limit(1);
+    return Array.isArray(data) && data.length > 0;
+  } catch (e) {
+    console.warn('userHasLivePaidSubscription error:', e?.message || e);
+    // Unknown — prefer the dunning path, which is the pre-existing behaviour.
+    return true;
+  }
+}
+
 async function triggerDunningEmail({ userId, dodoSubId, planType, emailHint, logReason }) {
   if (!isEmailEnabled()) return { ok: false, skipped: true, reason: 'email_disabled' };
   const uid = String(userId || '').trim();
@@ -2163,10 +2236,13 @@ async function triggerDunningEmail({ userId, dodoSubId, planType, emailHint, log
   if (last && nowMs - last < DUNNING_EMAIL_DEDUPE_MS) {
     return { ok: false, skipped: true, reason: 'recently_emailed' };
   }
+  // Reserved before the awaits below — see triggerSignupPaymentFailedEmail for why.
+  recentDunningEmails.set(dedupeKey, nowMs);
 
   let email = String(emailHint || '').trim();
   if (!email) email = await getUserEmailById(uid);
   if (!email) {
+    recentDunningEmails.delete(dedupeKey);
     console.warn('dunning: no email for user — skipping', { userId: uid, dodoSubId, logReason });
     return { ok: false, skipped: true, reason: 'no_email' };
   }
@@ -2183,8 +2259,9 @@ async function triggerDunningEmail({ userId, dodoSubId, planType, emailHint, log
 
   const result = await sendPaymentFailedEmail({ to: email, planType: plan });
   if (result.ok) {
-    recentDunningEmails.set(dedupeKey, nowMs);
     console.log('dunning: payment-failed email sent', { userId: uid, dodoSubId, plan, logReason });
+  } else {
+    recentDunningEmails.delete(dedupeKey);
   }
   return result;
 }
@@ -16773,22 +16850,40 @@ app.post('/api/dodo/webhook', async (req, res) => {
     // Declined card / insufficient funds on a subscription charge — Dodo: payment.failed, subscription.on_hold, etc.
     if (eventType.includes('payment.failed')) {
       const subId = dodoSubId;
-      if (!subId) {
-        return res.json({ ok: true, ignored: true, reason: 'payment_failed_no_subscription' });
-      }
+      const emailHint = dataObj?.customer?.email || dataObj?.customer_email || metadata?.email;
       let uid = userIdFromMeta;
-      if (!uid) {
+      if (!uid && subId) {
         uid = await lookupUserIdByDodoSubscriptionId(subId);
       }
       if (!uid) {
-        return res.json({ ok: true, ignored: true, reason: 'payment_failed_unknown_subscription' });
+        // No local row is expected for a declined FIRST charge — we never activate one. Checkout
+        // metadata still carries supabase_user_id, which is why userIdFromMeta is read first.
+        return res.json({
+          ok: true,
+          ignored: true,
+          reason: subId ? 'payment_failed_unknown_subscription' : 'payment_failed_no_subscription',
+        });
       }
+
+      // Someone with nothing to suspend was trying to BUY. Tell them the charge was declined
+      // rather than silently leaving them on free wondering what happened.
+      if (!(await userHasLivePaidSubscription(uid))) {
+        await triggerSignupPaymentFailedEmail({
+          userId: uid,
+          dodoSubId: subId,
+          planType: planTypeFromMeta,
+          emailHint,
+          logReason: `dodo_webhook:${eventType}`,
+        });
+        return res.json({ ok: true, action: 'signup_payment_failed_emailed', userId: uid });
+      }
+
       await markBillingSubscriptionPastDueAndDowngradeProfile(uid, subId, `dodo_webhook:${eventType}`);
       await triggerDunningEmail({
         userId: uid,
         dodoSubId: subId,
         planType: planTypeFromMeta,
-        emailHint: dataObj?.customer?.email || dataObj?.customer_email || metadata?.email,
+        emailHint,
         logReason: `dodo_webhook:${eventType}`,
       });
       return res.json({ ok: true, action: 'marked_past_due_payment_failed', userId: uid });
