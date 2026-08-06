@@ -15023,7 +15023,10 @@ async function founderComputeMetrics() {
   const [subs, profiles, authUsers, expenses, acquisitionMap, payments, refunds, dodoSubs] =
     await Promise.all([
       founderFetchAll('billing_subscriptions', subColumns),
-      founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug, created_at'),
+      // NB: profiles has no `email` column — selecting it made PostgREST reject the whole
+      // query, and founderFetchAll swallows the error and returns [], so the dashboard was
+      // silently computing against zero profiles. Emails come from auth.users below.
+      founderFetchAll('profiles', 'id, plan_type, referred_by_affiliate_slug, created_at'),
       founderFetchAuthUsers(),
       founderLoadExpenses(),
       founderLoadAcquisition(),
@@ -15978,7 +15981,8 @@ app.delete('/api/admin/metrics/expenses/:id', requireUser, requireAffiliateAdmin
 app.get('/api/admin/metrics/acquisition', requireUser, requireAffiliateAdmin, async (req, res) => {
   try {
     const [profiles, authUsers, acqMap] = await Promise.all([
-      founderFetchAll('profiles', 'id, plan_type, email, referred_by_affiliate_slug'),
+      // No `email` column on profiles — see the note in the founder aggregator.
+      founderFetchAll('profiles', 'id, plan_type, referred_by_affiliate_slug, attribution_channel, attribution_source, attribution_landing'),
       founderFetchAuthUsers(),
       founderLoadAcquisition(),
     ]);
@@ -15986,12 +15990,22 @@ app.get('/api/admin/metrics/acquisition', requireUser, requireAffiliateAdmin, as
     authUsers.forEach((u) => u?.id && emailByUser.set(u.id, normalizeEmail(u.email) || ''));
     const paid = profiles
       .filter((p) => p.plan_type && p.plan_type !== 'free')
-      .map((p) => ({
-        userId: p.id,
-        email: emailByUser.get(p.id) || normalizeEmail(p.email) || '',
-        plan: p.plan_type,
-        source: acqMap.get(p.id) || (p.referred_by_affiliate_slug ? 'affiliate' : 'other'),
-      }));
+      .map((p) => {
+        // Manual founder tags are the most reliable signal and always win. Auto-capture
+        // fills the gap for everyone untagged; the affiliate column is the last resort
+        // for accounts that predate attribution entirely.
+        const manual = acqMap.get(p.id) || null;
+        const auto = p.attribution_channel || null;
+        return {
+          userId: p.id,
+          email: emailByUser.get(p.id) || normalizeEmail(p.email) || '',
+          plan: p.plan_type,
+          source: manual || auto || (p.referred_by_affiliate_slug ? 'affiliate' : 'other'),
+          sourceOrigin: manual ? 'manual' : auto ? 'auto' : 'inferred',
+          landing: p.attribution_landing || null,
+          detail: p.attribution_source || null,
+        };
+      });
     return res.json({ ok: true, customers: paid, sources: FOUNDER_ACQUISITION_SOURCES });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to load acquisition data' });
@@ -16011,6 +16025,126 @@ app.post('/api/admin/metrics/acquisition', requireUser, requireAffiliateAdmin, a
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to save acquisition source (is the customer_acquisition table created?)' });
+  }
+});
+
+/**
+ * Auto-captured first-touch attribution from the browser (frontend/src/attribution.js).
+ *
+ * First touch wins permanently: once a profile has a channel, later calls are accepted
+ * and ignored. The client cannot rewrite history, so a customer who signs up from search
+ * and later clicks a TikTok link stays credited to search. Manual founder tags in
+ * customer_acquisition still outrank this — see /api/admin/metrics/acquisition.
+ */
+app.post('/api/attribution', requireUser, async (req, res) => {
+  try {
+    const { channel, source, landing, campaign, ts } = req.body || {};
+    if (!FOUNDER_ACQUISITION_SOURCES.includes(String(channel))) {
+      return res.status(400).json({ error: 'invalid channel' });
+    }
+
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('attribution_channel, created_at')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
+    if (profile?.attribution_channel) {
+      return res.json({ ok: true, alreadySet: true, channel: profile.attribution_channel });
+    }
+
+    const trim = (v, max) => (v ? String(v).trim().slice(0, max) : null);
+    const firstSeenMs = Number.isFinite(Date.parse(ts)) ? Date.parse(ts) : Date.now();
+    const firstSeen = new Date(firstSeenMs).toISOString();
+
+    // A touch recorded long after the account was created is a returning visit, not
+    // acquisition. Without this, every pre-existing user who opens the app tomorrow
+    // would be stamped with tomorrow's referrer — usually "direct" — and the channel
+    // split would be dominated by people we did not acquire that way.
+    const createdMs = Date.parse(profile?.created_at);
+    if (Number.isFinite(createdMs) && firstSeenMs > createdMs + 24 * 60 * 60 * 1000) {
+      return res.json({ ok: true, skipped: 'returning_user' });
+    }
+
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({
+        attribution_channel: String(channel),
+        attribution_source: trim(source, 200),
+        attribution_landing: trim(landing, 300),
+        attribution_campaign: trim(campaign, 120),
+        attribution_first_seen: firstSeen,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', req.user.id);
+
+    if (error) {
+      console.warn('attribution update failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save attribution (are the profiles.attribution_* columns created?)' });
+    }
+
+    founderMetricsCache = { at: 0, payload: null };
+    return res.json({ ok: true, channel: String(channel) });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to save attribution' });
+  }
+});
+
+/**
+ * Channel funnel: signups -> paid, plus the landing pages that earned them.
+ *
+ * `coverage` is the number to read first. Attribution only exists for profiles created
+ * after it shipped, so a low coverage percentage means the channel split below is drawn
+ * from a small slice of users and should not be extrapolated yet.
+ */
+app.get('/api/admin/metrics/attribution', requireUser, requireAffiliateAdmin, async (req, res) => {
+  try {
+    const profiles = await founderFetchAll(
+      'profiles',
+      'id, plan_type, attribution_channel, attribution_landing, attribution_first_seen'
+    );
+
+    const isPaid = (p) => p.plan_type && p.plan_type !== 'free';
+    const byChannel = new Map();
+    const landings = new Map();
+
+    for (const p of profiles) {
+      const channel = p.attribution_channel;
+      if (!channel) continue;
+
+      if (!byChannel.has(channel)) byChannel.set(channel, { channel, signups: 0, paid: 0 });
+      const row = byChannel.get(channel);
+      row.signups += 1;
+      if (isPaid(p)) row.paid += 1;
+
+      const key = `${channel}|${p.attribution_landing || '/'}`;
+      if (!landings.has(key)) {
+        landings.set(key, { channel, landing: p.attribution_landing || '/', signups: 0, paid: 0 });
+      }
+      const l = landings.get(key);
+      l.signups += 1;
+      if (isPaid(p)) l.paid += 1;
+    }
+
+    const attributed = profiles.filter((p) => p.attribution_channel).length;
+    const channels = [...byChannel.values()]
+      .map((r) => ({ ...r, conversion: r.signups ? Number(((r.paid / r.signups) * 100).toFixed(1)) : 0 }))
+      .sort((a, b) => b.paid - a.paid || b.signups - a.signups);
+
+    return res.json({
+      ok: true,
+      coverage: {
+        attributed,
+        total: profiles.length,
+        percent: profiles.length ? Number(((attributed / profiles.length) * 100).toFixed(1)) : 0,
+      },
+      channels,
+      landingPages: [...landings.values()]
+        .sort((a, b) => b.paid - a.paid || b.signups - a.signups)
+        .slice(0, 25),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load attribution metrics (are the profiles.attribution_* columns created?)' });
   }
 });
 

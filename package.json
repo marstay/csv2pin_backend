@@ -83,6 +83,7 @@
     "get-proto": "^1.0.1",
     "get-stream": "^5.2.0",
     "get-uri": "^6.0.5",
+    "googleapis": "^174.0.1",
     "gopd": "^1.2.0",
     "has-symbols": "^1.1.0",
     "has-tostringtag": "^1.0.2",

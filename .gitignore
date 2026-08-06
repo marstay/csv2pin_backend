@@ -86,3 +86,5 @@ Thumbs.db
 subscribers-*.csv
 subscribers-emails-*.txt
 lifecycle-emails/*.csv
+# GSC API pulls (regenerable — fetch again rather than committing)
+data/gsc/
