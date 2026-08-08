@@ -47,10 +47,18 @@ if (!KEY_FILE || !existsSync(KEY_FILE)) {
   process.exit(1);
 }
 
-async function client() {
+/**
+ * `readonly` covers every reporting command. Sitemap submission needs the write scope, so
+ * that one command asks for it explicitly rather than widening everything by default.
+ */
+async function client({ write = false } = {}) {
   const auth = new google.auth.GoogleAuth({
     keyFile: KEY_FILE,
-    scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
+    scopes: [
+      write
+        ? 'https://www.googleapis.com/auth/webmasters'
+        : 'https://www.googleapis.com/auth/webmasters.readonly',
+    ],
   });
   return google.searchconsole({ version: 'v1', auth: await auth.getClient() });
 }
@@ -260,10 +268,31 @@ async function cmdPageQueries() {
   console.log(`\n${rows.length} named queries | ${clicks} clicks / ${impr} impressions`);
 }
 
+/**
+ * Ask Google to re-read the sitemap. Google does not support IndexNow, so after changing
+ * titles or copy this plus a refreshed <lastmod> is the only recrawl signal available —
+ * the Indexing API only accepts JobPosting and BroadcastEvent, not ordinary pages.
+ *
+ *   node backend/scripts/gsc-api.mjs submit-sitemap [--sitemap=https://url2pin.com/sitemap.xml]
+ */
+async function cmdSubmitSitemap() {
+  const api = await client({ write: true });
+  const siteUrl = await resolveSite(api);
+  const feedpath = flag('sitemap', 'https://url2pin.com/sitemap.xml');
+  await api.sitemaps.submit({ siteUrl, feedpath });
+  console.log(`submitted ${feedpath} for ${siteUrl}`);
+
+  const { data } = await api.sitemaps.get({ siteUrl, feedpath });
+  console.log(`  lastSubmitted : ${data.lastSubmitted || '—'}`);
+  console.log(`  lastDownloaded: ${data.lastDownloaded || '— (Google has not fetched it yet)'}`);
+  console.log(`  warnings/errors: ${data.warnings ?? 0} / ${data.errors ?? 0}`);
+}
+
 const commands = {
   sites: cmdSites,
   fetch: cmdFetch,
   'page-queries': cmdPageQueries,
+  'submit-sitemap': cmdSubmitSitemap,
   pages: () => cmdTable('page', 'page', (k) => k.replace(/^https?:\/\/[^/]+/, '') || '/'),
   queries: () => cmdTable('query', 'query', (k) => k),
   countries: () => cmdTable('country', 'country', countryName),

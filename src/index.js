@@ -20,6 +20,7 @@ import {
   getStrategyReason,
   PIN_COPY_ANTI_CLICHE_INSTRUCTION,
   usesProductAffiliatePinMix,
+  SINGLE_PRODUCT_EXCLUDED_LAYOUTS,
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
 } from './strategicPin.js';
@@ -3371,8 +3372,11 @@ function appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, urlString) {
     return (
       `${imagePrompt} ` +
       promptTier(
-        'Do not render Amazon URL tracking or path fragments as text anywhere on the pin: no "ref=", "sr_", "sspa", query-style codes, or small boxes mimicking URL parameters. Only the specified headline, subheadline, and footer line may appear as readable text.',
-        'Never paint ref=/sspa/URL tracking text—only headline, sub, footer.',
+        // "Only the headline/sub/footer may be readable" used to be the closing line here, which
+        // read as an instruction to obscure the product's real label — the opposite of what a
+        // product pin needs. The carve-out for genuine packaging is the point.
+        'Do not render Amazon URL tracking or path fragments as text anywhere on the pin: no "ref=", "sr_", "sspa", query-style codes, or small boxes mimicking URL parameters. Apart from the product\'s own real packaging, the only readable text should be the specified headline, subheadline, and footer line.',
+        'Never paint ref=/sspa/URL tracking text. Readable text = headline, sub, footer, plus the product\'s real packaging.',
       )
     );
   } catch {
@@ -4329,13 +4333,37 @@ function isInfographicLikeStyleId(styleId) {
   return false;
 }
 
-const AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS = [
+/**
+ * Safe replacements: every one renders a single hero subject (before_after is two panels of the
+ * SAME subject). offset_collage_3 used to live here and was the bug — swapping a bad layout for a
+ * three-photo collage just moved the problem.
+ */
+const SINGLE_HERO_FALLBACK_LAYOUTS = [
   'minimal_elegant',
   'before_after',
   'curiosity_shock',
-  'offset_collage_3',
   'clean_appetizing',
 ];
+
+/**
+ * A page with exactly one product to show. Multi-panel layouts have nothing truthful to put in the
+ * extra panels here, so they get swapped for a single-hero layout.
+ */
+function isSingleProductPageBase(base) {
+  if (!base) return false;
+  return !!(base.affiliateHostedProductPage || usesProductAffiliatePinMix(base));
+}
+
+/**
+ * @param {string} styleId
+ * @param {{ hasReferenceImages?: boolean, singleProduct?: boolean }} ctx
+ */
+function shouldSwapLayoutForProductPin(styleId, ctx = {}) {
+  if (!styleId) return false;
+  if (ctx.singleProduct && SINGLE_PRODUCT_EXCLUDED_LAYOUTS.has(styleId)) return true;
+  if (ctx.hasReferenceImages && isInfographicLikeStyleId(styleId)) return true;
+  return false;
+}
 
 /**
  * Which strategy naturally produces this layout?
@@ -4354,7 +4382,7 @@ function strategyForLayoutId(layoutId) {
   return owners.find((s) => s !== 'list_value') || owners[0];
 }
 
-function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategicPlan) {
+function remapStylesForProductPins(effectiveStyles, strategicPlan, ctx = {}) {
   if (!Array.isArray(effectiveStyles) || effectiveStyles.length === 0) {
     return { styles: effectiveStyles, plan: strategicPlan };
   }
@@ -4362,9 +4390,13 @@ function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategic
   const plan = strategicPlan ? strategicPlan.map((p) => ({ ...p })) : null;
   let fb = 0;
   for (let i = 0; i < styles.length; i++) {
-    if (!isInfographicLikeStyleId(styles[i])) continue;
+    if (!shouldSwapLayoutForProductPin(styles[i], ctx)) continue;
+    // Prefer a layout the batch isn't already using — always taking fallback[0] turned every
+    // swapped pin into another minimal_elegant and flattened the batch.
+    const used = new Set(styles);
     const replacement =
-      AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[fb % AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS.length];
+      SINGLE_HERO_FALLBACK_LAYOUTS.find((id) => !used.has(id)) ||
+      SINGLE_HERO_FALLBACK_LAYOUTS[fb % SINGLE_HERO_FALLBACK_LAYOUTS.length];
     fb++;
     styles[i] = replacement;
     if (plan && plan[i]) {
@@ -4383,10 +4415,9 @@ function remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, strategic
   return { styles, plan };
 }
 
-function replaceInfographicStyleIdForAmazonNanoRefs(styleId, hasReferenceImages) {
-  if (!hasReferenceImages || !styleId) return styleId;
-  if (!isInfographicLikeStyleId(styleId)) return styleId;
-  return AMAZON_REF_NON_INFOGRAPHIC_FALLBACKS[0];
+function replaceLayoutForProductPin(styleId, ctx = {}) {
+  if (!shouldSwapLayoutForProductPin(styleId, ctx)) return styleId;
+  return SINGLE_HERO_FALLBACK_LAYOUTS[0];
 }
 
 /** Storage path prefix for anonymous free-preview reference image mirrors (no auth). */
@@ -4428,8 +4459,134 @@ function setNanoRefHarvestCache(key, images, source) {
   }
 }
 
+/** Reference sources that are a photo of THE product being sold (not a generic page image). */
+const PRODUCT_REFERENCE_SOURCES = new Set([
+  'amazon_product',
+  'walmart_product',
+  'etsy_product',
+  'ebay_product',
+  'manual_product',
+  // Merchant photos stored on a URL2Pin-hosted bridge page whose merchant isn't one of the above.
+  'hosted_product',
+]);
+
+function isProductReferenceSource(referenceSource) {
+  return PRODUCT_REFERENCE_SOURCES.has(String(referenceSource || ''));
+}
+
+/**
+ * Does this product arrive in packaging that carries printed text?
+ *
+ * Only these need the extra output resolution. A tallow jar has a brand, claims and a net weight
+ * the model has to reproduce or fake; a silver hoop earring has no printed surface at all, so more
+ * pixels buy nothing. Measured against real traffic this splits roughly 29% labelled / 22% bare /
+ * 49% undecidable from the title alone — hence the category path being tried first.
+ *
+ * @returns {'labelled'|'bare'|'unknown'}
+ */
+const PACKAGING_LABELLED_RE =
+  /\b(cream|balm|serum|moisturi[sz]er|lotion|butter|tallow|salve|ointment|sunscreen|spf|cleanser|shampoo|conditioner|soap|deodorant|toner|essence|perfume|cologne|fragrance|supplement|vitamin|capsules?|caps|softgels?|tablets?|gummies|powder|protein|collagen|probiotic|tincture|extract|syrup|honey|sauce|seasoning|spice|coffee|tea|snack|treats|jerky|kibble|detergent|cleaner|disinfect|polish|repellent|fertili[sz]er|paint|adhesive|glue|essential oils?|flavoring oils?|patches|strips|wipes|spray|roll[- ]on|gel|masks?|gum)\b/i;
+
+const PACKAGING_CONTAINER_RE =
+  /(\b(bottle|jar|tube|tin|canister|sachet|pouch|carton)\b|\d+\s*(?:fl\s*)?oz\b|\d+\s*ml\b|\d+\s*mg\b|\d+\s*mcg\b|\d+\s*iu\b|\bpack of \d+|\d+[- ]pack\b|\d+ count\b|\d+ ct\b)/i;
+
+const PACKAGING_BARE_RE =
+  /\b(rings?|necklaces?|earrings?|hoops?|bracelets?|pendant|chain|anklet|brooch|shirt|tee|dress|skirt|socks|hat|caps?|scarf|shoes|sneakers|boots|charger|charging|cable|adapter|adaptor|station|headphones|earbuds|speaker|camera|bulb|watch|tripod|stand|holder|mount|lamp|bag|backpack|tote|purse|wallet|mug|tumbler|blanket|pillow|cushion|rug|curtain|towel|cloth|scraper|tweezers|comb|mirror|organi[sz]er|shelf|hook|basket|planter|vase|frame|bells|decor|altar|figurine|ornament)\b/i;
+
+/** Amazon top-level categories that settle it without needing keywords. */
+const PACKAGING_CATEGORY_LABELLED_RE =
+  /(beauty & personal care|health & household|grocery|gourmet food|baby products|pet supplies.*(food|treat|health|grooming))/i;
+const PACKAGING_CATEGORY_BARE_RE =
+  /(clothing, shoes & jewelry|^jewelry|handmade jewelry|electronics|cell phones & accessories|toys & games|sports & outdoors|musical instruments|office products)/i;
+
+function categoryPathTextForPackaging(base) {
+  const parts = [];
+  const cats = base?.amazon_rapidapi_data?.category_path;
+  if (Array.isArray(cats)) {
+    for (const c of cats) {
+      const name = c && typeof c === 'object' ? c.name : c;
+      if (name) parts.push(String(name).trim());
+    }
+  }
+  return parts.join(' > ');
+}
+
+function classifyProductPackaging(base) {
+  // 1. Category path — a real taxonomy, so far more reliable than guessing from a listing title.
+  //    Amazon-only today; Walmart/Etsy RapidAPI responses carry no category, so they fall through.
+  const categoryText = categoryPathTextForPackaging(base);
+  if (categoryText) {
+    if (PACKAGING_CATEGORY_LABELLED_RE.test(categoryText)) return 'labelled';
+    if (PACKAGING_CATEGORY_BARE_RE.test(categoryText)) return 'bare';
+    // Still useful even when the top level is vague: "Home & Kitchen > ... > Laundry Detergent".
+    const catLabelled = PACKAGING_LABELLED_RE.test(categoryText) || PACKAGING_CONTAINER_RE.test(categoryText);
+    const catBare = PACKAGING_BARE_RE.test(categoryText);
+    if (catLabelled && !catBare) return 'labelled';
+    if (catBare && !catLabelled) return 'bare';
+  }
+
+  // 2. Listing title. Description is deliberately excluded — marketing copy mentions "cream" and
+  //    "bottle" for products that are neither, which pushed everything to 'labelled' in testing.
+  const title = String(base?.title || '').trim();
+  if (!title) return 'unknown';
+  const labelled = PACKAGING_LABELLED_RE.test(title) || PACKAGING_CONTAINER_RE.test(title);
+  const bare = PACKAGING_BARE_RE.test(title);
+  if (labelled && !bare) return 'labelled';
+  if (bare && !labelled) return 'bare';
+  // Both or neither matched: a "gel sock" or a "cleaning cloth 6-pack" is genuinely ambiguous.
+  return 'unknown';
+}
+
+/**
+ * Packaging class for resolution purposes, or null when no real product photo is attached
+ * (nothing to reproduce faithfully, so resolution is irrelevant).
+ */
+function packagingClassForResolution(base, { hasProductReference }) {
+  if (!hasProductReference) return null;
+  return classifyProductPackaging(base);
+}
+
+/**
+ * Packaging class for a roundup / comparison pin.
+ *
+ * One fabricated label among the cards discredits the whole pin, so the strictest item wins:
+ * any labelled product makes the pin labelled. These cards are also the smallest render of a
+ * product anywhere in the app, which is exactly where invented lettering shows up.
+ */
+function multiProductPackagingClass(items) {
+  const list = Array.isArray(items) ? items : [];
+  let sawUnknown = false;
+  for (const it of list) {
+    const cls = classifyProductPackaging({ title: it?.title });
+    if (cls === 'labelled') return 'labelled';
+    if (cls === 'unknown') sawUnknown = true;
+  }
+  if (sawUnknown) return 'unknown';
+  return list.length ? 'bare' : null;
+}
+
+/**
+ * Stop the model inventing packaging.
+ *
+ * At 1K on a 2:3 canvas the product's fine print is only a few pixels per glyph — below what the
+ * model can draw as real letterforms — so it fills the space with letter-shaped texture and
+ * plausible brand names ("Pure Kind.", "Grass-Ped", "Molsturizing"). Forbidding invented text is
+ * only half of it: the model needs a legitimate way out, hence the soft-focus escape hatch.
+ * Without one it just guesses again.
+ */
+// Lazy: promptTier reads NANO_BANANA_SIMPLE_PROMPTS, which is declared further down this file.
+function noInventedPackagingTextRule() {
+  return promptTier(
+    'Reproduce the product packaging exactly as it appears in the reference photograph. Do not invent, translate, paraphrase, or restyle any wording, brand name, logo, or measurement on the product. If label text is too small to render as genuine legible lettering, show it softly out of focus or turned away from camera — never as invented or approximated lettering.',
+    'Copy the real label exactly; never invent brand names or label text. Too small to render? Show it out of focus, not as fake lettering.'
+  );
+}
+
 function appendNanoBananaReferencePromptSuffix(imagePrompt, referenceSource) {
   if (!imagePrompt || !referenceSource) return imagePrompt;
+  if (isProductReferenceSource(referenceSource)) {
+    imagePrompt = `${imagePrompt} ${noInventedPackagingTextRule()}`;
+  }
   if (referenceSource === 'amazon_product') {
     return (
       `${imagePrompt} ` +
@@ -4454,6 +4611,15 @@ function appendNanoBananaReferencePromptSuffix(imagePrompt, referenceSource) {
       promptTier(
         'Attached reference image(s) are from the Etsy listing (product photos). Use them as the primary hero subject: preserve jewelry/product shape, materials, colors, and overall look. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
         'Reference: use attached Etsy listing photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.'
+      )
+    );
+  }
+  if (referenceSource === 'hosted_product') {
+    return (
+      `${imagePrompt} ` +
+      promptTier(
+        "Attached reference image(s) are the merchant's own photos of the product being promoted. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.",
+        'Reference: use attached merchant product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.'
       )
     );
   }
@@ -8393,6 +8559,35 @@ function createImageTimingCollector() {
   return { count: 0, queuedMs: 0, genMs: 0, maxGenMs: 0, failures: 0, refImgs: 0 };
 }
 
+/**
+ * Output resolution for one generation.
+ *
+ * Resolution only buys one thing: fine detail, which in practice means a product's real packaging
+ * text. At 1K on a 2:3 canvas that print is a few pixels per glyph, under what the model can
+ * letter — so it approximates. Nothing else on a pin needs the extra pixels; Pinterest renders
+ * feed images far smaller than 1K anyway.
+ *
+ * Both knobs default to '1K', so behaviour is unchanged until one is set. Set
+ * NANO_BANANA_RESOLUTION_PRODUCT=2K to raise ONLY products whose packaging carries printed text.
+ * NANO_BANANA_RESOLUTION_UNKNOWN covers the products the classifier could not call either way.
+ */
+function resolveImageResolution(options = {}) {
+  const fallback = String(process.env.NANO_BANANA_RESOLUTION || '').trim() || '1K';
+  const env = (name) => String(process.env[name] || '').trim() || fallback;
+  switch (options?.packagingClass) {
+    // Printed packaging: the only case where extra pixels buy anything.
+    case 'labelled':
+      return env('NANO_BANANA_RESOLUTION_PRODUCT');
+    // Couldn't tell. Its own knob so the policy can be changed without a deploy — the bucket is
+    // large (~half of product pins), so it moves the bill more than the labelled one does.
+    case 'unknown':
+      return env('NANO_BANANA_RESOLUTION_UNKNOWN');
+    // 'bare' (no printed surface) and null (no product photo at all) gain nothing from 2K.
+    default:
+      return fallback;
+  }
+}
+
 async function generateImageWithNanoBanana(prompt, logLabel = '', options = {}) {
   const timing = options?.timing || null;
   const queuedAt = Date.now();
@@ -8478,7 +8673,7 @@ async function generateImageWithNanoBananaInner(prompt, logLabel = '', options =
               prompt,
               aspect_ratio: '2:3',
               google_search: false,
-              resolution: '1K',
+              resolution: resolveImageResolution(options),
               output_format: 'png',
               ...(imageInput.length > 0 ? { [IMAGE_PROVIDER.imagesField]: imageInput } : {}),
             },
@@ -8963,7 +9158,12 @@ function buildMultiProductPinPrompt({ mode, headline, items, footer, brand }) {
     `(2) Show EXACTLY ${n} product${n === 1 ? '' : 's'} — never add, drop, merge, or duplicate a product. ` +
     `(3) Some products may look very similar or be from the same brand — still render them as separate, distinct cards in order; do not collapse them into one. ` +
     `(4) Each product gets its own clean white card with rounded corners and a soft shadow, one product photo per card. ` +
-    `(5) Keep all text crisp, correctly spelled, and high-contrast.`;
+    `(5) Keep all text crisp, correctly spelled, and high-contrast. ` +
+    // Cards are a fraction of the canvas, so packaging print lands well under the resolution the
+    // model can letter properly — without an explicit out it fills the space with invented brands.
+    `(6) Reproduce each product's packaging exactly as shown in its reference photo. Never invent, ` +
+    `translate, or restyle a brand name, logo, or wording on a product. If a label is too small to ` +
+    `render as genuine legible lettering, show it softly out of focus rather than as invented text.`;
 
   if (mode === 'comparison') {
     const a = safeItems[0] || {};
@@ -8999,7 +9199,18 @@ function buildMultiProductPinPrompt({ mode, headline, items, footer, brand }) {
   );
 }
 
-function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overlayText, brand, stepCount, niche }) {
+function buildOverlayImagePrompt({
+  styleId,
+  topic,
+  domain,
+  keyword,
+  year,
+  overlayText,
+  brand,
+  stepCount,
+  niche,
+  hasProductReference = false,
+}) {
   const headline = overlayText?.headline || topic;
   const subheadline = overlayText?.subheadline || '';
   const source = overlayText?.source || domain;
@@ -9028,17 +9239,45 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
   );
   const numSteps = typeof stepCount === 'number' ? stepCount : (styleId === 'step_cards_3' || styleId === 'grid_3_images' ? 3 : styleId === 'grid_4_images' ? 4 : styleId === 'timeline_infographic' ? 5 : null);
 
+  /**
+   * Subject clause for a style.
+   *
+   * When a real product photo is attached it IS the subject, so the invented-object language has
+   * to be REMOVED, not argued with. Leaving both in ("show an object relevant to <keyword>" plus
+   * "match the attached photo") is what made the model average the two and emit a correctly-shaped
+   * jar wearing a fabricated brand name. Several styles even demonstrated substitution
+   * ("for wellness show a journal or plant"), which is the opposite of what a product pin needs.
+   *
+   * Only styles reachable by a product pin need this; the multi-panel layouts are swapped out for
+   * single-product pages upstream, so they never carry a product reference.
+   */
+  const subj = (invented) =>
+    hasProductReference
+      ? 'The subject is the exact product in the attached reference photograph, reproduced as photographed — same packaging, label, and proportions. Do not redesign or restyle it. '
+      : invented;
+  // Both branches are spelled out in full so the non-product prompt stays byte-for-byte what it
+  // was. Splitting a style's opening sentence to bolt the flag on quietly reworded it for every
+  // blog pin too ("Clean food-blog style" lost its "food" hint that way).
+  const subjShort = (invented, whenProduct) => (hasProductReference ? whenProduct : invented);
+
   switch (styleId) {
        case 'before_after':
       return (
         baseIntro +
         promptTier(
           `Split layout with a clear “Before” left half and “After” right half about "${keyword || topic}". ` +
+            (hasProductReference
+              ? `Both halves show the same result or scene associated with the product in the attached reference photograph; if the product itself appears, reproduce it exactly as photographed. Never show two different products. `
+              : '') +
             `Show the on-image main text "${headline}" across the top center. ` +
             `Label the left side "Before" and the right side "After" with short, readable labels. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the main text. ` : '') +
             `At the bottom, add small, readable source text "${source}".`,
-          `Before | After split about "${keyword || topic}". Top text: "${headline}". ` +
+          `Before | After split about "${keyword || topic}". ` +
+            (hasProductReference
+              ? `Same product both halves, exactly as attached — never two different products. `
+              : '') +
+            `Top text: "${headline}". ` +
             (subheadline ? `Sub: "${subheadline}". ` : '') +
             `Footer: "${source}".`
         ) +
@@ -9095,11 +9334,17 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Soft neutral background with subtle texture. Simple, clear focal object or photograph that represents "${keyword || topic}". Clean, modern blog-style design with plenty of white space. ` +
+          `Soft neutral background with subtle texture. ` +
+            subj(`Simple, clear focal object or photograph that represents "${keyword || topic}". `) +
+            `Clean, modern blog-style design with plenty of white space. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Clean food-blog style, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Clean food-blog style, "${keyword || topic}". `,
+              `Clean blog style. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9109,11 +9354,19 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Bold, dramatic, high-contrast image. Strong central subject that represents or relates to "${keyword || topic}" and creates shock and curiosity. The visual must be semantically relevant to the article topic—e.g. for tech/WordPress show a laptop, screen, or workspace; for food show ingredients or cooking. Dramatic lighting. ` +
+          `Bold, dramatic, high-contrast image. ` +
+            subj(
+              `Strong central subject that represents or relates to "${keyword || topic}" and creates shock and curiosity. The visual must be semantically relevant to the article topic—e.g. for tech/WordPress show a laptop, screen, or workspace; for food show ingredients or cooking. `
+            ) +
+            `Dramatic lighting. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Dramatic high-contrast scene for "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Dramatic high-contrast scene for "${keyword || topic}". `,
+              `Dramatic high-contrast scene. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9123,11 +9376,17 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Visual value motif: imagery suggesting saving time, money, or results. Clean layout with practical elements related to "${keyword || topic}". Bright but simple. ` +
+          `Visual value motif: imagery suggesting saving time, money, or results. ` +
+            subj(`Clean layout with practical elements related to "${keyword || topic}". `) +
+            `Bright but simple. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Value/savings theme, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Value/savings theme, "${keyword || topic}". `,
+              `Value/savings theme. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9137,11 +9396,17 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Minimalist layout: pure white or light background, lots of whitespace. Single strong visual object representing "${keyword || topic}". High-contrast, typography-forward. ` +
+          `Minimalist layout: pure white or light background, lots of whitespace. ` +
+            subj(`Single strong visual object representing "${keyword || topic}". `) +
+            `High-contrast, typography-forward. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Minimal white space + one object, "${keyword || topic}". Big type: "${headline}". ` +
+          subjShort(
+              `Minimal white space + one object, "${keyword || topic}". `,
+              `Minimal white space. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Big type: "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9151,11 +9416,21 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Image that visually represents a question or dilemma about "${keyword || topic}", with subtle question-mark elements or split choices. The scene or subject must relate to the article topic. Clean background. ` +
+          subj(
+            `Image that visually represents a question or dilemma about "${keyword || topic}", with subtle question-mark elements or split choices. The scene or subject must relate to the article topic. `
+          ) +
+            (hasProductReference
+              ? `Frame it as a question with subtle question-mark elements around the product. `
+              : '') +
+            `Clean background. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Question/dilemma visual, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Question/dilemma visual, "${keyword || topic}". `,
+              `Question/dilemma visual. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9165,11 +9440,21 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Lifestyle context scene: someone interacting with "${keyword || topic}" in an appropriate everyday setting. The setting must match the topic—e.g. for tech/WordPress/digital topics show a laptop, screen, or workspace; for food/recipes show a kitchen; for wellness show a calm home setting. Warm natural light. Warm, inviting, lifestyle photography. ` +
+          subj(
+            `Lifestyle context scene: someone interacting with "${keyword || topic}" in an appropriate everyday setting. The setting must match the topic—e.g. for tech/WordPress/digital topics show a laptop, screen, or workspace; for food/recipes show a kitchen; for wellness show a calm home setting. `
+          ) +
+            (hasProductReference
+              ? `Place it in a natural everyday setting that suits the product, optionally with a person using it. `
+              : '') +
+            `Warm natural light. Warm, inviting, lifestyle photography. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Warm lifestyle scene, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Warm lifestyle scene, "${keyword || topic}". `,
+              `Warm lifestyle scene. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9179,11 +9464,19 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Story-like composition: focused close-up of a hand holding something that represents "${keyword || topic}" (e.g. document, device, product). Slightly dramatic lighting. Mysterious, story-driven, personal experiment feel. ` +
+          subj(
+            `Story-like composition: focused close-up of a hand holding something that represents "${keyword || topic}" (e.g. document, device, product). `
+          ) +
+            (hasProductReference ? `Frame it as a close-up held in one hand. ` : '') +
+            `Slightly dramatic lighting. Mysterious, story-driven, personal experiment feel. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Story-style close-up, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Story-style close-up, "${keyword || topic}". `,
+              `Story-style close-up. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9193,11 +9486,18 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Practical, simple layout: light surface with a clear object representing "${keyword || topic}" and a small related element (tool, document). Minimal props, lots of breathing room. Non-dramatic. ` +
+          (hasProductReference
+            ? `Practical, simple layout on a light surface. The subject is the exact product in the attached reference photograph, reproduced as photographed — same packaging, label, and proportions. Do not redesign or restyle it. Optionally add one small related element (tool, cloth). `
+            : `Practical, simple layout: light surface with a clear object representing "${keyword || topic}" and a small related element (tool, document). `) +
+            `Minimal props, lots of breathing room. Non-dramatic. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Simple how-to flat lay, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Simple how-to flat lay, "${keyword || topic}". `,
+              `Simple how-to flat lay. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9207,11 +9507,19 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Soft beige or light gray background. Elegant overhead shot of a single, simple object that is semantically relevant to "${keyword || topic}"—e.g. for tech/WordPress show a laptop, tablet, or document; for food show ingredients or a dish; for wellness show a journal or plant. Delicate shadows. Minimal, premium feel. ` +
+          `Soft beige or light gray background. ` +
+            subj(
+              `Elegant overhead shot of a single, simple object that is semantically relevant to "${keyword || topic}"—e.g. for tech/WordPress show a laptop, tablet, or document; for food show ingredients or a dish; for wellness show a journal or plant. `
+            ) +
+            `Delicate shadows. Minimal, premium feel. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Elegant minimal overhead, one object, "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Elegant minimal overhead, one object, "${keyword || topic}". `,
+              `Elegant minimal overhead. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -9277,11 +9585,18 @@ function buildOverlayImagePrompt({ styleId, topic, domain, keyword, year, overla
       return (
         baseIntro +
         promptTier(
-          `Eye-catching but not cluttered design about "${keyword || topic}". Use real-life photography or photorealistic imagery. ` +
+          (hasProductReference
+            ? `Eye-catching but not cluttered design. The subject is the exact product in the attached reference photograph, reproduced as photographed — same packaging, label, and proportions. Do not redesign or restyle it. `
+            : `Eye-catching but not cluttered design about "${keyword || topic}". `) +
+            `Use real-life photography or photorealistic imagery. ` +
             `Use the main on-image text "${headline}" as a bold, highly readable headline. ` +
             (subheadline ? `Optionally add a short subheadline "${subheadline}" under the headline. ` : '') +
             `Add small, readable source text "${source}" at the bottom of the pin.`,
-          `Eye-catching pin about "${keyword || topic}". Headline "${headline}". ` +
+          subjShort(
+              `Eye-catching pin about "${keyword || topic}". `,
+              `Eye-catching pin. Subject: the attached product photo, reproduced exactly. `
+            ) +
+            `Headline "${headline}". ` +
             (subheadline ? `"${subheadline}". ` : '') +
             `Footer "${source}".`
         ) +
@@ -10457,10 +10772,10 @@ app.post('/api/urltopin/preview', async (req, res) => {
       workingUrl,
       base,
     });
-    const layoutId = replaceInfographicStyleIdForAmazonNanoRefs(
-      p0.layoutId,
-      refHarvest.images.length > 0
-    );
+    const layoutId = replaceLayoutForProductPin(p0.layoutId, {
+      hasReferenceImages: refHarvest.images.length > 0,
+      singleProduct: isSingleProductPageBase(base),
+    });
     const p = { ...p0, layoutId };
 
     // 5. Metadata for the single pin (mirrors the strategic path in /generate).
@@ -10506,6 +10821,9 @@ app.post('/api/urltopin/preview', async (req, res) => {
       brand: brandName || brandColorsForPreview ? { ...(brandColorsForPreview || {}), brandName } : null,
       stepCount: meta.step_count ?? null,
       niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
+      hasProductReference:
+        refHarvest.images.length > 0 &&
+        (isProductReferenceSource(refHarvest.source) || isSingleProductPageBase(base)),
     });
     imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, workingUrl);
     imagePrompt = appendNanoBananaReferencePromptSuffix(imagePrompt, refHarvest.source);
@@ -10518,7 +10836,14 @@ app.post('/api/urltopin/preview', async (req, res) => {
         30_000,
         parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000
       );
-      const nanoOpts = refHarvest.images.length ? { imageInput: refHarvest.images } : {};
+      const nanoOpts = {
+        ...(refHarvest.images.length ? { imageInput: refHarvest.images } : {}),
+        packagingClass: packagingClassForResolution(base, {
+          hasProductReference:
+            refHarvest.images.length > 0 &&
+            (isProductReferenceSource(refHarvest.source) || isSingleProductPageBase(base)),
+        }),
+      };
       rawImageUrl =
         (await withSoftTimeout(
           generateImageWithNanoBanana(imagePrompt, `preview-${p.layoutId}`, nanoOpts),
@@ -10929,6 +11254,51 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         );
       }
     }
+    // A URL2Pin-hosted bridge page already stores the merchant's own product photos, validated
+    // when the page was built. Use them directly.
+    //
+    // Without this branch /generate re-scrapes the merchant listing instead, and for bridge pages
+    // that scrape is the ONLY source: fetchArticleBaseAndSummary returns early for hosted pages
+    // (see the `return hosted` above), so it never reaches the RapidAPI prefetch and
+    // base.amazon_rapidapi_data is always null here. When the scrape came back without images the
+    // batch got no reference at all and every pin invented its own packaging — which is exactly
+    // the "wrong product" reports. The correct photos were in the database the whole time.
+    if (
+      !metadataOnly &&
+      !useTextBased &&
+      !useUserComposite &&
+      process.env.USE_DUMMY_IMAGES !== 'true' &&
+      nanoBananaReferenceInputs.length === 0
+    ) {
+      const hostedImages = Array.isArray(base?.affiliateHostedProductPageImageUrls)
+        ? base.affiliateHostedProductPageImageUrls.filter(Boolean)
+        : [];
+      if (hostedImages.length > 0) {
+        try {
+          const underlying = String(base?.underlyingProductUrl || '').trim();
+          const onAmazonCdn = underlying && isAmazonProductPageForNanoReference(underlying);
+          nanoBananaReferenceInputs = onAmazonCdn
+            ? await mirrorAmazonImageUrlsForNanoBanana(hostedImages.slice(0, 3), req.user.id)
+            : await mirrorGenericPageImageUrlsForNanoBanana(hostedImages.slice(0, 3), req.user.id);
+          if (nanoBananaReferenceInputs.length > 0) {
+            // Keep the merchant identity so the prompt gets the right reference wording and the
+            // no-invented-packaging rule (which only fires for product sources).
+            nanoBananaReferenceSource = onAmazonCdn || base?.amazonLanding
+              ? 'amazon_product'
+              : base?.walmartLanding
+                ? 'walmart_product'
+                : base?.etsyLanding
+                  ? 'etsy_product'
+                  : 'hosted_product';
+            console.log(
+              `urltopin: Nano Banana reference images (hosted bridge page): ${nanoBananaReferenceInputs.length} source=${nanoBananaReferenceSource}`
+            );
+          }
+        } catch (e) {
+          console.warn('urltopin hosted product page images mirror error:', e.message || e);
+        }
+      }
+    }
     if (!metadataOnly && !useTextBased && !useUserComposite && nanoBananaReferenceInputs.length === 0) {
       // Etsy: prefer RapidAPI listing images for Nano Banana; fallback to oEmbed thumbnail.
       const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
@@ -11125,9 +11495,30 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
 
     if (nanoBananaReferenceInputs.length > 0) {
       setNanoRefHarvestCache(refHarvestCacheKey, nanoBananaReferenceInputs, nanoBananaReferenceSource);
-      const remapped = remapStylesAvoidingInfographicsForAmazonRefs(effectiveStyles, req._strategicPlan || null);
+    }
+
+    // Runs whether or not refs were harvested: a multi-panel layout on a one-product page invents
+    // the extra products either way.
+    {
+      const remapped = remapStylesForProductPins(effectiveStyles, req._strategicPlan || null, {
+        hasReferenceImages: nanoBananaReferenceInputs.length > 0,
+        singleProduct: isSingleProductPageBase(base),
+      });
       effectiveStyles = remapped.styles;
       if (remapped.plan) req._strategicPlan = remapped.plan;
+    }
+
+    /** A real photo of the product is attached, so the styles must not invent a stand-in subject. */
+    const pinHasProductReference =
+      nanoBananaReferenceInputs.length > 0 &&
+      (isProductReferenceSource(nanoBananaReferenceSource) || isSingleProductPageBase(base));
+    const pinPackagingClass = packagingClassForResolution(base, {
+      hasProductReference: pinHasProductReference,
+    });
+    if (pinPackagingClass) {
+      console.log(
+        `urltopin: packaging class = ${pinPackagingClass} (${String(base?.title || '').slice(0, 60)})`
+      );
     }
 
     const brandPrimary = brand?.primaryColor || null;
@@ -11425,41 +11816,19 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         brand: brandForPrompt,
         stepCount: meta.step_count ?? null,
         niche: usesProductAffiliatePinMix(contentProfile) ? 'amazon_affiliate' : contentProfile?.niche || null,
+        hasProductReference: pinHasProductReference,
       });
       if (useTextBased) {
         imagePrompt = `[text_based_pin] preset=${textBasedNorm.preset} primary=${textBasedNorm.primaryColor || 'default'} secondary=${textBasedNorm.secondaryColor || 'none'}`;
       } else {
         imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
         if (nanoBananaReferenceInputs.length > 0) {
-          if (nanoBananaReferenceSource === 'amazon_product') {
-            imagePrompt +=
-              ' ' +
-              promptTier(
-                'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
-                'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-              );
-          } else if (nanoBananaReferenceSource === 'walmart_product') {
-            imagePrompt +=
-              ' ' +
-              promptTier(
-                'Attached reference image(s) show the real product from the Walmart listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line. Integrate the product naturally; avoid duplicating it as a meaningless second copy unless the layout style requires a collage.',
-                'Reference: use attached Walmart product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-              );
-          } else if (nanoBananaReferenceSource === 'etsy_product') {
-            imagePrompt +=
-              ' ' +
-              promptTier(
-                'Attached reference image(s) are from the Etsy listing (product photos). Use them as the primary hero subject: preserve jewelry/product shape, materials, colors, and overall look. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-                'Reference: use attached Etsy listing photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-              );
-          } else {
-            imagePrompt +=
-              ' ' +
-              promptTier(
-                'Attached reference image(s) come from the source page (hero or content photos). Use them as the primary visual subject when helpful: preserve recognizable subjects, colors, and composition; do not paste URL text or watermarks as new text. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-                'Reference: prefer attached page photos as the hero when they are strong; keep headline/sub/footer as specified.',
-              );
-          }
+          // `|| 'page'` keeps the old fallback: refs attached but an unlabelled source still gets
+          // the generic page-photo guidance rather than silently no guidance at all.
+          imagePrompt = appendNanoBananaReferencePromptSuffix(
+            imagePrompt,
+            nanoBananaReferenceSource || 'page'
+          );
         }
       }
 
@@ -11588,6 +11957,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         try {
           const nanoOpts = {
             ...(nanoBananaReferenceInputs.length ? { imageInput: nanoBananaReferenceInputs } : {}),
+            packagingClass: pinPackagingClass,
             timing: imageTiming,
           };
           const providerSoftTimeoutMs =
@@ -12138,8 +12508,41 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     const amazonCtxUrl = pickAmazonContextUrl(effectiveUrl, base.canonicalUrl);
     const walmartCtxUrl = pickWalmartContextUrl(effectiveUrl, base.canonicalUrl);
     const refHtmlUrl = amazonCtxUrl || effectiveUrl;
+
+    // Same hosted-bridge-page shortcut as /generate. It matters MORE here: retries are the
+    // majority of all generations, so a retry that re-scrapes and comes back empty is exactly
+    // when the user is already unhappy with the image.
+    if (process.env.USE_DUMMY_IMAGES !== 'true') {
+      const hostedImages = Array.isArray(base?.affiliateHostedProductPageImageUrls)
+        ? base.affiliateHostedProductPageImageUrls.filter(Boolean)
+        : [];
+      if (hostedImages.length > 0) {
+        try {
+          const underlying = String(base?.underlyingProductUrl || '').trim();
+          const onAmazonCdn = underlying && isAmazonProductPageForNanoReference(underlying);
+          regenNanoReferenceInputs = onAmazonCdn
+            ? await mirrorAmazonImageUrlsForNanoBanana(hostedImages.slice(0, 3), req.user.id)
+            : await mirrorGenericPageImageUrlsForNanoBanana(hostedImages.slice(0, 3), req.user.id);
+          if (regenNanoReferenceInputs.length > 0) {
+            regenNanoReferenceSource = onAmazonCdn || base?.amazonLanding
+              ? 'amazon_product'
+              : base?.walmartLanding
+                ? 'walmart_product'
+                : base?.etsyLanding
+                  ? 'etsy_product'
+                  : 'hosted_product';
+            console.log(
+              `urltopin regenerate: reference images (hosted bridge page): ${regenNanoReferenceInputs.length} source=${regenNanoReferenceSource}`
+            );
+          }
+        } catch (e) {
+          console.warn('urltopin regenerate hosted product page images mirror error:', e.message || e);
+        }
+      }
+    }
+
     // Etsy: RapidAPI listing images when present; else oEmbed thumbnail.
-    if (isEtsyHost(new URL(effectiveUrl).hostname)) {
+    if (regenNanoReferenceInputs.length === 0 && isEtsyHost(new URL(effectiveUrl).hostname)) {
       const rapidEtsyUrls = Array.isArray(base?.etsy_rapidapi_image_urls) ? base.etsy_rapidapi_image_urls : [];
       if (rapidEtsyUrls.length > 0) {
         try {
@@ -12186,6 +12589,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       }
     }
     if (
+      regenNanoReferenceInputs.length === 0 &&
       process.env.URLTOPIN_AMAZON_PRODUCT_IMAGES !== '0' &&
       isAmazonProductPageForNanoReference(amazonCtxUrl)
     ) {
@@ -12284,16 +12688,23 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       }
     }
 
-    const nanoStyleId = replaceInfographicStyleIdForAmazonNanoRefs(
-      styleId,
-      regenNanoReferenceInputs.length > 0
-    );
-
     let regenNicheHint = null;
     const regenLanding = detectProductAffiliateLandingFromUrls(rawUrl, effectiveUrl, base?.canonicalUrl);
     if (usesProductAffiliatePinMix(regenLanding)) {
       regenNicheHint = 'amazon_affiliate';
     }
+
+    // Without this the retry re-rolls the same multi-panel layout that made the user retry.
+    const nanoStyleId = replaceLayoutForProductPin(styleId, {
+      hasReferenceImages: regenNanoReferenceInputs.length > 0,
+      singleProduct: isSingleProductPageBase(base) || usesProductAffiliatePinMix(regenLanding),
+    });
+
+    const regenHasProductReference =
+      regenNanoReferenceInputs.length > 0 &&
+      (isProductReferenceSource(regenNanoReferenceSource) ||
+        isSingleProductPageBase(base) ||
+        usesProductAffiliatePinMix(regenLanding));
 
     let imagePrompt = buildOverlayImagePrompt({
       styleId: nanoStyleId,
@@ -12304,6 +12715,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       overlayText: overlayForRender,
       brand,
       niche: regenNicheHint,
+      hasProductReference: regenHasProductReference,
     });
     imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
 
@@ -12355,38 +12767,18 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
 
     let imagePromptForNano = imagePrompt;
     if (regenNanoReferenceInputs.length > 0) {
-      if (regenNanoReferenceSource === 'amazon_product') {
-        imagePromptForNano +=
-          ' ' +
-          promptTier(
-            'Attached reference image(s) show the real product from the Amazon listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-            'Reference: use attached Amazon product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-          );
-      } else if (regenNanoReferenceSource === 'walmart_product') {
-        imagePromptForNano +=
-          ' ' +
-          promptTier(
-            'Attached reference image(s) show the real product from the Walmart listing. Use them as the primary hero subject: preserve packaging shape, brand marks, colors, and overall silhouette. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-            'Reference: use attached Walmart product photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-          );
-      } else if (regenNanoReferenceSource === 'etsy_product') {
-        imagePromptForNano +=
-          ' ' +
-          promptTier(
-            'Attached reference image(s) are from the Etsy listing (product photos). Use them as the primary hero subject: preserve jewelry/product shape, materials, colors, and overall look. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-            'Reference: use attached Etsy listing photo(s) as the main hero; match the real product; keep headline/sub/footer as specified.',
-          );
-      } else {
-        imagePromptForNano +=
-          ' ' +
-          promptTier(
-            'Attached reference image(s) come from the source page (hero or content photos). Use them as the primary visual subject when helpful: preserve recognizable subjects, colors, and composition; do not paste URL text or watermarks as new text. Compose a vertical 2:3 Pinterest pin in the requested style with the specified on-image headline, subheadline, and small footer line.',
-            'Reference: prefer attached page photos as the hero when they are strong; keep headline/sub/footer as specified.',
-          );
-      }
+      imagePromptForNano = appendNanoBananaReferencePromptSuffix(
+        imagePromptForNano,
+        regenNanoReferenceSource || 'page'
+      );
     }
 
-    const regenNanoOpts = regenNanoReferenceInputs.length ? { imageInput: regenNanoReferenceInputs } : {};
+    const regenNanoOpts = {
+      ...(regenNanoReferenceInputs.length ? { imageInput: regenNanoReferenceInputs } : {}),
+      packagingClass: packagingClassForResolution(base, {
+        hasProductReference: regenHasProductReference,
+      }),
+    };
 
     let imageUrl = '';
     try {
@@ -13434,7 +13826,11 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
         30_000,
         parseInt(process.env.URLTOPIN_IMAGE_PROVIDER_SOFT_TIMEOUT_MS || '360000', 10) || 360000
       );
-      const nanoOpts = referenceInputs.length ? { imageInput: referenceInputs } : {};
+      const nanoOpts = {
+        ...(referenceInputs.length ? { imageInput: referenceInputs } : {}),
+        packagingClass:
+          referenceInputs.length > 0 ? multiProductPackagingClass(items) : null,
+      };
       let nanoUrl = await withSoftTimeout(generateImageWithNanoBanana(prompt, `multi_${mode}`, nanoOpts), providerSoftTimeoutMs);
       if (!nanoUrl) {
         nanoUrl = await withSoftTimeout(generateImageWithNanoBanana(prompt, `multi_${mode}`, nanoOpts), providerSoftTimeoutMs);

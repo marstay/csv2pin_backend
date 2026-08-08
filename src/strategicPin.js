@@ -229,6 +229,23 @@ const MULTI_IMAGE_LAYOUTS = new Set([
   'before_after',
 ]);
 
+/**
+ * Layouts that ask for several visibly DIFFERENT subjects.
+ *
+ * On a single-product page the model has one product and N panels to fill, so it invents the
+ * missing ones — pins come back showing competitor-looking items that were never in the listing.
+ * `before_after` is deliberately absent: two panels of the same subject is valid for one product.
+ */
+const SINGLE_PRODUCT_EXCLUDED_LAYOUTS = new Set([
+  'grid_3_images',
+  'grid_4_images',
+  'stacked_strips',
+  'offset_collage_3',
+  'circle_cluster_4',
+  'step_cards_3',
+  'timeline_infographic',
+]);
+
 /** Clone-winner remix: no list pins, timelines, step cards, or multi-panel grids. */
 const CLONE_EXCLUDED_STRATEGIES = new Set(['list_value']);
 
@@ -979,6 +996,7 @@ export {
   pickAngle,
   getHookType,
   usesProductAffiliatePinMix,
+  SINGLE_PRODUCT_EXCLUDED_LAYOUTS,
   STRATEGY_LAYOUT_MAP,
   STRATEGY_COPY_RULES,
   NICHE_MIXES,
