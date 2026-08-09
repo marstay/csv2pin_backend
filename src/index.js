@@ -31,6 +31,8 @@ import { runBillingReconciliation, buildProductMaps } from './billingReconcile.j
 import { analyzeWinningProduct, normalizeAmazonProduct } from './winningProductFinder.js';
 import {
   createAffiliateProductPage,
+  createAffiliateRoundupPage,
+  generateRoundupPageContent,
   generateAffiliateProductPageContent,
   getAffiliateProductPageBySlug,
   getAffiliateProductPageStats,
@@ -4351,6 +4353,10 @@ const SINGLE_HERO_FALLBACK_LAYOUTS = [
  */
 function isSingleProductPageBase(base) {
   if (!base) return false;
+  // A roundup / comparison bridge page genuinely has several products, so multi-panel layouts
+  // are correct there — the opposite of a one-product page. Without this check every pin
+  // generated from a roundup page would be forced into a single-hero layout.
+  if (base.affiliateHostedPageType && base.affiliateHostedPageType !== 'product') return false;
   return !!(base.affiliateHostedProductPage || usesProductAffiliatePinMix(base));
 }
 
@@ -13761,7 +13767,8 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
   try {
     const mode = req.body?.mode === 'comparison' ? 'comparison' : 'roundup';
     let headline = String(req.body?.headline || '').trim().slice(0, 120);
-    const destinationUrl = String(req.body?.link || req.body?.destinationUrl || '').trim();
+    // Reassigned below when the user asks us to build the destination page for them.
+    let destinationUrl = String(req.body?.link || req.body?.destinationUrl || '').trim();
     const outputLanguage = String(req.body?.outputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = req.body?.strictLanguage === true || req.body?.strictLanguage === 'true';
     const affiliateDisclosure = normalizeAffiliateDisclosureRequest(req.body || {});
@@ -13777,7 +13784,12 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
       }))
       .filter((it) => it.title || it.imageUrl);
 
-    if (!destinationUrl) return res.status(400).json({ error: 'Missing link (where the pin should send people)' });
+    // Opt-in, not automatic: someone who already has a roundup post should keep sending traffic
+    // there rather than silently getting a second page they did not ask for.
+    const createDestinationPage = req.body?.createDestinationPage === true;
+    if (!destinationUrl && !createDestinationPage) {
+      return res.status(400).json({ error: 'Missing link (where the pin should send people)' });
+    }
     if (mode === 'comparison' && items.length !== 2) {
       return res.status(400).json({ error: 'Comparison pins need exactly 2 products.' });
     }
@@ -13793,6 +13805,46 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     // Headline is optional — when omitted, let the AI craft one from the products.
     if (!headline) {
       headline = await generateMultiProductHeadline({ mode, items, outputLanguage }, openai);
+    }
+
+    // Build the destination the pin needs. Done after the headline resolves so the page and the
+    // pin share a title, and before the quota charge so a page failure costs the user nothing.
+    let createdDestinationPage = null;
+    if (!destinationUrl && createDestinationPage) {
+      try {
+        const copy = await generateRoundupPageContent(openai, { mode, headline, items });
+        // Merchant only drives the buy-button wording; a mixed list falls back to "View product".
+        const landing = detectProductAffiliateLandingFromUrls(...items.map((it) => it.link));
+        const merchantForPage = landing.amazonLanding
+          ? 'amazon'
+          : landing.walmartLanding
+            ? 'walmart'
+            : landing.etsyLanding
+              ? 'etsy'
+              : 'other';
+        createdDestinationPage = await createAffiliateRoundupPage({
+          mode,
+          headline,
+          intro: copy.intro,
+          items: items.map((it, i) => ({
+            title: it.title,
+            imageUrl: it.imageUrl,
+            buyUrl: it.link,
+            blurb: copy.blurbs[i] || '',
+          })),
+          userId: req.user.id,
+          merchant: merchantForPage,
+        });
+        const origin = String(process.env.PUBLIC_APP_ORIGIN || 'https://url2pin.com').replace(/\/$/, '');
+        destinationUrl = `${origin}/page/${createdDestinationPage.slug}`;
+        console.log(`multi-product: created ${mode} destination page /page/${createdDestinationPage.slug}`);
+      } catch (e) {
+        console.warn('multi-product destination page error:', e.message || e);
+        return res.status(502).json({
+          error: 'destination_page_failed',
+          message: e.message || 'Could not create the destination page. Add a link and try again.',
+        });
+      }
     }
 
     // One AI image pin consumed.
@@ -13996,7 +14048,18 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
       console.warn('multi-product persist threw:', e.message || e);
     }
 
-    return res.json({ pins: [pinRecord] });
+    return res.json({
+      pins: [pinRecord],
+      // Present only when we built the destination, so the UI can show and manage the new page.
+      ...(createdDestinationPage && {
+        destinationPage: {
+          slug: createdDestinationPage.slug,
+          url: destinationUrl,
+          title: createdDestinationPage.title,
+          manageToken: createdDestinationPage.manageToken,
+        },
+      }),
+    });
   } catch (err) {
     console.error('urltopin generate-multi-product error:', err);
     return res.status(500).json({ error: err.message });

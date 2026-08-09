@@ -60,11 +60,41 @@ function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+/** Page types whose body is an items[] list rather than a single product. */
+const MULTI_PRODUCT_PAGE_TYPES = new Set(['roundup', 'comparison']);
+
+export function isMultiProductPageType(pageType) {
+  return MULTI_PRODUCT_PAGE_TYPES.has(String(pageType || ''));
+}
+
+/**
+ * Normalize one roundup entry. Everything is clipped and coerced here because these come
+ * straight from a client request body, and they end up rendered on a public page.
+ */
+function normalizeRoundupItem(raw, index) {
+  const title = String(raw?.title || '').trim().slice(0, 160);
+  const imageUrl = String(raw?.imageUrl || '').trim().slice(0, 600);
+  const buyUrl = String(raw?.buyUrl || raw?.link || '').trim().slice(0, 1000);
+  if (!title && !imageUrl) return null;
+  return {
+    title: title || `Pick ${index + 1}`,
+    imageUrl,
+    buyUrl,
+    blurb: String(raw?.blurb || '').trim().slice(0, 400),
+    rank: index + 1,
+  };
+}
+
 /** Map a snake_case DB row to the camelCase page object callers expect. */
 function rowToPage(row) {
   if (!row || typeof row !== 'object') return null;
   return {
     slug: row.slug,
+    // 'product' | 'roundup' | 'comparison'. Defaulted rather than read raw so rows written
+    // before the roundup migration (and any future type this build doesn't know) still render.
+    pageType: MULTI_PRODUCT_PAGE_TYPES.has(row.page_type) ? row.page_type : 'product',
+    items: asArray(row.items),
+    intro: row.intro || '',
     productUrl: row.product_url || '',
     affiliateUrl: row.affiliate_url || null,
     buyUrl: row.buy_url || '',
@@ -158,6 +188,128 @@ export async function createAffiliateProductPage({
     if (error.code === '23505') continue; // unique_violation on slug — retry with a new suffix
     console.error('createAffiliateProductPage:', error.message || error);
     throw new Error('Could not save product page.');
+  }
+  throw new Error('Could not generate a unique page slug. Please try again.');
+}
+
+/**
+ * Create a roundup / comparison destination page.
+ *
+ * Exists because a multi-product pin has nowhere honest to point: the pin shows six products
+ * and the generator demands one destination, so without a page the user has to send the click
+ * to a single item or their homepage. Both misrepresent the pin.
+ *
+ * Deliberately does no scraping — the multi-product flow already holds each item's title,
+ * image and link, so this is a pure insert plus (optionally) one copy call by the caller.
+ *
+ * @param {{ mode?: string, headline?: string, intro?: string, items: object[], userId: string,
+ *           merchant?: string, disclosure?: string }} args
+ */
+/**
+ * Intro + one-line blurbs for a roundup page.
+ *
+ * A page of bare titles and buy buttons is thin affiliate content; the blurbs are what make it a
+ * real landing page. Non-fatal by design — the caller falls back to an empty intro and no blurbs
+ * rather than failing the pin the user actually asked for.
+ *
+ * @param {import('openai').OpenAI} openai
+ */
+export async function generateRoundupPageContent(openai, { mode, headline, items }) {
+  const list = asArray(items)
+    .map((it, i) => `${i + 1}. ${String(it?.title || '').trim()}`)
+    .join('\n');
+  const prompt =
+    `You write honest affiliate roundup pages for Pinterest traffic (not fake reviews).\n` +
+    `Format: ${mode === 'comparison' ? 'A vs B comparison' : 'numbered roundup'}\n` +
+    `Headline: ${headline}\n` +
+    `Products:\n${list}\n\n` +
+    `Return JSON only:\n` +
+    `{"intro":"2-3 sentences framing the list","blurbs":["one line per product, same order"]}\n` +
+    `Rules: exactly ${asArray(items).length} blurbs, in the given order. One or two sentences each, ` +
+    `describing what the product is and who it suits based on its name. Hedge when unsure. ` +
+    `NEVER invent prices, star ratings, review counts, or discounts. No markdown.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 700,
+      temperature: 0.6,
+    });
+    const raw = completion.choices?.[0]?.message?.content?.trim() || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return { intro: '', blurbs: [] };
+    const parsed = JSON.parse(match[0]);
+    return {
+      intro: String(parsed.intro || '').trim().slice(0, 1200),
+      blurbs: asArray(parsed.blurbs).map((b) => String(b || '').trim().slice(0, 400)),
+    };
+  } catch (e) {
+    console.warn('generateRoundupPageContent:', e.message || e);
+    return { intro: '', blurbs: [] };
+  }
+}
+
+export async function createAffiliateRoundupPage({
+  mode = 'roundup',
+  headline,
+  intro = '',
+  items,
+  userId,
+  merchant = 'other',
+  disclosure,
+}) {
+  const pageType = mode === 'comparison' ? 'comparison' : 'roundup';
+  const normalized = asArray(items)
+    .map(normalizeRoundupItem)
+    .filter(Boolean)
+    .slice(0, 6);
+  if (normalized.length < 2) {
+    throw new Error('A roundup page needs at least two products.');
+  }
+  // Owner-only: an anonymous roundup page would be unreachable the moment the browser that
+  // created it forgets the manage token, and its pins would outlive it.
+  if (!userId) {
+    throw new Error('Sign in to create a roundup page.');
+  }
+
+  const title = String(headline || '').trim().slice(0, 160) ||
+    `${normalized.length} picks worth comparing`;
+
+  const row = {
+    page_type: pageType,
+    items: normalized,
+    intro: String(intro || '').trim().slice(0, 1200),
+    // No single underlying product: the per-item links live in items[].
+    product_url: '',
+    affiliate_url: null,
+    buy_url: '',
+    merchant,
+    merchant_label: merchantLabel(merchant),
+    title,
+    image_url: normalized.find((i) => i.imageUrl)?.imageUrl || '',
+    image_urls: normalized.map((i) => i.imageUrl).filter(Boolean).slice(0, 6),
+    summary: String(intro || '').trim().slice(0, 600),
+    pros: [],
+    cons: [],
+    best_for: [],
+    specifications: [],
+    disclosure: String(disclosure || DEFAULT_DISCLOSURE).trim(),
+    user_id: String(userId).trim(),
+    manage_token: crypto.randomBytes(16).toString('hex'),
+  };
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const slug = slugifyTitle(title);
+    const { data, error } = await getDb()
+      .from(TABLE)
+      .insert({ slug, ...row })
+      .select('*')
+      .single();
+    if (!error) return rowToPage(data);
+    if (error.code === '23505') continue; // unique_violation on slug — retry with a new suffix
+    console.error('createAffiliateRoundupPage:', error.message || error);
+    throw new Error('Could not save roundup page.');
   }
   throw new Error('Could not generate a unique page slug. Please try again.');
 }
@@ -404,18 +556,28 @@ export function buildUrlToPinArticleFromHostedProductPage(page, hostedPageUrl) {
     /* keep defaults */
   }
 
-  const summaryParts = [
-    title,
-    description,
-    ...(Array.isArray(page?.pros) ? page.pros.slice(0, 4) : []),
-    ...(Array.isArray(page?.bestFor) ? page.bestFor.slice(0, 3) : []),
-  ].filter(Boolean);
+  const multiProduct = isMultiProductPageType(page?.pageType);
+  const items = asArray(page?.items);
+
+  const summaryParts = multiProduct
+    ? // A roundup's substance is the line-up, so the item names are what the pin copy needs;
+      // pros/cons/bestFor are always empty on these rows.
+      [title, description, ...items.map((i) => String(i?.title || '').trim())].filter(Boolean)
+    : [
+        title,
+        description,
+        ...(Array.isArray(page?.pros) ? page.pros.slice(0, 4) : []),
+        ...(Array.isArray(page?.bestFor) ? page.bestFor.slice(0, 3) : []),
+      ].filter(Boolean);
   const articleSummary = summaryParts.join('. ').slice(0, 1200);
 
   const underlyingProductUrl = String(page?.productUrl || '').trim();
   const merchant = String(page?.merchant || 'other');
 
   const base = {
+    // Carried through so downstream layout rules can tell a one-product page from a line-up:
+    // multi-panel layouts are wrong for the former and right for the latter.
+    affiliateHostedPageType: multiProduct ? page.pageType : 'product',
     title,
     description,
     canonicalUrl,
