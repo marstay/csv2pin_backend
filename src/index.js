@@ -13807,8 +13807,21 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
       headline = await generateMultiProductHeadline({ mode, items, outputLanguage }, openai);
     }
 
-    // Build the destination the pin needs. Done after the headline resolves so the page and the
-    // pin share a title, and before the quota charge so a page failure costs the user nothing.
+    // One AI image pin consumed.
+    const usageResult = await applyPinQuotaDelta(req.user.id, { aiDelta: 1 }, req);
+    if (!usageResult.allowed) {
+      return res.status(402).json({
+        error: 'pin_limit_reached',
+        message: buildPinLimitReachedMessage(usageResult, { kind: 'ai', delta: 1 }),
+        details: usageResult,
+      });
+    }
+
+    // Build the destination the pin needs.
+    //
+    // Strictly after the quota check: building it first meant a user who was out of pins got a
+    // silent orphan page — an error response, no pin, and a live page they never saw. The quota
+    // is refunded below if the page itself fails, matching how image failures are handled.
     let createdDestinationPage = null;
     if (!destinationUrl && createDestinationPage) {
       try {
@@ -13840,21 +13853,12 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
         console.log(`multi-product: created ${mode} destination page /page/${createdDestinationPage.slug}`);
       } catch (e) {
         console.warn('multi-product destination page error:', e.message || e);
+        await applyPinQuotaDelta(req.user.id, { aiDelta: -1 }, req);
         return res.status(502).json({
           error: 'destination_page_failed',
           message: e.message || 'Could not create the destination page. Add a link and try again.',
         });
       }
-    }
-
-    // One AI image pin consumed.
-    const usageResult = await applyPinQuotaDelta(req.user.id, { aiDelta: 1 }, req);
-    if (!usageResult.allowed) {
-      return res.status(402).json({
-        error: 'pin_limit_reached',
-        message: buildPinLimitReachedMessage(usageResult, { kind: 'ai', delta: 1 }),
-        details: usageResult,
-      });
     }
 
     // Mirror product photos to Supabase, then pass them to Nano Banana as ordered reference images so the
