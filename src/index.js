@@ -13905,7 +13905,9 @@ app.patch('/api/account/affiliate-product-pages/:slug', requireUser, async (req,
     });
   } catch (err) {
     console.error('account affiliate-product-pages patch error:', err);
-    return res.status(500).json({ error: err.message || 'Could not update product page.' });
+    return res
+      .status(err?.statusCode || 500)
+      .json({ error: err.message || 'Could not update product page.' });
   }
 });
 

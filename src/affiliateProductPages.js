@@ -490,6 +490,29 @@ export async function updateAffiliateProductPageByUser(slug, userId, patches) {
       .slice(0, 10);
   }
 
+  // Multi-product fields. Only writable on a page that already is one — a roundup's body lives in
+  // items[], and letting these land on a single-product row would create a page that renders
+  // neither shape properly.
+  if (isMultiProductPageType(page.pageType)) {
+    if (patches.intro !== undefined) {
+      update.intro = String(patches.intro || '').trim().slice(0, 1200);
+    }
+    if (patches.items !== undefined && Array.isArray(patches.items)) {
+      const normalized = patches.items.map(normalizeRoundupItem).filter(Boolean).slice(0, 6);
+      // Refuse to empty the page: a roundup with fewer than two products is not a roundup, and the
+      // renderer would fall back to the single-product layout with nothing in it.
+      if (normalized.length < 2) {
+        // Bad input, not a server fault — tagged so the route answers 400 rather than 500.
+        const err = new Error('A roundup page needs at least two products.');
+        err.statusCode = 400;
+        throw err;
+      }
+      update.items = normalized;
+      update.image_url = normalized.find((i) => i.imageUrl)?.imageUrl || '';
+      update.image_urls = normalized.map((i) => i.imageUrl).filter(Boolean).slice(0, 6);
+    }
+  }
+
   const { data, error } = await getDb()
     .from(TABLE)
     .update(update)
