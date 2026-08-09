@@ -13250,11 +13250,23 @@ app.post('/api/urltopin/product-info', requireUser, async (req, res) => {
       }
     }
 
+    // The scrape already produced the listing's own copy; returning it lets the roundup page
+    // write pros / "best for" grounded in real detail instead of guessing from the title.
+    // Clipped hard because it is only ever used as model grounding, never rendered verbatim.
+    const listingBullets = Array.isArray(base?.amazon_rapidapi_data?.bullet_points)
+      ? base.amazon_rapidapi_data.bullet_points
+          .map((b) => String(b || '').trim())
+          .filter(Boolean)
+          .slice(0, 8)
+      : [];
+
     return res.json({
       ok: true,
       url: effectiveUrl,
       title: title || '',
       imageUrl: imageUrl || '',
+      description: String(base?.description || '').trim().slice(0, 1200),
+      bullets: listingBullets,
       amazonBlocked: !!base?.amazon_blocked,
     });
   } catch (err) {
@@ -13781,6 +13793,12 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
         title: String(it?.title || '').trim().slice(0, 120),
         imageUrl: String(it?.imageUrl || '').trim(),
         link: String(it?.link || '').trim(),
+        // Listing copy from the per-item fetch, used only to ground the destination page's
+        // write-up. Absent when the user typed the row by hand — handled downstream.
+        description: String(it?.description || '').trim().slice(0, 1200),
+        bullets: Array.isArray(it?.bullets)
+          ? it.bullets.map((b) => String(b || '').trim()).filter(Boolean).slice(0, 8)
+          : [],
       }))
       .filter((it) => it.title || it.imageUrl);
 
@@ -13843,7 +13861,9 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
             title: it.title,
             imageUrl: it.imageUrl,
             buyUrl: it.link,
-            blurb: copy.blurbs[i] || '',
+            blurb: copy.products[i]?.blurb || '',
+            pros: copy.products[i]?.pros || [],
+            bestFor: copy.products[i]?.bestFor || '',
           })),
           userId: req.user.id,
           merchant: merchantForPage,

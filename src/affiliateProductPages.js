@@ -81,6 +81,8 @@ function normalizeRoundupItem(raw, index) {
     imageUrl,
     buyUrl,
     blurb: String(raw?.blurb || '').trim().slice(0, 400),
+    pros: asArray(raw?.pros).map((p) => String(p || '').trim().slice(0, 120)).filter(Boolean).slice(0, 3),
+    bestFor: String(raw?.bestFor || '').trim().slice(0, 160),
     rank: index + 1,
   };
 }
@@ -216,37 +218,57 @@ export async function createAffiliateProductPage({
  */
 export async function generateRoundupPageContent(openai, { mode, headline, items }) {
   const list = asArray(items)
-    .map((it, i) => `${i + 1}. ${String(it?.title || '').trim()}`)
+    .map((it, i) => {
+      const lines = [`${i + 1}. ${String(it?.title || '').trim()}`];
+      const desc = String(it?.description || '').trim();
+      const bullets = asArray(it?.bullets).map((b) => String(b || '').trim()).filter(Boolean);
+      if (desc) lines.push(`   Listing description: ${desc.slice(0, 700)}`);
+      if (bullets.length) lines.push(`   Listing bullets: ${bullets.slice(0, 6).join(' | ').slice(0, 900)}`);
+      // Saying so explicitly is what stops the model inventing specifics for the thin rows.
+      if (!desc && !bullets.length) lines.push('   (no listing detail available — keep it general)');
+      return lines.join('\n');
+    })
     .join('\n');
+
   const prompt =
     `You write honest affiliate roundup pages for Pinterest traffic (not fake reviews).\n` +
     `Format: ${mode === 'comparison' ? 'A vs B comparison' : 'numbered roundup'}\n` +
-    `Headline: ${headline}\n` +
+    `Headline: ${headline}\n\n` +
     `Products:\n${list}\n\n` +
     `Return JSON only:\n` +
-    `{"intro":"2-3 sentences framing the list","blurbs":["one line per product, same order"]}\n` +
-    `Rules: exactly ${asArray(items).length} blurbs, in the given order. One or two sentences each, ` +
-    `describing what the product is and who it suits based on its name. Hedge when unsure. ` +
-    `NEVER invent prices, star ratings, review counts, or discounts. No markdown.`;
+    `{"intro":"2-3 sentences framing the list",` +
+    `"products":[{"blurb":"1-2 sentences","pros":["..."],"bestFor":"one short line"}]}\n` +
+    `Rules: exactly ${asArray(items).length} entries in "products", in the given order.\n` +
+    `- Base every claim on that product's listing description/bullets above.\n` +
+    `- 2-3 pros each, short phrases drawn from the listing — REWRITE them, never copy verbatim.\n` +
+    `- Where a product is marked as having no listing detail, write only what its name supports ` +
+    `and return an empty pros array rather than inventing features.\n` +
+    `- NEVER state prices, star ratings, review counts, discounts, or medical claims.\n` +
+    `No markdown.`;
 
+  const empty = { intro: '', products: [] };
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 700,
+      max_tokens: 1400,
       temperature: 0.6,
     });
     const raw = completion.choices?.[0]?.message?.content?.trim() || '';
     const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return { intro: '', blurbs: [] };
+    if (!match) return empty;
     const parsed = JSON.parse(match[0]);
     return {
       intro: String(parsed.intro || '').trim().slice(0, 1200),
-      blurbs: asArray(parsed.blurbs).map((b) => String(b || '').trim().slice(0, 400)),
+      products: asArray(parsed.products).map((p) => ({
+        blurb: String(p?.blurb || '').trim().slice(0, 400),
+        pros: asArray(p?.pros).map((x) => String(x || '').trim().slice(0, 120)).filter(Boolean).slice(0, 3),
+        bestFor: String(p?.bestFor || '').trim().slice(0, 160),
+      })),
     };
   } catch (e) {
     console.warn('generateRoundupPageContent:', e.message || e);
-    return { intro: '', blurbs: [] };
+    return empty;
   }
 }
 
