@@ -4929,6 +4929,103 @@ function isEtsyListingPageUrl(urlString) {
   return !!extractEtsyListingIdFromUrl(urlString);
 }
 
+/**
+ * Store / category / search URLs, by merchant URL grammar. These are the shapes that reliably
+ * mean "many products or none", which is what the pin pipeline cannot describe: it assumes one
+ * URL is one product, so on a shop front it latches onto whatever number or boilerplate is most
+ * prominent. A seller who pinned their Etsy shop got "3 Simple Steps to Launch Your Etsy Shop" —
+ * pins that recruit competitors instead of customers.
+ */
+const NON_PRODUCT_URL_PATTERNS = [
+  { host: isEtsyHost, re: /^\/(shop|c|search|market|featured)(\/|$)/i, label: 'Etsy shop or category page' },
+  { host: isAmazonRelatedHost, re: /^\/(s|b|stores|gp\/browse|gp\/bestsellers|best-sellers)(\/|$)/i, label: 'Amazon search, browse or brand-store page' },
+  { host: isWalmartRelatedHost, re: /^\/(browse|cp|shop|search)(\/|$)/i, label: 'Walmart category or search page' },
+  { host: isEbayHost, re: /^\/(sch|b|str|usr)(\/|$)/i, label: 'eBay search, category or seller page' },
+];
+
+/** Paths that are store furniture on ANY domain — no single product to describe. */
+const STORE_FURNITURE_PATH_RE =
+  /^\/(prices?|pricing|plans|shop|store|catalog(ue)?|collections?|gallery|products|browse|categories|category)\/?$/i;
+
+/**
+ * Is this URL something the one-URL-is-one-product pipeline can actually describe?
+ *
+ * Deliberately conservative: it only reports 'store' for shapes we are confident about, because a
+ * false warning on a working URL is worse than no warning. Anything a page declares as a Product
+ * (schema.org or og:type) is treated as a product page regardless of its URL, which protects
+ * one-product sites and custom storefronts.
+ *
+ * @returns {{ kind: 'product'|'store'|'unknown', label: string|null }}
+ */
+function classifyPinSourcePageType(urlString, base = {}) {
+  const raw = String(urlString || '').trim();
+  if (!raw) return { kind: 'unknown', label: null };
+
+  const schemaTypes = Array.isArray(base?.schemaTypes) ? base.schemaTypes : [];
+  const ogType = String(base?.ogType || '').toLowerCase();
+  // Positive signals win outright — a page that says it's a product is one.
+  if (schemaTypes.includes('product') || /(^|\.)product(\.|$)/.test(ogType)) {
+    return { kind: 'product', label: null };
+  }
+  if (
+    isAmazonProductPageForNanoReference(raw) ||
+    isEtsyListingPageUrl(raw) ||
+    isWalmartProductPageForNanoReference(raw) ||
+    /\/(itm|ip|dp|products)\/[^/]+/i.test(raw)
+  ) {
+    return { kind: 'product', label: null };
+  }
+
+  let u;
+  try {
+    u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+  } catch {
+    return { kind: 'unknown', label: null };
+  }
+  const path = u.pathname || '/';
+
+  for (const { host, re, label } of NON_PRODUCT_URL_PATTERNS) {
+    if (host(u.hostname) && re.test(path)) return { kind: 'store', label };
+  }
+  // A bare merchant domain is a storefront, never a listing.
+  const knownMerchant =
+    isEtsyHost(u.hostname) ||
+    isAmazonRelatedHost(u.hostname) ||
+    isWalmartRelatedHost(u.hostname) ||
+    isEbayHost(u.hostname);
+  if (knownMerchant && (path === '/' || path === '')) {
+    return { kind: 'store', label: 'store homepage' };
+  }
+  // Unknown domains: only the root and explicit store furniture. A blog post has a real slug and
+  // falls through to 'unknown', so it is never warned about.
+  if (path === '/' || path === '') return { kind: 'store', label: 'site homepage' };
+  if (STORE_FURNITURE_PATH_RE.test(path)) return { kind: 'store', label: 'store or pricing page' };
+
+  // Schema that positively says "list of things".
+  if (schemaTypes.some((t) => ['collectionpage', 'searchresultspage', 'itemlist'].includes(t))) {
+    return { kind: 'store', label: 'category or collection page' };
+  }
+
+  return { kind: 'unknown', label: null };
+}
+
+/** User-facing nudge for a non-product URL. Advice only — generation is never blocked. */
+function buildNonProductPageWarning(classification) {
+  if (!classification || classification.kind !== 'store') return null;
+  const label = String(classification.label || 'store page');
+  const article = /^[aeiou]/i.test(label) ? 'an' : 'a';
+  return {
+    kind: 'non_product_page',
+    label,
+    // Says "product or article" because the root-path rule also catches blog homepages, where
+    // "paste a specific listing" would be the wrong advice.
+    message:
+      `This looks like ${article} ${label}, not a single product or article page. ` +
+      `Pins work best from one specific URL — paste a product listing or article instead, ` +
+      `or use Roundup mode to feature several products in one pin.`,
+  };
+}
+
 function pushUniqueAmazonImageUrl(ordered, seen, raw) {
   const n = normalizeAmazonImageUrlString(raw);
   if (!n || seen.has(n)) return;
@@ -5834,7 +5931,57 @@ function extractMetaFromHtml(html, url) {
     linkDisplay = '';
   }
 
-  return { title, description, canonicalUrl, domain, keyword, linkDisplay };
+  // Page-type signals. A page that declares itself a Product is a product page whatever its URL
+  // looks like, which is what keeps the "this isn't a product page" warning from misfiring on
+  // one-product sites and custom storefronts.
+  let ogType = '';
+  const schemaTypes = [];
+  try {
+    const ogTypeMatch =
+      html.match(/<meta[^>]+property=["']og:type["'][^>]*content=["']([^"']*)["']/i) ||
+      html.match(/<meta[^>]+content=["']([^"']*)["'][^>]*property=["']og:type["']/i);
+    if (ogTypeMatch) ogType = String(ogTypeMatch[1] || '').trim().toLowerCase();
+
+    const collectTypes = (node, depth = 0) => {
+      if (!node || depth > 6 || schemaTypes.length > 40) return;
+      if (Array.isArray(node)) {
+        for (const n of node) collectTypes(n, depth + 1);
+        return;
+      }
+      if (typeof node !== 'object') return;
+      const t = node['@type'];
+      for (const v of Array.isArray(t) ? t : [t]) {
+        if (typeof v === 'string' && v.trim()) schemaTypes.push(v.trim().toLowerCase());
+      }
+      for (const key of ['@graph', 'mainEntity', 'itemListElement', 'about']) {
+        if (node[key]) collectTypes(node[key], depth + 1);
+      }
+    };
+    const ldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    let ld;
+    while ((ld = ldRe.exec(html)) !== null) {
+      const text = ld[1].trim();
+      if (!text) continue;
+      try {
+        collectTypes(JSON.parse(text));
+      } catch {
+        /* malformed ld+json is common; ignore */
+      }
+    }
+  } catch {
+    // best-effort only
+  }
+
+  return {
+    title,
+    description,
+    canonicalUrl,
+    domain,
+    keyword,
+    linkDisplay,
+    ogType,
+    schemaTypes: [...new Set(schemaTypes)],
+  };
 }
 
 /** Browser-like headers — bare Node fetch gets 403 from Medium and similar CDNs */
@@ -10531,10 +10678,20 @@ app.post('/api/urltopin/scrape', async (req, res) => {
       } catch {
         /* ignore */
       }
+      // Shop fronts often block scrapers, so the generic "couldn't load" fires before we ever
+      // look at the page. The URL alone is enough to give the useful answer instead.
+      // affiliateHop wins: for a Mavely/ShopMy/LTK link the "paste the direct product URL"
+      // instruction is the actionable one, and must not be displaced by generic page-type advice.
+      const blockedPageWarning = affiliateHop
+        ? null
+        : buildNonProductPageWarning(classifyPinSourcePageType(rawUrl, base));
       return res.status(502).json({
         error: affiliateHop
           ? 'Could not read the product page behind this affiliate link (Mavely/ShopMy/Benable block automated access). Paste the direct Temu/Amazon/store product URL in Product page URL — your affiliate link still goes on the pin. Add your brand in Pin footer (required).'
-          : 'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
+          : blockedPageWarning
+            ? blockedPageWarning.message
+            : 'Could not load this page. Many sites (including Medium) block automated requests. We retry with a browser when possible — if it still fails, try a different URL or paste your article on a blog you control.',
+        ...(blockedPageWarning ? { pageTypeWarning: blockedPageWarning } : {}),
       });
     }
 
@@ -10563,6 +10720,21 @@ app.post('/api/urltopin/scrape', async (req, res) => {
     if (articleSummary && String(articleSummary).trim().length > 0) {
       meta.articleSummary = articleSummary;
     }
+    // Advisory only. Surfaced here rather than at generate time so the user sees it before
+    // spending pins, and never blocks — pinning a homepage is unusual, not forbidden.
+    //
+    // Both the pasted URL and the canonical are checked. Canonical alone is not enough: a site
+    // can point its homepage at a real path (magicalstock.art canonicalises "/" to
+    // "/main-gallery-page/"), which hides the root and silences the warning. Pasted alone is not
+    // enough either, because short links resolve elsewhere. A product verdict from either side
+    // wins, so this stays conservative.
+    const pageTypeVerdicts = [rawUrl, base.canonicalUrl]
+      .filter(Boolean)
+      .map((u) => classifyPinSourcePageType(u, base));
+    const pageTypeWarning = pageTypeVerdicts.some((v) => v.kind === 'product')
+      ? null
+      : buildNonProductPageWarning(pageTypeVerdicts.find((v) => v.kind === 'store'));
+    if (pageTypeWarning) meta.pageTypeWarning = pageTypeWarning;
     if (base.etsy_oembed_thumbnail) meta.etsy_oembed_thumbnail = base.etsy_oembed_thumbnail;
     if (Array.isArray(base.etsy_rapidapi_image_urls) && base.etsy_rapidapi_image_urls.length > 0) {
       meta.etsy_rapidapi_image_urls = base.etsy_rapidapi_image_urls;
