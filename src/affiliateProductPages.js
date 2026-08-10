@@ -340,9 +340,13 @@ export async function incrementAffiliateProductPageViews(slug) {
   const key = String(slug || '').trim().toLowerCase();
   const current = await getAffiliateProductPageBySlug(key);
   if (!current) return null;
+  // Deliberately does NOT touch updated_at. It used to, which meant a stranger opening the page
+  // rewrote its "last updated" time — so the dashboard's "Recently updated" sort was really
+  // "recently viewed", and a page edited in July jumped to the top because someone read it today.
+  // updated_at now means what it says: last edited.
   const { data, error } = await getDb()
     .from(TABLE)
-    .update({ views: (Number(current.views) || 0) + 1, updated_at: new Date().toISOString() })
+    .update({ views: (Number(current.views) || 0) + 1 })
     .eq('slug', key)
     .select('*')
     .single();
@@ -359,10 +363,8 @@ export async function incrementAffiliateProductPageOutboundClicks(slug) {
   if (!current) return null;
   const { data, error } = await getDb()
     .from(TABLE)
-    .update({
-      outbound_clicks: (Number(current.outboundClicks) || 0) + 1,
-      updated_at: new Date().toISOString(),
-    })
+    // Same reasoning as the view counter: traffic is not an edit, so it must not move updated_at.
+    .update({ outbound_clicks: (Number(current.outboundClicks) || 0) + 1 })
     .eq('slug', key)
     .select('*')
     .single();
