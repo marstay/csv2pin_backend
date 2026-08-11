@@ -18644,12 +18644,60 @@ app.post('/api/pinterest/oauth', async (req, res) => {
       const planType = sub?.plan_type || profile?.plan_type || 'free';
       const { data: existing } = await supabaseAdmin
         .from('pinterest_accounts')
-        .select('id')
+        .select('id, account_name, created_at')
         .eq('user_id', user.id);
-      const count = Array.isArray(existing) ? existing.length : 0;
+      const existingRows = Array.isArray(existing) ? existing : [];
+
+      /**
+       * Re-linking an account the user already has must UPDATE that row, not add another.
+       *
+       * Connecting the same Pinterest account twice used to insert a second row, leaving a
+       * stale copy holding a dead token beside a working one. That is why one Pro customer
+       * showed three rows for two Pinterest accounts and looked disconnected while posting
+       * fine — whichever row got resolved decided whether his pins worked. Duplicates also
+       * inflate per-account analytics and, because the plan limit below counts rows, they
+       * consume a user's own allowance: a free user reconnecting would be told "Plan limit
+       * reached" by their own duplicate.
+       *
+       * account_name is the Pinterest username, matched case-insensitively — it is the only
+       * stable identifier stored for the remote account.
+       */
+      const nameKey = String(accountName || '').trim().toLowerCase();
+      const alreadyLinked = nameKey
+        ? existingRows.find((r) => String(r.account_name || '').trim().toLowerCase() === nameKey)
+        : null;
+
+      if (alreadyLinked) {
+        const { error: relinkError } = await supabaseAdmin
+          .from('pinterest_accounts')
+          .update({
+            access_token: tokenData.access_token,
+            account_name: accountName,
+            refresh_token: tokenData.refresh_token || null,
+            updated_at: new Date().toISOString(),
+            // They have just proved the connection works, so allow a future breakage to
+            // notify them again rather than staying muted by the old dedupe timestamp.
+            auth_notified_at: null,
+            ...(tokenExpiresAt ? { token_expires_at: tokenExpiresAt } : {}),
+          })
+          .eq('id', alreadyLinked.id)
+          .eq('user_id', user.id);
+        if (relinkError) {
+          console.error('Error re-linking pinterest account:', relinkError);
+          return res.status(500).json({ error: 'Failed to save Pinterest connection' });
+        }
+        console.log(`🔄 Re-linked existing Pinterest account ${accountName} for user ${user.id}`);
+        return res.json({ access_token: tokenData.access_token, account_name: accountName, relinked: true });
+      }
+
+      // Count DISTINCT Pinterest accounts, not rows: any duplicates already in the table
+      // would otherwise keep charging users for accounts they only linked once.
+      const distinctAccounts = new Set(
+        existingRows.map((r) => String(r.account_name || '').trim().toLowerCase()).filter(Boolean)
+      ).size;
       const planLimits = { free: 1, starter: 1, creator: 3, pro: Infinity, agency: Infinity };
       const limit = planLimits[planType] ?? 1;
-      if (count >= limit) {
+      if (distinctAccounts >= limit) {
         return res.status(403).json({ error: `Plan limit reached. Your plan (${planType}) allows ${limit === Infinity ? 'unlimited' : limit} account(s).` });
       }
 
