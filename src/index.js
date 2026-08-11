@@ -8101,6 +8101,7 @@ let schedulerInterval;
 let analyticsInterval;
 let refImageCleanupInterval;
 let onboardingEmailInterval;
+let pinterestTokenRefreshInterval;
 
 async function cleanupOldUrlToPinReferenceImages() {
   // Deletes only our temporary reference images mirrored into Storage for Nano Banana.
@@ -8192,6 +8193,16 @@ function startRefImageCleanup() {
   refImageCleanupInterval = setInterval(cleanupOldUrlToPinReferenceImages, 6 * 60 * 60 * 1000);
   setTimeout(cleanupOldUrlToPinReferenceImages, 60 * 1000);
   console.log('🧹 URL→Pin reference image cleanup started (runs every 6 hours)');
+}
+
+function startPinterestTokenRefresh() {
+  if (pinterestTokenRefreshInterval) clearInterval(pinterestTokenRefreshInterval);
+  // Every 6 hours against a 5-day window on 30-day tokens: an account gets ~20 chances to be
+  // renewed before it can lapse, so a few missed runs (deploy, restart) cannot kill a connection.
+  pinterestTokenRefreshInterval = setInterval(processPinterestTokenRefresh, 6 * 60 * 60 * 1000);
+  // Startup pass runs after the analytics sync's 30s so the two don't contend on boot.
+  setTimeout(processPinterestTokenRefresh, 90 * 1000);
+  console.log('🔑 Pinterest token refresh started (runs every 6 hours)');
 }
 
 /**
@@ -18336,6 +18347,95 @@ function pinterestAccountNeedsProactiveRefresh(account) {
   return Date.now() > expMs - PINTEREST_TOKEN_REFRESH_BUFFER_SEC * 1000;
 }
 
+/**
+ * Proactively renew Pinterest access tokens before they expire.
+ *
+ * Pinterest access tokens live exactly 30 days. Until this job existed, refresh happened ONLY
+ * reactively — when a token was actually used to post or to sync analytics. But the analytics
+ * sync only visits users who already have posted pins, so anyone who connected Pinterest and
+ * did not post within 30 days had their token quietly expire with nothing left to renew it.
+ * Their account still showed as "connected" in the UI. At the time this was written that was
+ * 103 of 212 connected accounts (49%), every one of them still holding a valid refresh_token
+ * that would have worked, and only 8 users had ever been told.
+ *
+ * Refresh tokens outlive access tokens by a long way, so most already-expired accounts are
+ * recoverable — this job is both a preventative measure and a one-off repair.
+ */
+const PINTEREST_PROACTIVE_REFRESH_WINDOW_DAYS = 5;
+const PINTEREST_PROACTIVE_REFRESH_MAX_PER_RUN = 60;
+const PINTEREST_PROACTIVE_REFRESH_DELAY_MS = 1000;
+
+async function processPinterestTokenRefresh() {
+  console.log('🔑 Processing Pinterest token refresh...');
+  try {
+    const cutoff = new Date(
+      Date.now() + PINTEREST_PROACTIVE_REFRESH_WINDOW_DAYS * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    const { data: accounts, error } = await supabaseAdmin
+      .from('pinterest_accounts')
+      .select('id, user_id, account_name, refresh_token, token_expires_at, auth_notified_at')
+      .not('refresh_token', 'is', null)
+      .not('token_expires_at', 'is', null)
+      .lt('token_expires_at', cutoff)
+      // Newest expiry first: protect accounts that are still alive but about to lapse before
+      // spending the run's budget on long-dead ones, which are recovery attempts rather than
+      // rescues. Explicit limit — an unbounded select is silently capped at ~1000 by PostgREST.
+      .order('token_expires_at', { ascending: false })
+      .limit(PINTEREST_PROACTIVE_REFRESH_MAX_PER_RUN);
+
+    if (error) {
+      console.error('❌ Pinterest token refresh fetch failed:', error.message || error);
+      return;
+    }
+    if (!accounts || accounts.length === 0) {
+      console.log('✅ No Pinterest tokens need refreshing');
+      return;
+    }
+
+    let renewed = 0;
+    let dead = 0;
+    let transient = 0;
+
+    for (const account of accounts) {
+      try {
+        const tokenData = await exchangePinterestRefreshToken(account.refresh_token);
+        if (tokenData?.access_token) {
+          await applyPinterestTokenResponseToAccount(account.id, tokenData);
+          renewed += 1;
+        } else {
+          transient += 1;
+        }
+      } catch (err) {
+        const msg = String(err?.message || err);
+        // A 400/401 from the token endpoint means the refresh token itself is rejected —
+        // the user revoked access or it expired, and only reconnecting fixes it. Anything
+        // else (5xx, network, rate limit) is transient and must NOT trigger an email, or a
+        // Pinterest outage would tell every customer their account is broken.
+        const permanent = /\b(400|401)\b/.test(msg) || /invalid_grant|invalid_request/i.test(msg);
+        if (permanent) {
+          dead += 1;
+          await triggerPinterestReconnectEmail({ userId: account.user_id, account });
+        } else {
+          transient += 1;
+          console.warn(
+            `Pinterest token refresh transient failure for ${account.account_name || account.id}:`,
+            msg.slice(0, 160)
+          );
+        }
+      }
+      await new Promise((r) => setTimeout(r, PINTEREST_PROACTIVE_REFRESH_DELAY_MS));
+    }
+
+    console.log(
+      `🔑 Pinterest token refresh done — renewed ${renewed}, needs reconnect ${dead}, transient ${transient} (of ${accounts.length} checked)`
+    );
+  } catch (err) {
+    // Never let this take the process down; it runs on a timer alongside posting.
+    console.error('❌ Error in processPinterestTokenRefresh:', err?.message || err);
+  }
+}
+
 function pinterestResponseIsAuthFailure(status, pinData) {
   // 401 + invalid_token/unauthorized should trigger token refresh; 403 is often authorization/permissions.
   if (status === 401) return true;
@@ -20757,4 +20857,8 @@ app.listen(PORT, () => {
   startTrendsScheduler();
   startOnboardingEmails();
   startBillingReconciliation();
+  // Must stay inside the BACKGROUND_JOBS_DISABLED guard above: refreshing rotates the stored
+  // refresh_token, so a local instance run against the production .env would hand Render a
+  // token Pinterest has already superseded and break live connections.
+  startPinterestTokenRefresh();
 }); 
