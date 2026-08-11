@@ -7650,23 +7650,48 @@ function extractPinterestPinMetrics(analyticsData) {
 }
 
 // Background job processor for Pinterest analytics sync
+/**
+ * Read every matching row, not just the first page.
+ *
+ * PostgREST caps an unbounded select at ~1000 rows and returns them WITHOUT any error, so a
+ * query that looks like "all rows" silently becomes "an arbitrary 1000". That is exactly what
+ * starved the analytics sync: 3927 posted pins were truncated to 1000, which yielded 46 of the
+ * 56 users who have posted pins, and the other 10 never had a single metric synced.
+ *
+ * `orderColumn` must be unique and stable, otherwise rows can repeat or be skipped across pages.
+ */
+async function fetchAllRowsPaged(table, columns, applyFilters, orderColumn = 'id', pageSize = 1000) {
+  const out = [];
+  for (let from = 0; ; from += pageSize) {
+    let query = supabaseAdmin.from(table).select(columns).order(orderColumn, { ascending: true });
+    query = applyFilters(query).range(from, from + pageSize - 1);
+    const { data, error } = await query;
+    if (error) return { data: out, error };
+    if (!data || data.length === 0) break;
+    out.push(...data);
+    if (data.length < pageSize) break;
+  }
+  return { data: out, error: null };
+}
+
 async function processAnalyticsSync() {
   console.log('📊 Processing automatic Pinterest analytics sync...');
-  
+
   try {
-    // Get all unique users who have posted pins with Pinterest pin IDs from scheduled_pins
-    const { data: scheduledPostedPins, error: scheduledFetchError } = await supabaseAdmin
-      .from('scheduled_pins')
-      .select('user_id')
-      .eq('status', 'posted')
-      .not('pinterest_pin_id', 'is', null);
+    // Get all unique users who have posted pins with Pinterest pin IDs from scheduled_pins.
+    // metrics_last_updated comes back too so the slowest-served users can go first below.
+    const { data: scheduledPostedPins, error: scheduledFetchError } = await fetchAllRowsPaged(
+      'scheduled_pins',
+      'user_id, metrics_last_updated',
+      (q) => q.eq('status', 'posted').not('pinterest_pin_id', 'is', null)
+    );
 
     // Also get users who have uploaded pins directly (Images mode) from user_images
-    const { data: directUploadPins, error: directFetchError } = await supabaseAdmin
-      .from('user_images')
-      .select('user_id')
-      .eq('pinterest_uploaded', true)
-      .not('pinterest_pin_id', 'is', null);
+    const { data: directUploadPins, error: directFetchError } = await fetchAllRowsPaged(
+      'user_images',
+      'user_id, metrics_last_updated',
+      (q) => q.eq('pinterest_uploaded', true).not('pinterest_pin_id', 'is', null)
+    );
 
     if (scheduledFetchError) {
       console.error('❌ Error fetching scheduled posted pins for analytics sync:', scheduledFetchError);
@@ -7679,23 +7704,36 @@ async function processAnalyticsSync() {
       return;
     }
 
-    // Collect unique user_ids across both sources
-    const userIdSet = new Set();
-    (scheduledPostedPins || []).forEach(pin => {
-      if (pin.user_id) userIdSet.add(pin.user_id);
-    });
-    (directUploadPins || []).forEach(pin => {
-      if (pin.user_id) userIdSet.add(pin.user_id);
-    });
+    // Collect unique user_ids across both sources, remembering each user's STALEST pin so the
+    // users who have gone longest without a refresh can be served first.
+    const stalestByUser = new Map();
+    const noteUser = (pin) => {
+      if (!pin?.user_id) return;
+      // A pin that has never synced is the strongest claim on the next run, so treat null as
+      // infinitely stale rather than letting it sort as "now".
+      const ts = pin.metrics_last_updated ? new Date(pin.metrics_last_updated).getTime() : 0;
+      const cur = stalestByUser.get(pin.user_id);
+      if (cur === undefined || ts < cur) stalestByUser.set(pin.user_id, ts);
+    };
+    (scheduledPostedPins || []).forEach(noteUser);
+    (directUploadPins || []).forEach(noteUser);
 
-    const userIds = Array.from(userIdSet);
+    /**
+     * Stalest user first. Each run only covers MAX_PINS_PER_USER_PER_RUN pins per user, and a
+     * run can end early (Render restart, deploy, rate-limit stall). With a fixed order the same
+     * users were always served first and the tail never caught up; this rotates naturally.
+     */
+    const userIds = [...stalestByUser.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id);
 
     if (!userIds || userIds.length === 0) {
       console.log('✅ No users with posted pins found for analytics sync');
       return;
     }
 
-    console.log(`📊 Found ${userIds.length} users for analytics sync`);
+    const neverSynced = [...stalestByUser.values()].filter((t) => t === 0).length;
+    console.log(
+      `📊 Found ${userIds.length} users for analytics sync (${neverSynced} with never-synced pins)`
+    );
 
     // Process each user's analytics
     for (const userId of userIds) {
