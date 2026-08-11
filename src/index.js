@@ -7762,6 +7762,61 @@ async function processAnalyticsSync() {
   }
 }
 
+/**
+ * Append one metrics reading per pin per day to pin_metrics_snapshots.
+ *
+ * scheduled_pins.impressions is overwritten on every sync, so it only ever answers "how many
+ * impressions right now". That makes any comparison between pins of different ages meaningless —
+ * an older pin always looks better simply because it has been counting for longer. Keeping a
+ * dated history lets pins be compared at equal age instead.
+ *
+ * Deliberately best-effort: a failure here (table not migrated yet, transient error) must never
+ * abort the sync that maintains the numbers customers actually see in the app.
+ */
+async function recordPinMetricsSnapshot({ scheduledPinId, userId, pinterestPinId, postedAt, metrics }) {
+  if (!pinterestPinId) return;
+  try {
+    const snapshotDate = new Date().toISOString().slice(0, 10);
+    const ageDays = postedAt
+      ? Math.max(0, Math.floor((Date.now() - new Date(postedAt).getTime()) / 86_400_000))
+      : null;
+
+    const { error } = await supabaseAdmin
+      .from('pin_metrics_snapshots')
+      .upsert(
+        {
+          scheduled_pin_id: scheduledPinId || null,
+          user_id: userId || null,
+          pinterest_pin_id: pinterestPinId,
+          snapshot_date: snapshotDate,
+          posted_at: postedAt || null,
+          age_days: ageDays,
+          impressions: Number(metrics?.impressions) || 0,
+          outbound_clicks: Number(metrics?.outboundClicks) || 0,
+          saves: Number(metrics?.saves) || 0,
+          pin_clicks: Number(metrics?.pinClicks) || 0,
+          closeup_views: Number(metrics?.closeupViews) || 0,
+        },
+        // The sync runs twice a day; keep the most recent reading for the day rather than
+        // erroring on the unique (pinterest_pin_id, snapshot_date) index.
+        { onConflict: 'pinterest_pin_id,snapshot_date' }
+      );
+
+    if (error && !recordPinMetricsSnapshot._warned) {
+      recordPinMetricsSnapshot._warned = true;
+      console.warn(
+        'pin_metrics_snapshots write failed (has supabase/pin_metrics_snapshots.sql been run?):',
+        error.message || error
+      );
+    }
+  } catch (err) {
+    if (!recordPinMetricsSnapshot._warned) {
+      recordPinMetricsSnapshot._warned = true;
+      console.warn('pin_metrics_snapshots write threw:', err?.message || err);
+    }
+  }
+}
+
 async function syncUserAnalytics(userId, accessToken, account = null) {
   if (!accessToken) {
     console.log(`⚠️ No access token found for user ${userId}, skipping`);
@@ -7778,7 +7833,9 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
 
   const { data: scheduledPins, error: scheduledError } = await supabaseAdmin
     .from('scheduled_pins')
-    .select('id, pinterest_pin_id, metrics_last_updated')
+    // posted_at feeds age_days on the metrics snapshot — the axis that makes pins of
+    // different ages comparable at all.
+    .select('id, pinterest_pin_id, metrics_last_updated, posted_at')
     .eq('user_id', userId)
     .eq('status', 'posted')
     .not('pinterest_pin_id', 'is', null)
@@ -7980,6 +8037,16 @@ async function syncUserAnalytics(userId, accessToken, account = null) {
         save_rate: Math.round(saveRate * 100) / 100,
         metrics_last_updated: new Date().toISOString()
       };
+
+      // Append today's reading to the history table before overwriting the cumulative columns.
+      // Best-effort by design: analytics history must never be able to break the sync itself.
+      await recordPinMetricsSnapshot({
+        scheduledPinId: pin.source === 'scheduled_pins' ? pin.id : null,
+        userId,
+        pinterestPinId: pin.pinterest_pin_id,
+        postedAt: pin.posted_at || null,
+        metrics: { impressions, outboundClicks, saves, pinClicks, closeupViews },
+      });
 
       let updateError = null;
 
