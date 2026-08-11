@@ -18324,13 +18324,24 @@ async function pinterestRefreshAfterAuthFailure(account) {
 app.get('/api/pinterest/callback', async (req, res) => {
   const { code, state } = req.query;
   console.log('--- Pinterest OAuth Callback ---');
-  console.log('Received code:', code);
+  // Prefix only. The full value is a live single-use credential that exchanges for a Pinterest
+  // access token; a prefix is still enough to correlate a callback with its token exchange.
+  console.log('Received code:', code ? `${String(code).slice(0, 6)}…` : '(none)');
   console.log('Received state:', state);
   if (!code) return res.status(400).send('Missing code');
-  // Redirect to frontend with code for user association (use env FRONTEND_URL)
+  // Redirect to frontend with code for user association (use env FRONTEND_URL).
+  //
+  // The param is deliberately NOT called `code`. Supabase runs flowType 'pkce' with
+  // detectSessionInUrl, where `?code=` is its OWN auth-callback signal: on load it checks
+  // `params.code && <stored code-verifier>` and, if both are present, tries to exchange the
+  // code for a session. Pinterest's code obviously fails that exchange, and GoTrueClient's
+  // failure path calls _removeSession() — deleting a perfectly valid login. A stale verifier
+  // is left behind by any Google sign-in that was started and abandoned, so users who had
+  // ever done that were signed out every single time they connected Pinterest, and password
+  // sign-in never clears the verifier, so they could not escape the loop.
   const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
   const finish = new URL(`${FRONTEND_URL.replace(/\/$/, '')}/pinterest/finish`);
-  finish.searchParams.set('code', code);
+  finish.searchParams.set('pinterest_code', code);
   if (state && typeof state === 'string') finish.searchParams.set('state', state);
   res.redirect(finish.toString());
 });
@@ -18355,7 +18366,8 @@ app.post('/api/pinterest/oauth', async (req, res) => {
     client_id: process.env.PINTEREST_CLIENT_ID,
     client_secret: process.env.PINTEREST_CLIENT_SECRET ? process.env.PINTEREST_CLIENT_SECRET.slice(0,3) + '...' + process.env.PINTEREST_CLIENT_SECRET.slice(-3) : undefined,
     redirect_uri: redirectUri,
-    code,
+    // Prefix only, same reasoning as the callback log above.
+    code: code ? `${String(code).slice(0, 6)}…` : '(none)',
     reconnect: !!reconnectAccountId,
   });
   try {
