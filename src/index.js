@@ -25,6 +25,7 @@ import {
   STRATEGY_COPY_RULES,
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
+import { coercePinDestinationUrl, classifyPinterestPostError } from './pinPosting.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
 import { runBillingReconciliation, buildProductMaps } from './billingReconcile.js';
@@ -7408,15 +7409,9 @@ async function processScheduledPin(pin) {
       // Handle Pinterest API error
       const status = pinterestRes.status;
       const errorMessage = pinData.message || pinData.error || 'Pinterest API error';
-      console.error(`❌ Pinterest API error for pin ${pin.id}:`, errorMessage);
+      console.error(`❌ Pinterest API error for pin ${pin.id} (HTTP ${status}):`, errorMessage);
       
-      const isPermissionError = pinterestResponseIsPermissionFailure(status, pinData);
-      const isValidationError = status === 400 || status === 404;
-      const isRateLimit = status === 429;
-      const isServerError = status >= 500;
-
-      // Permission and validation errors are not fixed by retries/token refresh.
-      const retryable = !isPermissionError && !isValidationError && (isRateLimit || isServerError || true);
+      const { retryable, isPermissionError } = classifyPinterestPostError(status, pinData);
 
       const finalMessage = isPermissionError
         ? `Pinterest permission error (board/account access): ${errorMessage}. Likely causes: board_id not owned by this connected account, board removed, missing app scopes, or the user needs to reconnect Pinterest and reselect a board.`
@@ -7452,7 +7447,9 @@ async function handlePinError(pinId, errorMessage, currentRetryCount = 0, option
         updated_at: new Date().toISOString()
       })
       .eq('id', pinId);
-    console.log(`❌ Pin ${pinId} failed permanently (non-retryable error)`);
+    console.log(
+      `❌ Pin ${pinId} failed permanently (non-retryable error${options?.status ? `, HTTP ${options.status}` : ''})`
+    );
     return;
   }
 
@@ -11332,7 +11329,19 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
     const isStrategic = mode === 'strategic';
     const isStrategicSingle = mode === 'strategic_single';
 
-    const rawUrl = String(url || '').trim();
+    // Reject a non-URL destination (a pasted product title, say) before any quota or image
+    // work happens. Otherwise it flows into scheduled_pins.link and is caught only by
+    // Pinterest at posting time — a permanent failure long after the pins were paid for.
+    const rawUrlInput = String(url || '').trim();
+    const coercedUrlInput = rawUrlInput ? coercePinDestinationUrl(rawUrlInput) : '';
+    if (rawUrlInput && !coercedUrlInput) {
+      return res.status(400).json({
+        error:
+          'That does not look like a URL. Paste the full web address of the page the pin should link to, e.g. https://example.com/product',
+      });
+    }
+
+    const rawUrl = coercedUrlInput;
     let effectiveUrl = rawUrl;
     if (productPageUrl) {
       effectiveUrl = productPageUrl;
@@ -12151,7 +12160,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           description: descriptionForPin,
           altText: '',
           hashtags: hashtagsForPin,
-          link: url,
+          link: rawUrl,
           overlayText,
           bakedInText: overlayTextForPrompt,
           metadataOnly: true,
@@ -12367,7 +12376,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
         description: descriptionForPin,
         altText,
         hashtags: hashtagsForPin,
-        link: url,
+        link: rawUrl,
         overlayText,
         bakedInText: overlayTextForPrompt,
         ...(userCompositeSourceUrl && {
@@ -12414,7 +12423,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       try {
         const baseHistory = {
           user_id: req.user.id,
-          source_url: url,
+          source_url: rawUrl,
           article_title: base.title || null,
           article_domain: domain || null,
           style_id: sp.id,
@@ -12422,7 +12431,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
           image_url: imageUrl || null,
           pin_title: pinTitle || null,
           pin_description: descriptionForPin || null,
-          pin_link: url,
+          pin_link: rawUrl,
         };
 
         // Fire-and-forget inserts so slow DB won't block the response
@@ -12461,7 +12470,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             description: descriptionForPin,
             image_url: imageUrl || null,
             board_id: '', // required by schema when not yet scheduled
-            link: url,
+            link: rawUrl,
             scheduled_for: null, // nullable when status is 'generated'; run migration to allow NULL
             timezone: null,
             is_recurring: false,
@@ -14097,6 +14106,18 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     const createDestinationPage = req.body?.createDestinationPage === true;
     if (!destinationUrl && !createDestinationPage) {
       return res.status(400).json({ error: 'Missing link (where the pin should send people)' });
+    }
+    // Same gate as the single-pin path: destinationUrl lands in scheduled_pins.link, so a
+    // non-URL here would only surface as a permanent Pinterest failure much later.
+    if (destinationUrl) {
+      const coercedDestination = coercePinDestinationUrl(destinationUrl);
+      if (!coercedDestination) {
+        return res.status(400).json({
+          error:
+            'That does not look like a URL. Paste the full web address the pin should send people to, e.g. https://example.com/roundup',
+        });
+      }
+      destinationUrl = coercedDestination;
     }
     if (mode === 'comparison' && items.length !== 2) {
       return res.status(400).json({ error: 'Comparison pins need exactly 2 products.' });
@@ -18443,17 +18464,6 @@ function pinterestResponseIsAuthFailure(status, pinData) {
   return msg.includes('authentication') || msg.includes('unauthorized') || msg.includes('invalid_token');
 }
 
-function pinterestResponseIsPermissionFailure(status, pinData) {
-  if (status !== 403) return false;
-  const msg = String(pinData?.message || pinData?.error || '').toLowerCase();
-  return (
-    msg.includes('not permitted') ||
-    msg.includes('forbidden') ||
-    msg.includes('permission') ||
-    msg.includes('access that resource')
-  );
-}
-
 async function pinterestValidateBoardAccess(accessToken, boardId) {
   try {
     const res = await fetch(`https://api.pinterest.com/v5/boards/${encodeURIComponent(boardId)}`, {
@@ -19075,6 +19085,16 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
   if ((!image_url && !bake) || !title || !description || !board_id) {
     return res.status(400).json({ error: 'Missing required fields: image_url (or bake), title, description, board_id' });
   }
+
+  // `link` is optional, but a non-URL here becomes a permanent Pinterest failure at posting
+  // time — hours or days after scheduling, when the user is no longer watching.
+  const rawLink = String(link || '').trim();
+  const destinationLink = rawLink ? coercePinDestinationUrl(rawLink) : '';
+  if (rawLink && !destinationLink) {
+    return res.status(400).json({
+      error: 'The pin link is not a valid URL. Use the full web address, e.g. https://example.com/product',
+    });
+  }
   if (!postImmediately && !scheduled_for) {
     return res.status(400).json({ error: 'Missing required field: scheduled_for' });
   }
@@ -19195,7 +19215,7 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
 
     // Store original pin data for reference
     const originalPinData = {
-      image_url: finalImageUrl, title, description, board_id, link, account_id,
+      image_url: finalImageUrl, title, description, board_id, link: destinationLink, account_id,
       ...(alt_text ? { alt_text } : {}),
       user_id: user.id, created_at: new Date().toISOString()
     };
@@ -19210,7 +19230,7 @@ app.post('/api/pinterest/schedule-pin', async (req, res) => {
         description,
         image_url: finalImageUrl,
         board_id,
-        link: link || '',
+        link: destinationLink,
         scheduled_for: scheduleDate.toISOString(),
         timezone,
         is_recurring,

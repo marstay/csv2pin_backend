@@ -191,6 +191,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
+    "test": "node --test \"test/**/*.test.js\"",
     "export:subscribers": "node scripts/export-subscribers-csv.mjs",
     "trends:refresh": "node scripts/refresh-trends.mjs",
     "billing:audit": "node scripts/audit-billing-health.mjs",
