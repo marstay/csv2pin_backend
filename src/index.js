@@ -15627,7 +15627,7 @@ const FOUNDER_PLAN_DISPLAY = { starter: 'Starter', creator: 'Creator', pro: 'Pro
 const FOUNDER_EXPENSE_CATEGORIES = ['openai', 'hosting', 'domains', 'email', 'ads', 'contractors', 'other'];
 // Keep in sync with the profiles_attribution_channel_check constraint in
 // supabase/profiles_attribution.sql — the API validates against this list, Postgres enforces it.
-const FOUNDER_ACQUISITION_SOURCES = ['tiktok', 'pinterest', 'seo', 'affiliate', 'direct', 'other', 'extension'];
+const FOUNDER_ACQUISITION_SOURCES = ['tiktok', 'pinterest', 'seo', 'affiliate', 'direct', 'other', 'extension', 'ai'];
 // Sentinel "still active / auto-renewing" interval end (far future).
 const FOUNDER_ONGOING_MS = Date.UTC(2999, 0, 1);
 
