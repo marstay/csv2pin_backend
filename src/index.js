@@ -9960,15 +9960,56 @@ function getClientIp(req) {
   return xf || req.socket?.remoteAddress || 'unknown';
 }
 
-function rateLimitTool(req, key, { windowMs = 60_000, max = 20 } = {}) {
-  const ip = getClientIp(req);
+/**
+ * @param {object} opts
+ * @param {string} [opts.identity] Key the bucket on this instead of the caller's IP. Pass a user
+ *   id for authenticated requests: IP-only buckets punish paying customers for sharing an office,
+ *   a VPN or a mobile carrier NAT with strangers, and an agency account was hitting an
+ *   anonymous-abuse ceiling because of it.
+ */
+function rateLimitTool(req, key, { windowMs = 60_000, max = 20, identity = '' } = {}) {
+  const who = String(identity || '').trim() || getClientIp(req);
   const now = Date.now();
-  const k = `${key}::${ip}`;
+  const k = `${key}::${who}`;
   const prev = toolRateLimit.get(k) || { start: now, count: 0 };
   const next = now - prev.start > windowMs ? { start: now, count: 0 } : prev;
   next.count++;
   toolRateLimit.set(k, next);
   return next.count <= max;
+}
+
+/**
+ * Hourly bridge-page ceiling by plan. The 8/hour cap exists to stop anonymous abuse of a free
+ * tool; applying it unchanged to subscribers meant the highest-paying accounts were throttled
+ * exactly like a logged-out visitor. Paid tiers are set well above realistic session volume so
+ * the limit only ever catches genuine runaway usage.
+ */
+const AFFILIATE_PAGE_HOURLY_LIMIT = {
+  anonymous: 8,
+  free: 10,
+  starter: 50,
+  creator: 100,
+  pro: 250,
+  agency: 500,
+};
+
+async function affiliatePageHourlyLimitForUser(userId) {
+  if (!userId) return { limit: AFFILIATE_PAGE_HOURLY_LIMIT.anonymous, planType: 'anonymous' };
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .select('plan_type')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) throw error;
+    const planType = String(data?.plan_type || 'free').trim().toLowerCase();
+    return { limit: AFFILIATE_PAGE_HOURLY_LIMIT[planType] ?? AFFILIATE_PAGE_HOURLY_LIMIT.free, planType };
+  } catch (err) {
+    // Never let a plan lookup failure block a paying customer — fall back to the paid floor
+    // rather than the anonymous ceiling, since we already know they are authenticated.
+    console.warn('affiliatePageHourlyLimitForUser:', err?.message || err);
+    return { limit: AFFILIATE_PAGE_HOURLY_LIMIT.starter, planType: 'unknown' };
+  }
 }
 
 function dedupeKeepOrder(arr) {
@@ -13851,8 +13892,24 @@ function shouldStoreAffiliateBuyUrl(buyUrl, resolvedProductUrl) {
 
 app.post('/api/tools/affiliate-product-page/generate', attachOptionalUser, async (req, res) => {
   try {
-    if (!rateLimitTool(req, 'affiliate-product-page', { windowMs: 60 * 60_000, max: 8 })) {
-      return res.status(429).json({ error: 'Too many pages generated. Please wait an hour and try again.' });
+    // Authenticated callers get a per-user bucket scaled to their plan; anonymous callers keep
+    // the original IP-keyed abuse ceiling.
+    const { limit: pageLimit, planType: limitPlan } = await affiliatePageHourlyLimitForUser(req.user?.id);
+    if (
+      !rateLimitTool(req, 'affiliate-product-page', {
+        windowMs: 60 * 60_000,
+        max: pageLimit,
+        identity: req.user?.id || '',
+      })
+    ) {
+      console.warn(
+        `affiliate-product-page hourly limit hit — user=${req.user?.id || 'anon'} plan=${limitPlan} limit=${pageLimit}`
+      );
+      return res.status(429).json({
+        error: req.user?.id
+          ? `You have generated ${pageLimit} product pages in the last hour, which is the limit for your plan. It resets within the hour.`
+          : 'Too many pages generated. Please wait an hour and try again.',
+      });
     }
     const rawUrl = String(req.body?.url || req.body?.productUrl || req.body?.affiliateUrl || '').trim();
     if (!rawUrl) {
