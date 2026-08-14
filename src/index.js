@@ -516,6 +516,24 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
 
   const paymentId = opts.paymentId || null;
 
+  // A commission needs something to commission ON.
+  //
+  // Checkout fires several events for one subscription, and only the payment event carries a
+  // payment_id and an amount — the others arrive with neither. Those used to insert $0 rows,
+  // and because the duplicate guard below keys on payment_id, a NULL one could never match,
+  // so nothing stopped them. The first real commission (2026-08-14, $12 starter) wrote THREE
+  // rows for one sale: two $0 phantoms plus the real $3.34 — including a "renewal" for a
+  // subscription two seconds old. Payouts sum commission_cents so no money moved, but the
+  // affiliate's dashboard lists rows individually and showed three entries for one sale.
+  //
+  // Deliberately requires BOTH to be missing: an event carrying an amount but no payment id
+  // still records (falling back to gross, with the existing loud warning), and a payment id
+  // with no amount still records (the net breakdown is fetched from Dodo below).
+  const grossFromOpts = Math.max(0, Number(opts.amountCents || 0) || 0);
+  if (!paymentId && grossFromOpts <= 0) {
+    return { ok: false, reason: 'no_payment_to_commission' };
+  }
+
   try {
     await promoteHeldAffiliateCommissions();
 
