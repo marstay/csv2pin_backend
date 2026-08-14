@@ -5,6 +5,8 @@ import {
   coercePinDestinationUrl,
   classifyPinterestPostError,
   pinterestResponseIsPermissionFailure,
+  pinRetryBackoffMinutes,
+  PIN_RETRY_BACKOFF_MINUTES,
 } from '../src/pinPosting.js';
 
 /**
@@ -177,4 +179,63 @@ test('pinterestResponseIsPermissionFailure — only fires on 403 with permission
   assert.equal(pinterestResponseIsPermissionFailure(403, { message: 'Forbidden' }), true);
   assert.equal(pinterestResponseIsPermissionFailure(403, { message: GENERIC }), false);
   assert.equal(pinterestResponseIsPermissionFailure(400, { message: 'not permitted' }), false);
+});
+
+/**
+ * Retry backoff. The regression these guard: the generic Pinterest error used to share the
+ * 5/15/45 ladder, spending every retry inside ~65 minutes. A Creator user lost 3 of 5 pins
+ * in one morning to a wobble that outlasted that window.
+ */
+
+const totalMinutes = (tier) => PIN_RETRY_BACKOFF_MINUTES[tier].reduce((a, b) => a + b, 0);
+
+test('pinRetryBackoffMinutes — generic Pinterest error retries over hours, not one hour', () => {
+  const delays = [1, 2, 3].map((n) => pinRetryBackoffMinutes(n, GENERIC));
+  assert.deepEqual(delays.map((d) => d.tier), ['transient', 'transient', 'transient']);
+  assert.deepEqual(delays.map((d) => d.minutes), [15, 60, 240]);
+
+  // The point of the change: the budget must outlast the ~65min that lost Paul's pins.
+  assert.ok(totalMinutes('transient') > 65 * 3, 'transient budget should span several hours');
+});
+
+test('pinRetryBackoffMinutes — the generic error outranks the spam wording test', () => {
+  // "blocked"/"redirect" must not capture a message that is really the generic error.
+  assert.equal(pinRetryBackoffMinutes(1, 'Sorry! Something went wrong on our end.').tier, 'transient');
+});
+
+test('pinRetryBackoffMinutes — spam wording keeps its long ladder', () => {
+  const spam = 'Sorry! We blocked this link because it may lead to spam.';
+  assert.deepEqual([1, 2, 3].map((n) => pinRetryBackoffMinutes(n, spam).minutes), [30, 90, 270]);
+  assert.equal(pinRetryBackoffMinutes(1, 'too many redirects').tier, 'spam');
+});
+
+test('pinRetryBackoffMinutes — ordinary transient failures still retry fast', () => {
+  for (const msg of ['Too many requests', 'Internal error', 'fetch failed']) {
+    assert.equal(pinRetryBackoffMinutes(1, msg).tier, 'standard', msg);
+  }
+  assert.deepEqual([1, 2, 3].map((n) => pinRetryBackoffMinutes(n, 'Internal error').minutes), [5, 15, 45]);
+});
+
+test('pinRetryBackoffMinutes — every ladder grows monotonically', () => {
+  for (const [tier, ladder] of Object.entries(PIN_RETRY_BACKOFF_MINUTES)) {
+    for (let i = 1; i < ladder.length; i += 1) {
+      assert.ok(ladder[i] > ladder[i - 1], `${tier} ladder must increase at step ${i}`);
+    }
+  }
+});
+
+test('pinRetryBackoffMinutes — out-of-range attempts clamp to the ladder ends', () => {
+  assert.equal(pinRetryBackoffMinutes(0, GENERIC).minutes, 15);
+  assert.equal(pinRetryBackoffMinutes(-3, GENERIC).minutes, 15);
+  // maxRetries is 3, but a 4th attempt must not return undefined and produce an Invalid Date.
+  assert.equal(pinRetryBackoffMinutes(99, GENERIC).minutes, 240);
+});
+
+test('pinRetryBackoffMinutes — a missing message does not throw', () => {
+  // handlePinError's catch path passes error.message, which can be undefined.
+  for (const msg of [null, undefined, '']) {
+    assert.doesNotThrow(() => pinRetryBackoffMinutes(1, msg));
+    assert.equal(pinRetryBackoffMinutes(1, msg).tier, 'standard');
+  }
+  assert.ok(Number.isFinite(pinRetryBackoffMinutes(1, undefined).minutes));
 });

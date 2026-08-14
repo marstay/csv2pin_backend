@@ -25,7 +25,11 @@ import {
   STRATEGY_COPY_RULES,
 } from './strategicPin.js';
 import { compositeUserPhotoPin, isAllowedUserImageUrl } from './urltopinComposite.js';
-import { coercePinDestinationUrl, classifyPinterestPostError } from './pinPosting.js';
+import {
+  coercePinDestinationUrl,
+  classifyPinterestPostError,
+  pinRetryBackoffMinutes,
+} from './pinPosting.js';
 import { renderTextBasedPin, normalizeTextBasedInput } from './urltopinTextBased.js';
 import { initTrendsEngine, getTrendsCatalog, getTrendBySlug, startTrendsScheduler } from './trendsEngine.js';
 import { runBillingReconciliation, buildProductMaps } from './billingReconcile.js';
@@ -7430,12 +7434,7 @@ async function handlePinError(pinId, errorMessage, currentRetryCount = 0, option
   const maxRetries = 3;
   const nextRetryCount = currentRetryCount + 1;
   const retryable = options?.retryable !== false;
-  
-  // Check if this is a spam-related error
-  const isSpamError = errorMessage.toLowerCase().includes('spam') || 
-                      errorMessage.toLowerCase().includes('blocked') ||
-                      errorMessage.toLowerCase().includes('redirect');
-  
+
   if (!retryable) {
     // Permanent error: don't waste retries (e.g., permission/validation)
     await supabaseAdmin
@@ -7454,17 +7453,9 @@ async function handlePinError(pinId, errorMessage, currentRetryCount = 0, option
   }
 
   if (nextRetryCount <= maxRetries) {
-    // Calculate backoff based on error type
-    let backoffMinutes;
-    if (isSpamError) {
-      // Longer delays for spam errors: 30min, 90min, 270min (4.5 hours)
-      backoffMinutes = 30 * Math.pow(3, currentRetryCount);
-      console.log(`🚫 Spam-related error detected for pin ${pinId}, using extended retry delay`);
-    } else {
-      // Standard exponential backoff: 5min, 15min, 45min
-      backoffMinutes = 5 * Math.pow(3, currentRetryCount);
-    }
-    
+    // Backoff ladder depends on the failure tier — see PIN_RETRY_BACKOFF_MINUTES.
+    const { tier, minutes: backoffMinutes } = pinRetryBackoffMinutes(nextRetryCount, errorMessage);
+
     const nextRetryAt = new Date();
     nextRetryAt.setMinutes(nextRetryAt.getMinutes() + backoffMinutes);
     
@@ -7479,7 +7470,7 @@ async function handlePinError(pinId, errorMessage, currentRetryCount = 0, option
       })
       .eq('id', pinId);
       
-    console.log(`🔄 Pin ${pinId} will retry in ${backoffMinutes} minutes (attempt ${nextRetryCount}/${maxRetries}) - ${isSpamError ? 'SPAM ERROR' : 'STANDARD ERROR'}`);
+    console.log(`🔄 Pin ${pinId} will retry in ${backoffMinutes} minutes (attempt ${nextRetryCount}/${maxRetries}) - ${tier.toUpperCase()} ERROR`);
   } else {
     // Max retries reached
     await supabaseAdmin

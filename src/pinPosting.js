@@ -85,3 +85,51 @@ export function classifyPinterestPostError(status, pinData) {
     retryable: !isPermissionError && !isValidationError,
   };
 }
+
+/**
+ * Minutes to wait before retry #`attempt` of a failed pin post, per failure tier.
+ *
+ * Three ladders, because these failures recover on very different timescales:
+ *
+ * - `transient` Pinterest's generic "something went wrong on our end".
+ *   classifyPinterestPostError already earns this a retry, but the old 5/15/45 ladder spent
+ *   the whole budget inside ~65 minutes, so any wobble lasting longer than that killed the
+ *   pin for good. Seen in production: a Creator user lost 3 of 5 pins to this in one morning
+ *   while the same link and the same board posted fine either side of it. ~5h of cover
+ *   instead, which is long enough to outlast a bad patch but still posts the same day.
+ * - `spam` Pinterest is soft-blocking the link or throttling the account. Retrying quickly
+ *   makes it worse, so these wait hours (unchanged).
+ * - `standard` 429s, 5xx, network blips. These clear in minutes (unchanged).
+ *
+ * @type {{ transient: number[], spam: number[], standard: number[] }}
+ */
+export const PIN_RETRY_BACKOFF_MINUTES = {
+  transient: [15, 60, 240],
+  spam: [30, 90, 270],
+  standard: [5, 15, 45],
+};
+
+/**
+ * Pick the retry delay for a failed pin post.
+ *
+ * Tier is chosen from Pinterest's own wording. The generic-error test runs FIRST: that
+ * message is the one case where a 400 still deserves a retry, and it must not fall through
+ * to another ladder.
+ *
+ * @param {number} attempt 1-based retry number (1 = first retry). Clamped to the ladder.
+ * @param {string|null|undefined} errorMessage Pinterest's message for this failure
+ * @returns {{ tier: 'transient'|'spam'|'standard', minutes: number }}
+ */
+export function pinRetryBackoffMinutes(attempt, errorMessage) {
+  const msg = String(errorMessage ?? '');
+  const tier = /something went wrong on our end/i.test(msg)
+    ? 'transient'
+    : /spam|blocked|redirect/i.test(msg)
+      ? 'spam'
+      : 'standard';
+
+  const ladder = PIN_RETRY_BACKOFF_MINUTES[tier];
+  const n = Number.isFinite(attempt) ? Math.trunc(attempt) : 1;
+  const index = Math.min(Math.max(n, 1), ladder.length) - 1;
+  return { tier, minutes: ladder[index] };
+}
