@@ -4616,6 +4616,22 @@ function appendNanoBananaReferencePromptSuffix(imagePrompt, referenceSource) {
   if (isProductReferenceSource(referenceSource)) {
     imagePrompt = `${imagePrompt} ${noInventedPackagingTextRule()}`;
   }
+  // "Keep this pin, just fix the words." The normal regenerate paths hand the model the PRODUCT
+  // photos, so it paints a brand-new composition — which is why editing a headline today costs
+  // you the artwork you liked. Here the attached reference is the previously generated pin
+  // itself, and the instruction is to reproduce it and swap only the text.
+  //
+  // Deliberately NOT in PRODUCT_REFERENCE_SOURCES: the reference is a finished pin, not a
+  // product photo, so the packaging-text rule above does not apply to it.
+  if (referenceSource === 'previous_pin') {
+    return (
+      `${imagePrompt} ` +
+      promptTier(
+        'The attached image is an EXISTING pin that must be reproduced, not reinterpreted. Recreate it as faithfully as you can: identical composition, layout, framing, background, product placement and scale, colour palette, lighting, and typographic style. Change exactly ONE thing — replace the written words with the specified headline, subheadline and footer line, keeping them in the same position, size, weight and colour as the text already present in the attached image. Do not redesign, restyle, re-crop, re-light or re-imagine any other element, and do not add or remove objects. Output a vertical 2:3 Pinterest pin.',
+        'Reproduce the attached pin exactly; keep composition, colours and layout identical; replace ONLY the on-image words with the specified headline/sub/footer in the same position and styling.'
+      )
+    );
+  }
   if (referenceSource === 'amazon_product') {
     return (
       `${imagePrompt} ` +
@@ -12767,8 +12783,25 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       imageGenerationMode,
       textBased: rawTextBased,
       usePageReferenceImages: rawUsePageReferenceImages,
+      preserveArtFromImageUrl: rawPreserveArtFromImageUrl,
     } = req.body || {};
     const usePageReferenceImages = rawUsePageReferenceImages === true;
+
+    // OPT-IN "keep the art, change the words" mode. Absent or invalid => every line below behaves
+    // exactly as it did before, so no existing caller changes behaviour.
+    // Must be one of our own Supabase-hosted pin images: the model fetches it directly, so an
+    // arbitrary caller-supplied URL would be an SSRF-shaped hole.
+    const preserveArtCandidate = String(rawPreserveArtFromImageUrl || '').trim();
+    const preserveArtFromImageUrl =
+      preserveArtCandidate &&
+      isAllowedUserImageUrl(preserveArtCandidate, process.env.SUPABASE_URL) &&
+      /\/ai-images\//.test(preserveArtCandidate)
+        ? preserveArtCandidate
+        : null;
+    if (preserveArtCandidate && !preserveArtFromImageUrl) {
+      console.warn('urltopin regenerate: preserveArtFromImageUrl rejected (not an ai-images URL)');
+    }
+
     if (!url || !styleId) {
       return res.status(400).json({ error: 'Missing url or styleId' });
     }
@@ -13039,6 +13072,16 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       } catch (e) {
         console.warn('urltopin regenerate page refs:', e.message || e);
       }
+    }
+
+    // "Keep the art, change the words": replace whatever product references were just derived with
+    // the pin the user is actually looking at. Placed AFTER the derivation above on purpose — the
+    // existing branches run untouched and are simply overridden, so nothing about the normal path
+    // depends on this block existing.
+    if (preserveArtFromImageUrl) {
+      regenNanoReferenceInputs = [preserveArtFromImageUrl];
+      regenNanoReferenceSource = 'previous_pin';
+      console.log('urltopin regenerate: preserve-art mode — referencing the previous pin image');
     }
 
     let regenNicheHint = null;
