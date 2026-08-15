@@ -13389,7 +13389,19 @@ app.delete('/api/custom-templates/:id', requireUser, async (req, res) => {
   }
 });
 
-const BRAND_PRESET_LIMIT = 10;
+/**
+ * Saved brand presets per user.
+ *
+ * Raised 10 -> 20 on 2026-08-15: the agency customer filled all ten slots and asked for more.
+ * A preset is a name plus four short strings inside the existing profiles.brand_kit JSON, so the
+ * cost of the extra slots is negligible.
+ *
+ * NOTE: this value is duplicated in frontend/src/UrlToPinPage.js and
+ * frontend/src/tools/BrandKitManager.jsx. All three must move together — sanitizeBrandKitFull()
+ * below TRUNCATES with .slice(0, BRAND_PRESET_LIMIT) on every save, so a frontend that allows
+ * more than the backend permits silently discards the extra presets. Deploy backend first.
+ */
+const BRAND_PRESET_LIMIT = 20;
 
 /** The brand fields themselves — shared by the legacy flat kit and each preset. */
 function sanitizeBrandKit(raw) {
