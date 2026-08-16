@@ -2371,20 +2371,37 @@ async function triggerUpgradeNudge({ userId, planType, used, limit, reason, year
   }
 }
 
+/**
+ * The user's entitlement plan. Drives enforcePaidSchedulingOrThrow(), i.e. the scheduling paywall.
+ *
+ * READS billing_subscriptions ONLY — never profiles.
+ *
+ * Why: profiles is writable by the end user. RLS on that table is row-scoped
+ * ("profiles_update_own": auth.uid() = id) and NOT column-scoped, so any signed-in user can set
+ * their own profiles.plan_type from the browser with the anon key that ships in the bundle. This
+ * function used to fall back to that column when no active subscription existed — exactly the
+ * state a free user is in — so setting plan_type='starter' unlocked scheduling without paying.
+ * billing_subscriptions is service-role only and cannot be written from the client.
+ *
+ * Removing the fallback is safe, verified 2026-08-16 before the change:
+ *  - 30 profiles have a non-free plan_type; ALL 30 have a matching active subscription. Zero
+ *    users depended on the fallback, so nobody loses access.
+ *  - No profile disagrees with its active subscription.
+ *  - applyPlanActivationForUser() INSERTS billing_subscriptions first and returns early on insert
+ *    failure, then upserts profiles LAST. So there is no window during checkout or upgrade where
+ *    profiles says "paid" while billing_subscriptions does not — the subscription always exists
+ *    first. New signups, upgrades and renewals are unaffected.
+ *  - grant-influencer-trial.mjs writes BOTH tables, so comped accounts keep working.
+ *
+ * Error semantics are unchanged: a throw from getActiveSubscriptionForUser still propagates
+ * rather than silently degrading a paying customer to 'free'.
+ *
+ * Do NOT reintroduce a profiles fallback here. If an entitlement ever needs to survive a missing
+ * subscription row, add an explicit service-role-only column instead of trusting a user-writable one.
+ */
 async function resolvePlanTypeForUser(userId) {
   const sub = await getActiveSubscriptionForUser(userId);
-  if (sub?.plan_type) return sub.plan_type;
-  try {
-    const { data: profile, error } = await supabaseAdmin
-      .from('profiles')
-      .select('plan_type')
-      .eq('id', userId)
-      .maybeSingle();
-    if (error) return 'free';
-    return profile?.plan_type || 'free';
-  } catch {
-    return 'free';
-  }
+  return sub?.plan_type || 'free';
 }
 
 /** Display value for usage API when local dev bypass is active (not enforced as a hard cap). */
@@ -2739,12 +2756,22 @@ async function getCurrentUsageSnapshot(userId, req = null) {
     ? LOCALHOST_DEV_UNLIMITED_PINS
     : resolveUserPhotoPinLimitForPlan(effectiveSubForLimits);
 
-  // Profile info (for email, created_at, etc.)
-  const { data: profile } = await supabaseAdmin
-    .from('profiles')
-    .select('id, email, plan_type')
-    .eq('id', userId)
-    .single();
+  // The account email lives in auth.users, NOT in profiles — public.profiles has no email column.
+  // This used to be `.from('profiles').select('id, email, plan_type')`, which PostgREST rejected
+  // outright ("column profiles.email does not exist"). The error was destructured away, `profile`
+  // came back null, and My Account has therefore shown "-" for the email for every user since
+  // launch. Nothing else needed that query: `id` is just userId, and plan_type is taken from
+  // billing_subscriptions above (profiles.plan_type is user-writable and must never be trusted).
+  //
+  // Failure here must not take down the account page, so it degrades to null like before.
+  let accountEmail = null;
+  try {
+    const { data: authUser, error: authErr } = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (authErr) throw authErr;
+    accountEmail = authUser?.user?.email || null;
+  } catch (e) {
+    console.warn('account usage: email lookup failed', e?.message || e);
+  }
 
   const pinUsage =
     planType === 'free'
@@ -2778,8 +2805,8 @@ async function getCurrentUsageSnapshot(userId, req = null) {
   return {
     localhost_dev_unlimited_pins: localhostUnlimitedPins,
     user: {
-      id: profile?.id || userId,
-      email: profile?.email || null,
+      id: userId,
+      email: accountEmail,
     },
     subscription: subscription
       ? {
@@ -10062,13 +10089,12 @@ const AFFILIATE_PAGE_HOURLY_LIMIT = {
 async function affiliatePageHourlyLimitForUser(userId) {
   if (!userId) return { limit: AFFILIATE_PAGE_HOURLY_LIMIT.anonymous, planType: 'anonymous' };
   try {
-    const { data, error } = await supabaseAdmin
-      .from('profiles')
-      .select('plan_type')
-      .eq('id', userId)
-      .maybeSingle();
-    if (error) throw error;
-    const planType = String(data?.plan_type || 'free').trim().toLowerCase();
+    // Was reading profiles.plan_type, which the end user can write themselves (row-scoped RLS,
+    // no column restriction) — a spoofed plan_type raised this rate limit from the free tier to
+    // agency's 500/hour. resolvePlanTypeForUser reads billing_subscriptions only.
+    // Behaviour is identical for every current user: all 30 non-free profiles match their active
+    // subscription, and none exists without one (verified 2026-08-16).
+    const planType = String((await resolvePlanTypeForUser(userId)) || 'free').trim().toLowerCase();
     return { limit: AFFILIATE_PAGE_HOURLY_LIMIT[planType] ?? AFFILIATE_PAGE_HOURLY_LIMIT.free, planType };
   } catch (err) {
     // Never let a plan lookup failure block a paying customer — fall back to the paid floor
@@ -15724,7 +15750,9 @@ const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const FOUNDER_TERMINAL_SUB_STATUSES = new Set(['cancelled', 'canceled', 'expired', 'refunded', 'paused']);
 
 const FOUNDER_AI_PIN_COST_USD = Number(process.env.FOUNDER_AI_PIN_COST_USD || 0.0425);
-const FOUNDER_PLAN_AI_PINS = { starter: 60, creator: 150, pro: 450, agency: 1000 };
+// MUST MATCH PLAN_PIN_LIMITS. Drives the founder dashboard's projected image-cost model, so a
+// stale copy silently UNDER-states cost of goods on the very screen used to sanity-check pricing.
+const FOUNDER_PLAN_AI_PINS = { starter: 90, creator: 250, pro: 600, agency: 1300 };
 const FOUNDER_MOR_FEE_RATE = Number(process.env.FOUNDER_MOR_FEE_RATE || 0.04);
 const FOUNDER_MOR_FEE_FLAT_USD = Number(process.env.FOUNDER_MOR_FEE_FLAT_USD || 0.4);
 const FOUNDER_PLAN_ORDER = ['starter', 'creator', 'pro', 'agency'];
@@ -18802,18 +18830,13 @@ app.post('/api/pinterest/oauth', async (req, res) => {
         });
       }
 
-      // Enforce plan limits (new link only)
-      // Prefer active subscription (billing_subscriptions is source-of-truth),
-      // fallback to profile for legacy.
-      const sub = await getActiveSubscriptionForUser(user.id);
-      const { data: profile } = sub?.plan_type
-        ? { data: null }
-        : await supabaseAdmin
-            .from('profiles')
-            .select('plan_type')
-            .eq('id', user.id)
-            .single();
-      const planType = sub?.plan_type || profile?.plan_type || 'free';
+      // Enforce plan limits (new link only).
+      // billing_subscriptions is the ONLY source of truth. The previous "fallback to profile for
+      // legacy" path trusted profiles.plan_type, which the end user can write from the browser
+      // (row-scoped RLS with no column restriction), letting a free account connect as many
+      // Pinterest accounts as Agency. No user relies on that fallback: all 30 non-free profiles
+      // have a matching active subscription and none exists without one (verified 2026-08-16).
+      const planType = await resolvePlanTypeForUser(user.id);
       const { data: existing } = await supabaseAdmin
         .from('pinterest_accounts')
         .select('id, account_name, created_at')

@@ -13,7 +13,10 @@
  * (scripts/reconcile-billing.mjs) so both behave identically.
  */
 
-export const PLAN_LIMITS = { free: 10, starter: 60, creator: 150, pro: 450, agency: 1000 };
+// MUST MATCH PLAN_PIN_LIMITS in index.js. Reconciliation compares this against each row's
+// pins_limit_per_month and REWRITES the row when they differ, so a stale copy raises a CRITICAL
+// plan-drift alert for every customer and writes the old allowance back on every run.
+export const PLAN_LIMITS = { free: 10, starter: 90, creator: 250, pro: 600, agency: 1300 };
 const PAID_PLANS = new Set(['starter', 'creator', 'pro', 'agency']);
 const LOCAL_ACTIVE = new Set(['active', 'trialing', 'past_due']);
 const DODO_OK = new Set(['active', 'trialing']);

@@ -1,6 +1,6 @@
 /**
  * Grant comp Creator (or other paid) access for influencer / partner trials.
- * Creator plan = 150 AI pins per billing period (no Dodo charge).
+ * Creator plan = 250 AI pins per billing period (no Dodo charge).
  *
  * Usage (dry run — default):
  *   node scripts/grant-influencer-trial.mjs --email alice@example.com --email bob@example.com
@@ -15,7 +15,7 @@
  *   node scripts/grant-influencer-trial.mjs --apply --create --password "TrialPass123!" --email test1@test.com
  *
  * Options:
- *   --plan creator          Plan tier (default: creator → 150 AI pins / period)
+ *   --plan creator          Plan tier (default: creator → 250 AI pins / period)
  *   --days 30               Trial length in days (default: 30 = one Creator billing period)
  *   --interval month        Billing interval stored in DB (month | year)
  *   --label influencer      Stored in dodo_subscription_id as comp:<label> for tracking
@@ -29,12 +29,16 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(__dirname, '../.env') });
 
+// MUST MATCH PLAN_PIN_LIMITS in src/index.js. This script WRITES pins_limit_per_month into
+// billing_subscriptions, so a stale copy stores a wrong allowance on every comped account.
+// Enforcement still reads the canonical table (planAiPinsLimit prefers it for standard tiers),
+// so a drift here is cosmetic rather than dangerous — but it makes the DB lie about the plan.
 const PLAN_PIN_LIMITS = {
   free: 10,
-  starter: 60,
-  creator: 150,
-  pro: 450,
-  agency: 1000,
+  starter: 90,
+  creator: 250,
+  pro: 600,
+  agency: 1300,
 };
 
 const FREE_LIFETIME_YEAR_MONTH = '1970-01-01';
@@ -181,17 +185,22 @@ async function grantPlan(supabase, userId, opts) {
     { onConflict: 'user_id,year_month' }
   );
 
-  const { data: authUser } = await supabase.auth.admin.getUserById(userId);
-  await supabase.from('profiles').upsert(
+  // public.profiles has NO email column — including one here made PostgREST reject the whole
+  // upsert ("column profiles.email does not exist"), and because the error was never checked,
+  // every comped account silently kept plan_type='free' in profiles. Entitlements were still
+  // correct (they come from billing_subscriptions), but the profile disagreed with the grant.
+  const { error: profileError } = await supabase.from('profiles').upsert(
     {
       id: userId,
-      email: authUser?.user?.email || null,
       plan_type: plan,
       is_pro: plan !== 'free',
       updated_at: now.toISOString(),
     },
     { onConflict: 'id' }
   );
+  if (profileError) {
+    console.warn(`  WARNING: profiles upsert failed — ${profileError.message}`);
+  }
 
   return { preview, applied: true };
 }
