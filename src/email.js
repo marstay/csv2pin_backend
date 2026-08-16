@@ -47,7 +47,10 @@ const PLAN_LABELS = { free: 'Free', starter: 'Starter', creator: 'Creator', pro:
 // in an outbound email — quote what the checkout will charge.
 const PLAN_PRICES_USD = { free: 0, starter: 12, creator: 25, pro: 55, agency: 129 };
 const PLAN_ANNUAL_PRICE_USD = { starter: 108, creator: 225, pro: 495, agency: 1161 };
-const PLAN_AI_PIN_LIMITS = { free: 10, starter: 60, creator: 150, pro: 450, agency: 1000 };
+// MUST MATCH PLAN_PIN_LIMITS in index.js — that table is what the app actually enforces; this
+// copy only decides what outbound email QUOTES. If they drift, customers are promised an allowance
+// they do not get (or vice versa). Raised 2026-08-16 alongside index.js.
+const PLAN_AI_PIN_LIMITS = { free: 10, starter: 90, creator: 250, pro: 600, agency: 1300 };
 const NEXT_PLAN = { free: 'starter', starter: 'creator', creator: 'pro', pro: 'agency', agency: null };
 
 /** The plan to recommend upgrading to, or null if already on the top tier. */
