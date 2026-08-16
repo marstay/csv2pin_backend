@@ -643,21 +643,62 @@ async function recordAffiliateCommissionOnPaidSubscription(userId, planType, opt
 
 // --- Plan & usage helpers (pin_usage / metadata_usage) ---
 
+/**
+ * AI pin quotas. Raised 2026-08-16 (was 60/150/450/1000).
+ *
+ * Why: at $0.04 per generated image the old caps left ~70% gross margin but priced badly against
+ * BlogToPin, which sells 500 AI pins at $39 and 1000 at $79. Five of sixteen Starters were sitting
+ * at >=80% of the old 60 cap and three were hard-stopped at exactly 60/60.
+ *
+ * LIST PRICES ARE UNCHANGED ($12/$25/$55/$129). Cutting price instead of raising quota was
+ * considered and rejected: dropping Agency to $99 lost more margin than the extra pins gained.
+ *
+ * Margin at 100% utilisation, list prices: starter 63%, creator 53%, pro 49%, agency 52%.
+ * Max exposure if all 26 customers maxed out: 5,690 images = $227.60/mo against ~$257/mo
+ * available after fees, infra and the free tier — break-even sits at 113% utilisation, so this is
+ * SAFE EVEN IF EVERY CUSTOMER MAXES OUT. Actual utilisation is 48-63%.
+ *
+ * Deliberately chose safety over matching BlogToPin's 12.7-14 pins-per-dollar. We sit at 7.5-10.9.
+ * That is fine where it matters: our $12 entry has no BlogToPin equivalent (their floor is $39),
+ * and Creator at $25/250 is cheaper in absolute terms than their $39/500 for anyone under 250 pins.
+ * Starter + Creator is 23 of 26 customers. Pro and Agency are less competitive per-pin, but no
+ * subscription has EVER been sold at either list price, so that costs nothing today.
+ *
+ * KNOWN GAP: the Creator -> Pro upgrade path. A customer outgrowing 250 pins sees $55 for 600 here
+ * versus $39 for 500 at BlogToPin, which is the moment they shop around instead of upgrading.
+ * Raising Pro to 700 would hit exact per-pin parity at 42% margin and keep break-even at 109%
+ * (still safe at full utilisation) — the single cheapest fix if upgrade churn shows up.
+ *
+ * WATCH: if platform-wide utilisation climbs past ~80%, or image spend exceeds ~$230/mo, revisit
+ * before adding customers.
+ *
+ * Grandfathered customers get these limits automatically: planAiPinsLimit() below always prefers
+ * this table over the per-row pins_limit_per_month, so there is no backfill and no per-customer
+ * migration. Legacy PRICES are untouched — only the allowance moves.
+ */
 const PLAN_PIN_LIMITS = {
   free: 10,
-  starter: 60,
-  creator: 150,
-  pro: 450,
-  agency: 1000,
+  starter: 90,
+  creator: 250,
+  pro: 600,
+  agency: 1300,
 };
 
-/** Monthly caps for “your photo + text overlay” pins (no image model). Separate from AI pin quota. */
+/**
+ * Monthly caps for “your photo + text overlay” pins (no image model). Separate from AI pin quota.
+ *
+ * Raised 2026-08-16 (was 240/600/1800/4800). These cost no image-model spend at all —
+ * compositeUserPhotoPin() is sharp + SVG on our own CPU — so the only marginal cost is storage and
+ * bandwidth. Deliberately NOT unlimited: each composited pin is ~1.5MB and accumulates in Supabase
+ * storage forever, so a truly uncapped tier has a cost tail that grows every month. 4x is generous
+ * enough to stop anyone hitting it in normal use while keeping that tail bounded.
+ */
 const PLAN_USER_PHOTO_PIN_LIMITS = {
   free: 40,
-  starter: 240,
-  creator: 600,
-  pro: 1800,
-  agency: 4800,
+  starter: 1000,
+  creator: 2500,
+  pro: 6000,
+  agency: 12000,
 };
 
 const PLAN_METADATA_LIMITS = {
