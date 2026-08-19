@@ -22,6 +22,7 @@ const flag = (n, d) => {
 };
 const BUDGET = Math.max(10, Number(flag('budget', 150)) || 150);
 const OUT = flag('out', 'tiktok-creators.csv');
+const SET = String(flag('set', 'creators')).trim().toLowerCase();
 
 const envRaw = readFileSync(new URL('../.env', import.meta.url), 'utf8');
 const env = {};
@@ -49,22 +50,45 @@ async function api(path) {
   }
 }
 
-// Keywords chosen to surface people TEACHING this, not people selling unrelated products.
-const KEYWORDS = [
-  'amazon affiliate pinterest', 'pinterest affiliate marketing', 'amazon associates pinterest',
-  'pinterest amazon finds', 'affiliate marketing pinterest 2026', 'pinterest side hustle affiliate',
-  'faceless pinterest affiliate', 'amazon influencer pinterest', 'pinterest traffic affiliate',
-  'make money on pinterest', 'pinterest marketing tips', 'pinterest pins affiliate links',
-  'amazon storefront pinterest', 'pinterest for bloggers', 'pinterest seo affiliate',
-  'digital products pinterest', 'pinterest automation tool', 'amazon finds creator',
-  'pinterest beginners affiliate', 'blog traffic pinterest',
-];
+// Two audiences, selected with --set. They need different keywords and a different pitch.
+//
+//   creators — people with an audience who might PROMOTE the product for commission.
+//   services — Pinterest VAs, managers and agencies who would BUY it to run client accounts.
+//              This group posts to attract clients rather than to farm views, so the searches
+//              return smaller accounts; that is the point, and follower count should not be
+//              used to rank them.
+const KEYWORD_SETS = {
+  creators: [
+    'amazon affiliate pinterest', 'pinterest affiliate marketing', 'amazon associates pinterest',
+    'pinterest amazon finds', 'affiliate marketing pinterest 2026', 'pinterest side hustle affiliate',
+    'faceless pinterest affiliate', 'amazon influencer pinterest', 'pinterest traffic affiliate',
+    'make money on pinterest', 'pinterest marketing tips', 'pinterest pins affiliate links',
+    'amazon storefront pinterest', 'pinterest for bloggers', 'pinterest seo affiliate',
+    'digital products pinterest', 'pinterest automation tool', 'amazon finds creator',
+    'pinterest beginners affiliate', 'blog traffic pinterest',
+  ],
+  services: [
+    'pinterest virtual assistant', 'pinterest manager', 'pinterest management services',
+    'pinterest va', 'freelance pinterest manager', 'pinterest strategist',
+    'pinterest manager for bloggers', 'pinterest for etsy sellers', 'pinterest for small business',
+    'pinterest marketing agency', 'pinterest account management', 'social media manager pinterest',
+    'pinterest services for coaches', 'pinterest client work', 'start a pinterest va business',
+    'pinterest manager pricing',
+  ],
+};
 
-// Do not pitch people selling a competing course/tool.
+// Only meaningful for the creators set: someone selling a competing course is a poor promoter.
+// For the services set a course-seller is still a potential BUYER, so this only annotates.
 const COMPETITOR_HINT = /(gumroad|course|ebook|my guide|template).{0,40}(pinterest|affiliate)|pinterest.{0,20}(course|guide|template|blueprint)/i;
 const EMAIL_RE = /[a-z0-9._%+-]+\s*(?:@|\(at\)|\[at\]|\s+at\s+)\s*[a-z0-9.-]+\s*\.\s*[a-z]{2,}/i;
 
-console.log(`TikTok creator discovery — budget ${BUDGET} requests\n`);
+const KEYWORDS = KEYWORD_SETS[SET];
+if (!KEYWORDS) {
+  console.error(`Unknown --set "${SET}". Use one of: ${Object.keys(KEYWORD_SETS).join(', ')}`);
+  process.exit(1);
+}
+
+console.log(`TikTok discovery — set "${SET}" (${KEYWORDS.length} keywords), budget ${BUDGET} requests\n`);
 
 // --- phase 1: cheap keyword searches to build a ranked pool -------------------
 const pool = new Map();
@@ -117,8 +141,10 @@ for (const c of ranked) {
 }
 console.log('\n');
 
-const withEmail = rows.filter((r) => r.email && r.likelyCompetitor !== 'yes');
-withEmail.sort((a, b) => b.followers - a.followers);
+const withEmail = rows.filter((r) => r.email && (SET === 'services' || r.likelyCompetitor !== 'yes'));
+withEmail.sort((a, b) =>
+  SET === 'services' ? b.keywordHits - a.keywordHits || b.videos - a.videos : b.followers - a.followers
+);
 
 const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
 const header = ['handle', 'nickname', 'followers', 'videos', 'keywordHits', 'plays', 'email', 'instagram', 'youtube', 'likelyCompetitor', 'bio'];

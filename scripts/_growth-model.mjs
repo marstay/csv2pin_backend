@@ -26,11 +26,15 @@ function liveCreds() {
 }
 const { key, base } = liveCreds();
 
+// Must also match *_LEGACY_ID and *_ANNUAL_LEGACY_ID. The old pattern ([A-Z]+?)(_ANNUAL)?_ID
+// could not match them ("_" is not in [A-Z]), so all 8 grandfathered customers fell through as
+// unmapped — and an unmapped product silently DEFAULTED to interval 'month'. That counted one
+// $384/YEAR legacy annual sub as $384/month and inflated reported MRR by $352.
 const productToPlan = {};
 const productToInterval = {};
-for (const m of envRaw.matchAll(/DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?_ID\s*=\s*(\S+)/g)) {
-  productToPlan[m[3].trim()] = m[1].toLowerCase();
-  productToInterval[m[3].trim()] = m[2] ? 'year' : 'month';
+for (const m of envRaw.matchAll(/DODO_PRODUCT_([A-Z]+?)(_ANNUAL)?(_LEGACY)?_ID\s*=\s*(\S+)/g)) {
+  productToPlan[m[4].trim()] = m[1].toLowerCase() + (m[3] ? ' (legacy)' : '');
+  productToInterval[m[4].trim()] = m[2] ? 'year' : 'month';
 }
 
 async function listAll(path) {
@@ -60,9 +64,19 @@ const active = subs.filter((s) => String(s.status) === 'active');
 // ---------------------------------------------------------------- MRR
 let mrr = 0;
 const mix = {};
+const unmapped = [];
 for (const s of active) {
   const plan = productToPlan[s.product_id] || '?';
-  const interval = productToInterval[s.product_id] || 'month';
+  if (!productToPlan[s.product_id]) unmapped.push(`${s.customer?.email || s.subscription_id} (${s.product_id})`);
+  // Dodo's own payment_frequency_interval is authoritative and always present. Never infer the
+  // billing interval from the env map alone — a product missing from .env used to default to
+  // 'month', which counts an annual subscription at 12x its true monthly value.
+  const dodoInterval = String(s.payment_frequency_interval || '').trim().toLowerCase();
+  const interval = dodoInterval.startsWith('year')
+    ? 'year'
+    : dodoInterval.startsWith('month')
+      ? 'month'
+      : productToInterval[s.product_id] || 'month';
   const amt = usd(s.recurring_pre_tax_amount ?? s.amount, s.currency);
   const monthly = interval === 'year' ? amt / 12 : amt;
   mrr += monthly;
@@ -77,7 +91,11 @@ console.log(`MRR                  : $${mrr.toFixed(2)}`);
 console.log(`ARPU                 : $${(mrr / Math.max(1, active.length)).toFixed(2)}`);
 console.log('\nplan mix:');
 for (const [p, v] of Object.entries(mix).sort((a, b) => b[1].mrr - a[1].mrr)) {
-  console.log(`  ${p.padEnd(8)} ${String(v.n).padStart(3)} subs  $${v.mrr.toFixed(2)}/mo  (${((v.mrr / mrr) * 100).toFixed(0)}% of MRR)`);
+  console.log(`  ${p.padEnd(18)} ${String(v.n).padStart(3)} subs  $${v.mrr.toFixed(2)}/mo  (${((v.mrr / mrr) * 100).toFixed(0)}% of MRR)`);
+}
+if (unmapped.length) {
+  console.log(`\n!! ${unmapped.length} active sub(s) on a product_id absent from .env — plan mix is wrong for these:`);
+  for (const u of unmapped) console.log(`   ${u}`);
 }
 
 // ------------------------------------------------- acquisition & churn
