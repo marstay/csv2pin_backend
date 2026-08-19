@@ -79,7 +79,7 @@ async function emailForUser(userId) {
 
 const { data: subs, error } = await supabase
   .from('billing_subscriptions')
-  .select('user_id, plan_type, status, billing_interval, dodo_subscription_id')
+  .select('user_id, plan_type, status, billing_interval, dodo_subscription_id, cancel_at_period_end')
   .eq('status', 'active');
 
 if (error) {
@@ -87,9 +87,28 @@ if (error) {
   process.exit(1);
 }
 
-const targets = (subs || []).filter(
-  (s) => isMonthly(s.billing_interval) && ANNUAL_PRICE[String(s.plan_type || '').toLowerCase()]
+// Never upsell someone who has already pressed cancel: status stays 'active' until their paid
+// period runs out, so they look like healthy customers here. Selling them an annual plan on the
+// way out is tone-deaf, and worse if they were just asked why they cancelled.
+//
+// Grouped PER USER, not per row: billing_subscriptions holds duplicate rows for one subscription
+// and they disagree with each other (one customer had three rows, two saying false and one true).
+// A row-level filter would let them through on a stale row.
+const leaving = new Set(
+  (subs || []).filter((s) => s.cancel_at_period_end).map((s) => s.user_id)
 );
+
+const targets = (subs || []).filter(
+  (s) =>
+    isMonthly(s.billing_interval) &&
+    ANNUAL_PRICE[String(s.plan_type || '').toLowerCase()] &&
+    !leaving.has(s.user_id)
+);
+
+if (leaving.size) {
+  console.log(`Excluded ${leaving.size} customer(s) already set to not renew.
+`);
+}
 
 const LEGACY_IDS = legacyProductIds();
 const productBySub = await loadDodoProductBySub();

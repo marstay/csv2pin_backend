@@ -353,7 +353,9 @@ export function renderDay3TipEmail() {
   const bodyHtml = `
     <p style="margin:0 0 14px;">Hi there,</p>
     <p style="margin:0 0 14px;">One tip that compounds on Pinterest: <strong>make several pins per product</strong>, not one. Different angles, titles and images mean more chances to get picked up in search and feeds.</p>
-    <p style="margin:0 0 14px;">With ${BRAND} you can spin up multiple pin angles from the same URL in seconds — try generating 3–5 variations for your best product and scheduling them across the week.</p>`;
+    <p style="margin:0 0 14px;">With ${BRAND} you can spin up multiple pin angles from the same URL in seconds — try generating 3–5 variations for your best product and scheduling them across the week.</p>
+    <p style="margin:0 0 14px;">One thing worth knowing early: <strong>Pinterest is slow before it's fast.</strong> Pins typically take 60&ndash;90 days to reach full traffic, because the platform keeps surfacing good pins months after they're published &mdash; which is exactly why volume pays off here and doesn't on other platforms.</p>
+    <p style="margin:0 0 14px;">So in the first few weeks, watch <strong>impressions and saves</strong> in your analytics rather than clicks. Those move first, and they tell you which pins Pinterest has decided to show.</p>`;
   const html = emailLayout({
     heading: 'Multiply your pins, multiply your reach',
     bodyHtml,

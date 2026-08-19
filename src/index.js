@@ -57,6 +57,7 @@ import {
   sendPinterestReconnectEmail,
   nextPlanFor,
   sendWelcomeEmail,
+  sendDay3TipEmail,
   sendFirstPinEmail,
   isEmailEnabled,
 } from './email.js';
@@ -8380,6 +8381,17 @@ async function processOnboardingEmails() {
         if (await claimEmailEvent(uid, 'activation_first_pin')) {
           const r = await sendFirstPinEmail({ to: email });
           if (r?.ok) { sent += 1; console.log('onboarding: first-pin sent', { uid }); }
+        }
+      }
+      // Day ~3: sets the 60–90 day Pinterest expectation. Goes to everyone, activated or not —
+      // people who have published are exactly the ones about to wonder why nothing has happened.
+      // claimEmailEvent('day3_tip') is the once-only guard: it upserts on (user_id, email_key)
+      // and returns true only when a row was genuinely inserted, so an hourly re-run inside the
+      // 2-day window cannot send twice.
+      if (ageDays >= 3 && ageDays < 5) {
+        if (await claimEmailEvent(uid, 'day3_tip')) {
+          const r = await sendDay3TipEmail({ to: email });
+          if (r?.ok) { sent += 1; console.log('onboarding: day3-tip sent', { uid }); }
         }
       }
     } catch (e) {
