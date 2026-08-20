@@ -18978,7 +18978,10 @@ app.delete('/api/pinterest/accounts/:id', async (req, res) => {
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    // Delete the account; scheduled_pins.pinterest_account_id has ON DELETE CASCADE
+    // Delete the account. scheduled_pins.pinterest_account_id is ON DELETE SET NULL
+    // (supabase/scheduled_pins_preserve_history.sql), so pins are ORPHANED, not destroyed:
+    // published pins keep status/posted_at/pinterest_pin_id and their analytics history.
+    // Before that migration this cascaded and silently wiped a customer's entire pin record.
     const { error: deleteError } = await supabaseAdmin
       .from('pinterest_accounts')
       .delete()
