@@ -323,7 +323,9 @@ export function renderWelcomeEmail() {
     bodyHtml,
     ctaText: 'Create my first pin',
     ctaUrl: APP_URL,
-    ps: `Hit reply and tell me what you're promoting — I read every email and I'm happy to suggest the best first URL to try.`,
+    // Asking how they found us here is the only acquisition attribution that exists: 99% of
+    // signups arrive from an unidentified source, and this email already sends to everyone.
+    ps: `Hit reply and tell me two things: what you're promoting, and how you found ${BRAND}. I read every email, and I'm happy to suggest the best first URL to try.`,
     footerNote: `You're receiving this because you just created a ${BRAND} account.`,
   });
   return { subject, html };
