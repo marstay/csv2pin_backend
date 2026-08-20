@@ -3271,6 +3271,11 @@ function isOpaqueMerchantProductIdSegment(seg) {
 
 function slugSegmentToKeyword(slug) {
   let s = cleanProductSlugHandleForKeyword(String(slug || '').trim());
+  // Some sites bolt internal ids onto an otherwise readable slug. Houzz uses
+  // "farmhouse-bedroom-ideas-phbr1-bp~t_715~s_2114". Everything from the first machinery
+  // character onward is ids, and it previously survived into the image prompt and got
+  // RENDERED as text inside the pin ("... bp~t 715~s 2114").
+  s = s.replace(/[~^|{}<>\\`].*$/, '');
   s = s.replace(/-g-\d{5,}$/i, '');
   return s
     .replace(/[-_]/g, ' ')
@@ -3278,13 +3283,31 @@ function slugSegmentToKeyword(slug) {
     .trim();
 }
 
+/**
+ * Tokens that are plainly URL machinery rather than words. Deliberately conservative: short
+ * numbers ("3 tier", "5 piece") and digit-suffixed units ("32oz") are real and must survive.
+ */
+function isUrlIdToken(word) {
+  const w = String(word || '');
+  if (/[~^|{}<>\\`]/.test(w)) return true;
+  if (/^\d{3,}$/.test(w)) return true;             // 715, 2114, 1234567890
+  if (/^[a-z]{1,8}\d{1,4}$/i.test(w)) return true; // phbr1, bp2, sku7
+  return false;
+}
+
 function sanitizeDerivedKeyword(keyword) {
-  const k = String(keyword || '').trim();
-  if (!k || k.length < 3) return '';
+  let k = String(keyword || '').trim();
+  if (!k) return '';
   if (/^ref\s*=/i.test(k) || /\bsspa\b/i.test(k)) return '';
   if (/^A\s*-?\s*\d{5,}$/i.test(k)) return '';
   if (/^g\s*-?\s*\d{5,}$/i.test(k)) return '';
   if (/^\d{5,15}$/.test(k.replace(/\s/g, ''))) return '';
+  // Strip id tokens the slug conversion left behind, then trailing 1-2 char remnants
+  // ("farmhouse bedroom ideas bp"), which are never the point of a title.
+  const words = k.split(/\s+/).filter(Boolean).filter((w) => !isUrlIdToken(w));
+  while (words.length > 1 && words[words.length - 1].length <= 2) words.pop();
+  k = words.join(' ').trim();
+  if (k.length < 3) return '';
   return k;
 }
 
