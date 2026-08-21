@@ -14716,7 +14716,9 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     const pinRecord = {
       styleId: `${mode}:${usedStyle.id}`,
       styleLabel: `${mode === 'comparison' ? 'Comparison' : 'Roundup'} — ${usedStyle.label}`,
-      strategy: mode === 'comparison' ? 'clean_authority' : 'list_value',
+      // goal only, deliberately NO strategy: the pin list groups by `goal` (falling back to the
+      // "Other" heading without one), but the "Generate more: Curiosity / List-style / …" row is
+      // gated on `strategy` and drives a single-URL regeneration that multi-product pins cannot use.
       goal: mode === 'comparison' ? 'trust' : 'saves',
       imagePrompt: prompt,
       imageUrl,
