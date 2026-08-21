@@ -909,8 +909,9 @@ async function generateStrategicPinMetadata(
       'CRITICAL: this pin links to ONE product, not an article, list or roundup.\n' +
       '- Do NOT promise a count in the title, overlay or description: no "5 Mistakes", "3 Ways", "7 Reasons", "Top 10", "the five things".\n' +
       '- Do NOT imply the destination holds multiple items, steps, tips or products.\n' +
-      '- Write about THIS one product: what it is, what problem it solves, why it is worth buying.\n' +
-      '- A question or an open loop is fine; a numbered promise is not.\n' +
+      '- Do NOT open with a hype verb: Elevate, Transform, Enhance, Upgrade, Discover, Unlock, Experience, Ultimate.\n' +
+      'This rule only FORBIDS the above. It does not decide what the copy says -- follow the LAYOUT and\n' +
+      'STRATEGY guidance for that, including any instruction to write the headline as a question.\n' +
       'Return step_count: null.'
     : '';
   const angle = ANGLE_OPTIONS.includes(suggestedAngle) ? suggestedAngle : ANGLE_OPTIONS[0];
