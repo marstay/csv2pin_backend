@@ -4782,6 +4782,11 @@ async function harvestNanoBananaReferenceImagesForUrlToPin({
 }) {
   const result = { images: [], source: null };
   if (!userId || process.env.USE_DUMMY_IMAGES === 'true') return result;
+  // The checkbox is labelled "Use photos from page when available". Users who uncheck it mean
+  // ALL of them. Previously only the generic page-scrape branch honoured this flag, so Amazon /
+  // Etsy / Walmart / bridge-page photos were harvested regardless -- one customer got their own
+  // face from an Amazon storefront and left a 1-star review. Gate every source, not the last one.
+  if (!usePageReferenceImages) return result;
 
   const hostedImages = Array.isArray(base?.affiliateHostedProductPageImageUrls)
     ? base.affiliateHostedProductPageImageUrls.filter(Boolean)
@@ -11715,7 +11720,11 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       amazonCtxUrl || effectiveUrl,
       manualProduct
     );
-    if (!metadataOnly && !useTextBased && !useUserComposite) {
+    // The checkbox is labelled "Use photos from page when available". Users who uncheck it mean
+    // ALL of them. Previously only the generic page-scrape branch honoured this flag, so Amazon /
+    // Etsy / Walmart / bridge-page photos were harvested regardless -- one customer got their own
+    // face from an Amazon storefront and left a 1-star review. Gate every source, not the last one.
+    if (!metadataOnly && !useTextBased && !useUserComposite && usePageReferenceImages) {
       const cachedRefs = getNanoRefHarvestFromCache(refHarvestCacheKey);
       if (cachedRefs) {
         nanoBananaReferenceInputs = cachedRefs.images;
@@ -13000,7 +13009,11 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     // Same hosted-bridge-page shortcut as /generate. It matters MORE here: retries are the
     // majority of all generations, so a retry that re-scrapes and comes back empty is exactly
     // when the user is already unhappy with the image.
-    if (process.env.USE_DUMMY_IMAGES !== 'true') {
+    // The checkbox is labelled "Use photos from page when available". Users who uncheck it mean
+    // ALL of them. Previously only the generic page-scrape branch honoured this flag, so Amazon /
+    // Etsy / Walmart / bridge-page photos were harvested regardless -- one customer got their own
+    // face from an Amazon storefront and left a 1-star review. Gate every source, not the last one.
+    if (process.env.USE_DUMMY_IMAGES !== 'true' && usePageReferenceImages) {
       const hostedImages = Array.isArray(base?.affiliateHostedProductPageImageUrls)
         ? base.affiliateHostedProductPageImageUrls.filter(Boolean)
         : [];
