@@ -5075,6 +5075,12 @@ function isEtsyListingPageUrl(urlString) {
 const NON_PRODUCT_URL_PATTERNS = [
   { host: isEtsyHost, re: /^\/(shop|c|search|market|featured)(\/|$)/i, label: 'Etsy shop or category page' },
   { host: isAmazonRelatedHost, re: /^\/(s|b|stores|gp\/browse|gp\/bestsellers|best-sellers)(\/|$)/i, label: 'Amazon search, browse or brand-store page' },
+  // Influencer storefronts live under /shop/. An idea list (/shop/<handle>/list/<id>) is a
+  // CURATED SET of products, and a storefront is a profile page -- neither is a single product.
+  // Missing these meant an idea list fell through to page-image scraping, which harvested the
+  // influencer's own profile photo into her pins. Keep the list pattern above the storefront one.
+  { host: isAmazonRelatedHost, re: /^\/shop\/[^/]+\/list(\/|$)/i, label: 'Amazon idea list' },
+  { host: isAmazonRelatedHost, re: /^\/shop(\/|$)/i, label: 'Amazon influencer storefront' },
   { host: isWalmartRelatedHost, re: /^\/(browse|cp|shop|search)(\/|$)/i, label: 'Walmart category or search page' },
   { host: isEbayHost, re: /^\/(sch|b|str|usr)(\/|$)/i, label: 'eBay search, category or seller page' },
 ];
@@ -5149,6 +5155,18 @@ function classifyPinSourcePageType(urlString, base = {}) {
 function buildNonProductPageWarning(classification) {
   if (!classification || classification.kind !== 'store') return null;
   const label = String(classification.label || 'store page');
+  // An idea list is the one case where we can be specific about the fix: it is already a
+  // hand-picked set of products, which is exactly what Roundup mode takes.
+  if (label === 'Amazon idea list') {
+    return {
+      kind: 'non_product_page',
+      label,
+      message:
+        'This is an Amazon idea list, not a product page — it holds several products, so there is no single ' +
+        'item to build a pin around. Open the list, copy the individual product links, and add them in Roundup ' +
+        'mode to feature them all in one pin.',
+    };
+  }
   const article = /^[aeiou]/i.test(label) ? 'an' : 'a';
   return {
     kind: 'non_product_page',
