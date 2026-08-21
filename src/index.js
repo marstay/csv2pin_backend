@@ -9484,7 +9484,7 @@ function buildBrandPaletteHint(brand) {
     roles.push(`${secondary} supports — a subtle secondary element or a gentle gradient partner`);
   }
   if (accent) {
-    roles.push(`${accent} accents — small high-emphasis details only, such as a badge or underline`);
+    roles.push(`${accent} accents — small high-emphasis details only, such as an underline, a thin keyline, or emphasised type`);
   }
   if (!roles.length) return '';
   return (
@@ -9796,7 +9796,25 @@ function buildOverlayImagePrompt({
           ` Use the brand name ${brand.brandName} subtly in the design.`,
           ` Brand: ${brand.brandName}.`
         );
-  const brandTail = brandColorHint + brandNameHint;
+  /**
+   * No invented insignia on single pins.
+   *
+   * The palette hint used to offer "a badge or underline" as an accent example and the model took
+   * it literally -- live pins came back with a leaf-in-a-circle and a little tag mark floating over
+   * the photo, in the accent colour. They read as certification or award marks the product has not
+   * earned, which is worse than mere clutter.
+   *
+   * Deliberately NOT added to buildMultiProductPinPrompt: roundup and comparison layouts ask for
+   * TOP PICK / VS / WINNER badges on purpose, and those carry real meaning.
+   */
+  const noInventedMarksHint = promptTier(
+    ' Do NOT add any badge, emblem, seal, rosette, sticker, ribbon, award mark, certification mark, ' +
+      'circular icon or logo-like graphic anywhere on the pin. The only graphics are the product photo ' +
+      'itself and plain typography; accents must be typographic — a rule, an underline, a thin keyline — never a drawn mark.',
+    ' No badges, seals, emblems, stickers or logo-like icons; accents are typographic only.'
+  );
+
+  const brandTail = brandColorHint + brandNameHint + noInventedMarksHint;
   const nicheTail =
     niche && NICHE_VISUAL_HINTS[niche]
       ? promptTier(` ${NICHE_VISUAL_HINTS[niche]}`, '')
