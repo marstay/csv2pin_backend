@@ -4456,11 +4456,31 @@ function isInfographicLikeStyleId(styleId) {
  * SAME subject). offset_collage_3 used to live here and was the bug — swapping a bad layout for a
  * three-photo collage just moved the problem.
  */
+/*
+ * ORDER MATTERS: replaceLayoutForProductPin returns [0], so the first entry is used for EVERY
+ * swapped product pin. That made minimal_elegant 43% of all product pins (1,578 of ~3,600).
+ *
+ * Measured save rate on Amazon product URLs, Aug 2026:
+ *   clean_appetizing  0.28%  (29 saves / 10,445 impressions)
+ *   before_after      0.11%
+ *   minimal_elegant   0.08%  (28 saves / 34,362 impressions)
+ *   curiosity_shock   0.06%
+ *
+ * The mechanism matches the numbers. This fallback only fires when a product reference image
+ * exists, and clean_appetizing's reference variant says "Subject: the attached product photo,
+ * reproduced exactly" — it shows the actual item. minimal_elegant asks for "an elegant overhead
+ * shot of a single object semantically relevant to the topic", i.e. it invents a mood object that
+ * merely resembles the product. Saves come from showing the thing, not something like it.
+ *
+ * `clean_appetizing` is a recipe-era id, NOT food-specific — users see it as "Clean & Soft (Best
+ * Overall)". Do not rename the id: 1,443 urltopin_history rows carry it and renaming would split
+ * the style in two for save-rate analysis.
+ */
 const SINGLE_HERO_FALLBACK_LAYOUTS = [
-  'minimal_elegant',
-  'before_after',
-  'curiosity_shock',
   'clean_appetizing',
+  'before_after',
+  'minimal_elegant',
+  'curiosity_shock',
 ];
 
 /**
