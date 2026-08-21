@@ -14453,6 +14453,9 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     const photoUrls = items.map((it) => it.imageUrl).filter(Boolean);
     if (photoUrls.length && process.env.USE_DUMMY_IMAGES !== 'true') {
       try {
+        // 6 matches MAX_ROUNDUP_ITEMS in MultiProductPins.jsx. These two MUST move together: the
+        // prompt asks for EXACTLY n numbered cards, so any item without a reference photo gets
+        // its appearance invented by the model.
         referenceInputs = await mirrorGenericPageImageUrlsForNanoBanana(photoUrls.slice(0, 6), req.user.id);
       } catch (e) {
         console.warn('multi-product image mirror error:', e.message || e);
