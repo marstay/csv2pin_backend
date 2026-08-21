@@ -736,7 +736,7 @@ function shuffleCopy(arr) {
 /** Shared instruction for LLM + image prompts: block overused Pinterest hooks. */
 const PIN_COPY_ANTI_CLICHE_INSTRUCTION = `ANTI-CLICHÉ: Do not use these exact phrases or tired close variants: "most people get this wrong", "check before you decide", "here's what actually works", "the truth about … they don't tell you", "stop wasting time and money", "do it the smart way instead", "key things you should know", "can you really trust", "get the real answer", "i tried … for 30 days", "here's what actually happened", "practical tips you can actually use", "plain-english guide, no fluff", "nobody talks about" (as empty hype). Write hooks that fit THIS article with fresh wording.
 
-BANNED OPENING WORDS: Do NOT start the title or overlay_headline with any of these overused verbs/words (or their close variants): "Elevate", "Transform", "Discover", "Unlock", "Unleash", "Upgrade", "Experience", "Revolutionize", "Boost", "Master", "Ultimate", "Effortless", "Supercharge", "Reveal", "Level up". Also avoid the pattern "Elevate/Transform/Upgrade your <noun>". Lead with the concrete subject, a number, a question, or a specific outcome instead.
+BANNED OPENING WORDS: Do NOT start ANY generated field -- title, overlay_headline, overlay_subheadline or description -- with any of these overused verbs/words (or their close variants): "Elevate", "Transform", "Discover", "Unlock", "Unleash", "Upgrade", "Experience", "Revolutionize", "Boost", "Master", "Ultimate", "Effortless", "Supercharge", "Reveal", "Level up". This applies to the description too, which is where it is violated most often. Also avoid, anywhere in any field, the pattern "Elevate/Transform/Upgrade your <noun>". Lead with the concrete subject, a number, a question, or a specific outcome instead.
 
 OPENING VARIETY: Vary how each headline/title BEGINS across the batch — do not start two pins the same way. Rotate between: a number ("7 ..."), a question ("Why does ...?"), the concrete noun/subject first, a "How to ..." frame, a specific outcome, or a contrast ("X vs Y"). Prefer plain, specific language over generic hype verbs.`;
 
@@ -799,14 +799,17 @@ ${PIN_COPY_ANTI_CLICHE_INSTRUCTION}
 
 Follow the strategy rules below. Use the angle to give a distinct PERSPECTIVE — not recycled Pinterest filler.
 
+PRECEDENCE: when the LAYOUT guidance specifies a shape for the on-image headline (for example "write a direct question"),
+that shape wins over the ANGLE. Express the angle through the wording inside that shape, not by abandoning it.
+
 Also return:
 - reason: one short sentence (max 80 chars) explaining why THIS pin works for Pinterest (e.g. "Creates curiosity without revealing the answer", "Numbers signal clear value for saves")
 
 Return JSON only (no markdown) with these exact keys:
-- title: catchy pin title (max 100 chars)
+- title: the Pinterest SEARCH surface, not the hook. Lead with the concrete subject and the words someone would actually type to find it; descriptive beats clever. Do NOT phrase the title as a question -- a question belongs on the image (overlay_headline), where the layout asks for one. Numbers up front are good when they are true. Max 100 chars. Must NOT start with a BANNED OPENING WORD.
 - overlay_headline: main on-image text (max 60 chars, 5-10 words)
 - overlay_subheadline: supporting on-image line (max 80 chars, optional)
-- description: pin description with 4-6 hashtags at end (max 450 chars)
+- description: pin description with 4-6 hashtags at end (max 450 chars). Must NOT start with a BANNED OPENING WORD.
 - hashtags: array of 10-20 relevant hashtags
 - image_prompt_hint: short hint for image composition (1-2 sentences, used with layout)
 - step_count: (optional) number of steps/images to show - MUST match the number used in title and overlay
@@ -879,7 +882,7 @@ Return JSON only (no markdown) with this exact shape:
  * @param {Object} openai
  * @returns {Promise<Object>} { title, overlay_headline, overlay_subheadline, description, hashtags, image_prompt_hint, step_count }
  */
-async function generateStrategicPinMetadata(
+async function generateStrategicPinMetadataOnce(
   {
     articleSummary,
     keyword,
@@ -893,6 +896,7 @@ async function generateStrategicPinMetadata(
     outputLanguage,
     winnerContext,
     singleProduct,
+    copyViolations,
   },
   openai
 ) {
@@ -907,13 +911,23 @@ async function generateStrategicPinMetadata(
   const singleProductRule = singleProduct
     ? '\nSINGLE PRODUCT PAGE:\n' +
       'CRITICAL: this pin links to ONE product, not an article, list or roundup.\n' +
-      '- Do NOT promise a count in the title, overlay or description: no "5 Mistakes", "3 Ways", "7 Reasons", "Top 10", "the five things".\n' +
+      '- Numbers are ALLOWED and perform well, but only when the count describes THIS one product: "3 Reasons This Planter Lasts", "2-Pack", "24-Inch Tall".\n' +
+      '- Do NOT use a count that implies the destination lists several DIFFERENT products: no "5 Best Planters", "Top 10 Gifts", "7 Planters You Need".\n' +
       '- Do NOT imply the destination holds multiple items, steps, tips or products.\n' +
       '- Do NOT open with a hype verb: Elevate, Transform, Enhance, Upgrade, Discover, Unlock, Experience, Ultimate.\n' +
       'This rule only FORBIDS the above. It does not decide what the copy says -- follow the LAYOUT and\n' +
-      'STRATEGY guidance for that, including any instruction to write the headline as a question.\n' +
+      'STRATEGY guidance for that, including any instruction to write the OVERLAY_HEADLINE as a question.\n' +
       'Return step_count: null.'
     : '';
+  // Retry pass: the model is told exactly what it just got wrong. Plain prompting has proved
+  // unreliable here (26% of titles and 49% of descriptions violated a ban that already names the
+  // exact words), so the wrapper below re-runs the call once with this block appended.
+  const correctionBlock =
+    Array.isArray(copyViolations) && copyViolations.length
+      ? '\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED. Fix these and change nothing else about the approach:\n' +
+        copyViolations.map((v) => `- ${v}`).join('\n') +
+        '\nRewrite so none of the above applies. Lead with the concrete subject, a number, a question, or a specific outcome.\n'
+      : '';
   const angle = ANGLE_OPTIONS.includes(suggestedAngle) ? suggestedAngle : ANGLE_OPTIONS[0];
 
   const ideasList = Array.isArray(keyIdeas) && keyIdeas.length
@@ -962,6 +976,7 @@ async function generateStrategicPinMetadata(
     + (outputLanguage && String(outputLanguage).trim().toLowerCase() !== 'auto'
       ? `\nLANGUAGE REQUIREMENT: All fields (title, overlay_headline, overlay_subheadline, description, hashtags) must be written in ${String(outputLanguage).trim().toUpperCase()}.\nDo not use English.\n`
       : '')
+    + correctionBlock
     + `\nReturn JSON only.`;
 
   try {
@@ -1015,6 +1030,52 @@ async function generateStrategicPinMetadata(
     angle: 'benefit',
     reason: getStrategyReason(strategy),
   };
+}
+
+
+/**
+ * Banned-copy detection, applied to every generated field rather than trusting the prompt.
+ *
+ * BANNED OPENING WORDS has been in the prompt for a long time and names these exact words; a scan
+ * of 1,000 pins generated since 1 Jul 2026 found 26.2% of titles still starting with one, 48.9% of
+ * descriptions, and 43.9% matching the explicitly banned "<verb> your <noun>" pattern. The ban also
+ * only ever covered title and overlay_headline, so descriptions were never in scope at all.
+ */
+const BANNED_COPY_OPENERS =
+  /^\s*["']?(elevate|transform|discover|unlock|unleash|upgrade|experience|revolutionize|boost|master|ultimate|effortless|supercharge|reveal|level up)\b/i;
+const BANNED_COPY_PATTERN = /\b(elevate|transform|upgrade|revolutionize|supercharge)\s+your\b/i;
+
+function findBannedCopyViolations(meta) {
+  if (!meta || typeof meta !== 'object') return [];
+  const out = [];
+  for (const field of ['title', 'overlay_headline', 'overlay_subheadline', 'description']) {
+    const value = String(meta[field] || '').trim();
+    if (!value) continue;
+    const openerHit = value.match(BANNED_COPY_OPENERS);
+    if (openerHit) {
+      out.push(`${field} starts with the banned word "${openerHit[1]}": "${value.slice(0, 70)}"`);
+      continue;
+    }
+    const patternHit = value.match(BANNED_COPY_PATTERN);
+    if (patternHit) {
+      out.push(`${field} uses the banned "${patternHit[1]} your ..." pattern: "${value.slice(0, 70)}"`);
+    }
+  }
+  return out;
+}
+
+/**
+ * One retry, then accept. A second violation means the model is not going to comply for this
+ * article, and a third call costs latency without buying anything. The FIRST result is kept when
+ * both fail, so behaviour stays deterministic rather than depending on which attempt was worse.
+ */
+async function generateStrategicPinMetadata(args, openai) {
+  const first = await generateStrategicPinMetadataOnce(args, openai);
+  const violations = findBannedCopyViolations(first);
+  if (!violations.length) return first;
+  console.warn('pin copy violated banned-word rules, retrying once:', violations.join(' | '));
+  const second = await generateStrategicPinMetadataOnce({ ...args, copyViolations: violations }, openai);
+  return findBannedCopyViolations(second).length ? first : second;
 }
 
 export {
