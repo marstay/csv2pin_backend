@@ -13361,7 +13361,14 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
         isSingleProductPageBase(base) ||
         usesProductAffiliatePinMix(regenLanding));
 
-    let imagePrompt = buildOverlayImagePrompt({
+    // A roundup/comparison pin has no single-product style, so buildOverlayImagePrompt would
+    // describe the wrong kind of pin entirely. In preserve-art mode that base barely matters --
+    // the "reproduce the attached pin exactly" instruction carries the layout -- but a wrong base
+    // is noise the model can blend in. Give it a neutral one instead.
+    const isMultiProductStyle = /^(roundup|comparison)[:_]/i.test(String(styleId || ''));
+    let imagePrompt = isMultiProductStyle
+      ? 'Create a vertical 1000x1500 px (2:3) Pinterest pin.'
+      : buildOverlayImagePrompt({
       styleId: nanoStyleId,
       topic,
       domain,
@@ -13371,7 +13378,7 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
       brand,
       niche: regenNicheHint,
       hasProductReference: regenHasProductReference,
-    });
+        });
     imagePrompt = appendNanoBananaAmazonUrlGarbageGuard(imagePrompt, amazonCtxUrl);
 
     const trimmedUserImg = userImageUrl && String(userImageUrl).trim();
