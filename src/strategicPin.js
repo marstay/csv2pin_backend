@@ -19,12 +19,27 @@ const STRATEGY_LAYOUT_MAP = {
 // Niche-specific strategy mixes (from design doc Section 13)
 const NICHE_MIXES = {
   default: { curiosity_hook: 3, list_value: 2, lifestyle: 2, clean_authority: 1, wildcard: 1, transformation: 1 },
-  /** Pinterest → Amazon: prioritize saves, trust, value, and in-context product — not curiosity-only. */
+  /**
+   * Pinterest → product page (Amazon, Walmart, Etsy, creator storefronts).
+   *
+   * NO list_value. All five of its layouts are in SINGLE_PRODUCT_EXCLUDED_LAYOUTS, so on a
+   * one-product page every list_value slot was planned and then swapped out before rendering --
+   * ~3 of 10 pins drawn from the fallback pool instead of being planned as a usable strategy.
+   * value_save carries the save-intent instead: higher save prior (92 vs 90) and both of its
+   * layouts are legal here.
+   *
+   * curiosity_hook was absent, which made question_style unreachable on product URLs -- measured
+   * 0.23% save rate vs 0.09% for Amazon product pins overall (Aug 2026).
+   *
+   * KEEP THE TOTAL AT 10. planStrategies truncates at `count` (max 10), and if the mix yields
+   * fewer than 10 the fill loop tops up from NICHE_MIXES.default -- which carries list_value: 2
+   * and wildcard: 1, and all four wildcard layouts are excluded for single products.
+   */
   amazon_affiliate: {
-    list_value: 3,
     clean_authority: 2,
-    value_save: 2,
+    value_save: 3,
     lifestyle: 2,
+    curiosity_hook: 2,
     transformation: 1,
   },
   recipe: { curiosity_hook: 2, list_value: 3, lifestyle: 3, transformation: 1, clean_authority: 1 },
@@ -294,7 +309,8 @@ function usesProductAffiliatePinMix(contentProfile) {
 }
 
 function getWeightedMix(contentProfile) {
-  const base = usesProductAffiliatePinMix(contentProfile)
+  const isProductPin = usesProductAffiliatePinMix(contentProfile);
+  const base = isProductPin
     ? NICHE_MIXES.amazon_affiliate
     : NICHE_MIXES[contentProfile.niche] || NICHE_MIXES.default;
   const mix = { ...base };
@@ -302,14 +318,18 @@ function getWeightedMix(contentProfile) {
   const emotional = contentProfile.emotional_intensity || 'medium';
   const visual = contentProfile.visual_potential || 'low';
 
-  // Listicle → boost list_value, reduce clean
-  if (ct === 'listicle') {
+  // Listicle → boost list_value, reduce clean.
+  // Skipped for product pins: `(mix.list_value || 0) + 1` on an absent key yields 1, which would
+  // reintroduce the strategy the product mix deliberately drops -- and push the total past 10,
+  // silently truncating the last entry. Product pages hit this often; their bullet-point feature
+  // lists classify as listicle / how_to.
+  if (!isProductPin && ct === 'listicle') {
     mix.list_value = Math.min(4, (mix.list_value || 0) + 1);
     mix.clean_authority = Math.max(0, (mix.clean_authority || 0) - 1);
   }
 
-  // How-to → boost list_value
-  if (ct === 'how_to') {
+  // How-to → boost list_value (same reason as above for the product-pin exemption)
+  if (!isProductPin && ct === 'how_to') {
     mix.list_value = Math.min(4, (mix.list_value || 0) + 1);
   }
 
