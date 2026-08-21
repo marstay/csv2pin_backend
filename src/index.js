@@ -9628,6 +9628,65 @@ const ROUNDUP_STYLES = [
   },
 ];
 
+/**
+ * Treatments for an A-vs-B comparison pin. `split` is first and stays the default, so existing
+ * behaviour is unchanged until a styleId asks otherwise.
+ *
+ * `table` is the interesting one for distribution: a spec comparison is genuinely useful
+ * information, and useful pins are what get saved.
+ */
+const COMPARISON_STYLES = [
+  {
+    id: 'split',
+    label: 'Side by side',
+    build: (a, b, title) =>
+      'a clean, modern side-by-side PRODUCT COMPARISON graphic. ' +
+      `A bold header band across the top shows the title "${title}". ` +
+      'Below the header, split the pin into TWO equal columns. ' +
+      `LEFT column = product A: photo of "${a}" on a card, with a circular "A" badge and the product name as a short label beneath it. ` +
+      `RIGHT column = product B: photo of "${b}" on a card, with a circular "B" badge and the product name as a short label beneath it. ` +
+      'Place one bold circular "VS" badge in the exact center between the two columns. ' +
+      'Lots of white space, big readable typography, scroll-stopping but uncluttered.',
+  },
+  {
+    id: 'stacked',
+    label: 'Stacked, OR divider',
+    build: (a, b, title) =>
+      'a vertical TWO-PRODUCT comparison, stacked rather than side by side so each product gets the full pin width. ' +
+      `A bold headline across the top reads "${title}". ` +
+      `The TOP half shows product A: a large photo of "${a}" with its name on one line beneath. ` +
+      `The BOTTOM half shows product B: a large photo of "${b}" with its name on one line beneath. ` +
+      'Between them, a full-width divider band containing one short bold word: "OR". ' +
+      'Big readable type, generous margins, high contrast.',
+  },
+  {
+    id: 'table',
+    label: 'Spec table',
+    build: (a, b, title) =>
+      'a PRODUCT COMPARISON TABLE graphic. ' +
+      `A bold header band across the top shows the title "${title}". ` +
+      `Beneath it, a two-column table: the LEFT column header is a small photo of "${a}" with its name, the RIGHT column header is a small photo of "${b}" with its name. ` +
+      'Below the headers, show 4 to 5 comparison rows, each row a short feature label on the far left and a clear green tick or grey cross under each product. ' +
+      'Clean alternating row shading, thin dividers, crisp legible labels. Looks like a genuinely useful buying-guide table.',
+  },
+  {
+    id: 'winner',
+    label: 'Winner badge',
+    build: (a, b, title) =>
+      'a two-product comparison that picks a winner. ' +
+      `A bold header band across the top shows the title "${title}". ` +
+      `Show BOTH products as cards side by side: "${a}" on the left and "${b}" on the right. ` +
+      'Give the LEFT card a prominent ribbon or rosette badge reading "WINNER", slightly larger scale and a coloured border; render the right card slightly smaller and more muted. ' +
+      'Product names as short labels under each photo. Confident, editorial, easy to read at a glance.',
+  },
+];
+
+/** Same rotation as roundup, over the comparison pool. */
+function planComparisonStyles(count = 1) {
+  const n = Math.max(1, Math.min(20, Math.floor(count) || 1));
+  return Array.from({ length: n }, (_, i) => COMPARISON_STYLES[i % COMPARISON_STYLES.length]);
+}
+
 /** Rotate through the pool so N pins get N different treatments; wraps if N exceeds the pool. */
 function planRoundupStyles(count = 1) {
   const n = Math.max(1, Math.min(20, Math.floor(count) || 1));
@@ -9655,16 +9714,13 @@ function buildMultiProductPinPrompt({ mode, headline, items, footer, brand, styl
     `render as genuine legible lettering, show it softly out of focus rather than as invented text.`;
 
   if (mode === 'comparison') {
-    const a = safeItems[0] || {};
-    const b = safeItems[1] || {};
+    const a = String(safeItems[0]?.title || 'Option A').slice(0, 80);
+    const b = String(safeItems[1]?.title || 'Option B').slice(0, 80);
+    const cmpTitle = String(headline || 'Which one should you buy?').slice(0, 90);
+    const cmpStyle = COMPARISON_STYLES.find((st) => st.id === styleId) || COMPARISON_STYLES[0];
     return (
-      'Create a vertical 1000x1500 px (2:3) Pinterest pin: a clean, modern side-by-side PRODUCT COMPARISON graphic. ' +
-      `A bold header band across the top shows the title "${String(headline || 'Which one should you buy?').slice(0, 90)}". ` +
-      'Below the header, split the pin into TWO equal columns. ' +
-      `LEFT column = product A: photo of "${String(a.title || 'Option A').slice(0, 80)}" on a card, with a circular "A" badge and the product name as a short label beneath it. ` +
-      `RIGHT column = product B: photo of "${String(b.title || 'Option B').slice(0, 80)}" on a card, with a circular "B" badge and the product name as a short label beneath it. ` +
-      'Place one bold circular "VS" badge in the exact center between the two columns. ' +
-      'Lots of white space, big readable typography, scroll-stopping but uncluttered.' +
+      `Create a vertical 1000x1500 px (2:3) Pinterest pin: ` +
+      cmpStyle.build(a, b, cmpTitle) +
       fidelityRules +
       paletteHint +
       footerHint
@@ -14404,9 +14460,12 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     // One pin per call, exactly like the single-pin flow: the CLIENT loops over
     // planRoundupStyles(count) and sends a different styleId each time. Quota therefore stays
     // -1 per call and needs no batching here.
-    const styleId = ROUNDUP_STYLES.some((st) => st.id === req.body?.styleId)
+    // Each mode has its own pool, so validate against the right one and fall back to that
+    // pool's first entry (which is the pre-existing layout in both cases).
+    const stylePool = mode === 'comparison' ? COMPARISON_STYLES : ROUNDUP_STYLES;
+    const styleId = stylePool.some((st) => st.id === req.body?.styleId)
       ? String(req.body.styleId)
-      : 'numbered';
+      : stylePool[0].id;
     let headline = String(req.body?.headline || '').trim().slice(0, 120);
     // Reassigned below when the user asks us to build the destination page for them.
     let destinationUrl = String(req.body?.link || req.body?.destinationUrl || '').trim();
@@ -14651,10 +14710,14 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
 
     // Record the ACTUAL treatment, not a generic 'roundup_grid', so save rate can be compared
     // per style later. Legacy rows carry 'roundup_grid' from when there was only one layout.
-    const roundupStyle = ROUNDUP_STYLES.find((st) => st.id === styleId) || ROUNDUP_STYLES[0];
+    const usedStyle = stylePool.find((st) => st.id === styleId) || stylePool[0];
+    // strategy + goal make these group and sort like single-mode pins in the UI. Without a goal
+    // the pin list falls back to "other" and every roundup pin lands under an "Other" heading.
     const pinRecord = {
-      styleId: mode === 'comparison' ? 'comparison_split' : `roundup:${roundupStyle.id}`,
-      styleLabel: mode === 'comparison' ? 'Comparison' : `Roundup — ${roundupStyle.label}`,
+      styleId: `${mode}:${usedStyle.id}`,
+      styleLabel: `${mode === 'comparison' ? 'Comparison' : 'Roundup'} — ${usedStyle.label}`,
+      strategy: mode === 'comparison' ? 'clean_authority' : 'list_value',
+      goal: mode === 'comparison' ? 'trust' : 'saves',
       imagePrompt: prompt,
       imageUrl,
       title: pinTitle,
