@@ -15862,6 +15862,47 @@ app.get('/api/affiliate/me', requireUser, async (req, res) => {
   }
 });
 
+
+/**
+ * Update the affiliate's own payout address.
+ *
+ * payout_email was captured once on the application form and then had no read or write path:
+ * the dashboard never displayed it and no endpoint could change it. Affiliates could not tell
+ * whether they had ever supplied one, which is exactly what they email to ask. Payouts are
+ * manual, so a wrong address here is caught by a human -- but it should not require one.
+ */
+app.patch('/api/affiliate/me', requireUser, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.user?.email);
+    const affiliate = await findAffiliateRowForUser(req.user.id, email);
+    if (!affiliate) {
+      return res.status(404).json({ error: 'not_an_affiliate', message: 'No affiliate account found for this login.' });
+    }
+    if (String(affiliate.status || '') === 'disabled') {
+      return res.status(403).json({ error: 'disabled', message: 'This affiliate account is disabled.' });
+    }
+
+    const payoutEmail = normalizeEmail(req.body?.payoutEmail || req.body?.payout_email);
+    // normalizeEmail only trims and lowercases; the apply form relied on the browser for shape.
+    if (!payoutEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(payoutEmail)) {
+      return res.status(400).json({ error: 'invalid_email', message: 'Enter a valid email address for PayPal.' });
+    }
+
+    const { error } = await supabaseAdmin
+      .from('affiliates')
+      .update({ payout_email: payoutEmail, updated_at: new Date().toISOString() })
+      .eq('id', affiliate.id);
+    if (error) {
+      console.warn('affiliate payout_email update error:', error.message || error);
+      return res.status(500).json({ error: 'update_failed', message: 'Could not save your payout email.' });
+    }
+    return res.json({ ok: true, payoutEmail });
+  } catch (err) {
+    console.error('affiliate/me PATCH error:', err);
+    return res.status(500).json({ error: 'update_failed', message: 'Could not save your payout email.' });
+  }
+});
+
 app.get('/api/admin/affiliates/pending', requireUser, requireAffiliateAdmin, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
