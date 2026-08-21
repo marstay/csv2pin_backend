@@ -9563,7 +9563,78 @@ function correctHeadlineCount(text, count) {
  * The provided product photos are passed as reference images (imageInput) in the SAME order as `items`,
  * and the prompt is written to keep numbering exact and to treat similar/same-brand products as distinct cards.
  */
-function buildMultiProductPinPrompt({ mode, headline, items, footer, brand }) {
+/**
+ * Visual treatments for a roundup pin. Same products, genuinely different creative — the point is
+ * variety, mirroring how the single-pin flow gives one URL several strategies rather than ten
+ * copies of one layout. Order is the rotation order; `numbered` stays first so it remains default.
+ *
+ * Save rate across the platform is ~0.14% against a 0.5-2% benchmark, and saves are what earn
+ * distribution on Pinterest, so creative variety is the lever with the most headroom.
+ */
+const ROUNDUP_STYLES = [
+  {
+    id: 'numbered',
+    label: 'Numbered list',
+    build: (n, list, title) =>
+      `a clean, modern PRODUCT ROUNDUP / gift-guide graphic with EXACTLY ${n} numbered cards stacked vertically. ` +
+      `A bold header band across the top shows the title "${title}". ` +
+      `Below the header, list the ${n} products as ${n} separate rounded cards, top to bottom, in this exact order: ${list}. ` +
+      `Each card has a LARGE, clearly visible NUMBER BADGE in the top-left corner showing its position as a single digit, numbered strictly 1, 2, 3 … ${n} from top to bottom with no skipped, repeated, or out-of-order numbers. ` +
+      'Inside each card: the product photo on the left and the product name as a short label on the right. ' +
+      'Generous spacing between cards, bright, high readability, Pinterest-friendly.',
+  },
+  {
+    id: 'grid',
+    label: 'Gift-guide grid',
+    build: (n, list, title) =>
+      `a bright PRODUCT GRID gift guide. A bold header band across the top shows the title "${title}". ` +
+      `Below it, arrange EXACTLY ${n} products in a neat two-column grid of equal rounded cards, filled left-to-right then top-to-bottom in this exact order: ${list}. ` +
+      'Each card shows the product photo large and centred, with a short product name on one line beneath it. ' +
+      'Even gutters between cards, soft background, plenty of white space, no numbers.',
+  },
+  {
+    id: 'hero',
+    label: 'Top pick + alternatives',
+    build: (n, list, title) =>
+      `a "top pick plus alternatives" roundup. A bold header band across the top shows the title "${title}". ` +
+      `Directly below it, ONE large hero card takes the full width and shows the FIRST product from this ordered list: ${list}. ` +
+      `Beneath the hero card, show the remaining ${Math.max(0, n - 1)} products as a single row of smaller equal cards in the same order. ` +
+      'Give the hero card a small ribbon or badge reading "TOP PICK". Short product names under each photo, high contrast, uncluttered.',
+  },
+  {
+    id: 'editorial',
+    label: 'Editorial collage',
+    build: (n, list, title) =>
+      `an editorial magazine-style collage. A large expressive headline reading "${title}" sits across the upper third on a solid colour block. ` +
+      `Below and around it, arrange EXACTLY ${n} product photos as cut-out images overlapping slightly at varied angles, in this order: ${list}. ` +
+      'Add a thin hand-drawn circle or arrow accent near one product. Small neat labels beside each item. Confident, stylish, print-magazine feel.',
+  },
+  {
+    id: 'checklist',
+    label: 'Shopping checklist',
+    build: (n, list, title) =>
+      `a SHOPPING CHECKLIST graphic on a paper-like background. A bold header across the top shows the title "${title}". ` +
+      `Below it, list EXACTLY ${n} rows top to bottom in this exact order: ${list}. ` +
+      'Each row has a small ticked checkbox on the left, then a compact product photo, then the product name. ' +
+      'Thin dividing lines between rows, tidy handwritten-notebook feel, very legible.',
+  },
+  {
+    id: 'polaroid',
+    label: 'Scrapbook polaroids',
+    build: (n, list, title) =>
+      `a warm scrapbook layout. A handwritten-style headline reading "${title}" sits at the top. ` +
+      `Below it, show EXACTLY ${n} product photos as instant-camera style frames with thick white borders, tilted at slightly different angles and overlapping a little, in this order: ${list}. ` +
+      'Write each product name as a short caption in the white border beneath its photo. Textured paper background, cosy and tactile.',
+  },
+];
+
+/** Rotate through the pool so N pins get N different treatments; wraps if N exceeds the pool. */
+function planRoundupStyles(count = 1) {
+  const n = Math.max(1, Math.min(20, Math.floor(count) || 1));
+  return Array.from({ length: n }, (_, i) => ROUNDUP_STYLES[i % ROUNDUP_STYLES.length]);
+}
+
+function buildMultiProductPinPrompt({ mode, headline, items, footer, brand, styleId = 'numbered' }) {
   const safeItems = Array.isArray(items) ? items.filter((it) => it && (it.title || it.imageUrl)) : [];
   const n = Math.max(1, safeItems.length);
   const paletteHint = buildBrandPaletteHint(brand);
@@ -9600,17 +9671,15 @@ function buildMultiProductPinPrompt({ mode, headline, items, footer, brand }) {
     );
   }
 
-  // roundup / gift guide — numbered list of cards
+  // roundup / gift guide — treatment chosen from ROUNDUP_STYLES so a batch can vary
   const numberedList = safeItems
     .map((it, i) => `Card ${i + 1} = "${String(it.title || `Product ${i + 1}`).slice(0, 80)}"`)
     .join('; ');
+  const style = ROUNDUP_STYLES.find((st) => st.id === styleId) || ROUNDUP_STYLES[0];
+  const title = String(headline || `${n} Top Picks`).slice(0, 90);
   return (
-    `Create a vertical 1000x1500 px (2:3) Pinterest pin: a clean, modern PRODUCT ROUNDUP / gift-guide graphic with EXACTLY ${n} numbered cards stacked vertically. ` +
-    `A bold header band across the top shows the title "${String(headline || `${n} Top Picks`).slice(0, 90)}". ` +
-    `Below the header, list the ${n} products as ${n} separate rounded cards, top to bottom, in this exact order: ${numberedList}. ` +
-    `Each card has a LARGE, clearly visible NUMBER BADGE in the top-left corner showing its position as a single digit, numbered strictly 1, 2, 3 … ${n} from top to bottom with no skipped, repeated, or out-of-order numbers. ` +
-    `Inside each card: the product photo on the left and the product name as a short label on the right. ` +
-    'Generous spacing between cards, bright, high readability, Pinterest-friendly.' +
+    `Create a vertical 1000x1500 px (2:3) Pinterest pin: ` +
+    style.build(n, numberedList, title) +
     fidelityRules +
     paletteHint +
     footerHint
@@ -14332,6 +14401,12 @@ app.post('/api/account/affiliate-product-pages/claim', requireUser, async (req, 
 app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) => {
   try {
     const mode = req.body?.mode === 'comparison' ? 'comparison' : 'roundup';
+    // One pin per call, exactly like the single-pin flow: the CLIENT loops over
+    // planRoundupStyles(count) and sends a different styleId each time. Quota therefore stays
+    // -1 per call and needs no batching here.
+    const styleId = ROUNDUP_STYLES.some((st) => st.id === req.body?.styleId)
+      ? String(req.body.styleId)
+      : 'numbered';
     let headline = String(req.body?.headline || '').trim().slice(0, 120);
     // Reassigned below when the user asks us to build the destination page for them.
     let destinationUrl = String(req.body?.link || req.body?.destinationUrl || '').trim();
@@ -14463,7 +14538,7 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
     }
 
     const footer = String(brand?.brandName || '').trim().slice(0, 80);
-    const prompt = buildMultiProductPinPrompt({ mode, headline, items, footer, brand });
+    const prompt = buildMultiProductPinPrompt({ mode, headline, items, footer, brand, styleId });
 
     let imageUrl = '';
     try {
@@ -14574,9 +14649,12 @@ app.post('/api/urltopin/generate-multi-product', requireUser, async (req, res) =
       /* alt text is best-effort */
     }
 
+    // Record the ACTUAL treatment, not a generic 'roundup_grid', so save rate can be compared
+    // per style later. Legacy rows carry 'roundup_grid' from when there was only one layout.
+    const roundupStyle = ROUNDUP_STYLES.find((st) => st.id === styleId) || ROUNDUP_STYLES[0];
     const pinRecord = {
-      styleId: mode === 'comparison' ? 'comparison_split' : 'roundup_grid',
-      styleLabel: mode === 'comparison' ? 'Comparison' : 'Roundup',
+      styleId: mode === 'comparison' ? 'comparison_split' : `roundup:${roundupStyle.id}`,
+      styleLabel: mode === 'comparison' ? 'Comparison' : `Roundup — ${roundupStyle.label}`,
       imagePrompt: prompt,
       imageUrl,
       title: pinTitle,
