@@ -892,12 +892,27 @@ async function generateStrategicPinMetadata(
     layoutOverlayGuidance,
     outputLanguage,
     winnerContext,
+    singleProduct,
   },
   openai
 ) {
   const rules = STRATEGY_COPY_RULES[strategy]?.rules || STRATEGY_COPY_RULES.curiosity_hook.rules;
   const strategyLabel = strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   const layoutRule = LAYOUT_NUMBER_RULES[layoutId] ? `\nLAYOUT (${layoutId}):\n${LAYOUT_NUMBER_RULES[layoutId]}` : '';
+  // LAYOUT_NUMBER_RULES only covers multi-panel layouts, and every one of those is excluded on a
+  // single-product page -- so nothing stopped the model promising a count anyway. Observed live:
+  // a question_style pin for one planter titled "5 Mistakes That Can Ruin Your Planters' Health".
+  // The strategy-swap patch in index.js guards list_value only; curiosity_hook's 'mistake' angle
+  // walks straight past it.
+  const singleProductRule = singleProduct
+    ? '\nSINGLE PRODUCT PAGE:\n' +
+      'CRITICAL: this pin links to ONE product, not an article, list or roundup.\n' +
+      '- Do NOT promise a count in the title, overlay or description: no "5 Mistakes", "3 Ways", "7 Reasons", "Top 10", "the five things".\n' +
+      '- Do NOT imply the destination holds multiple items, steps, tips or products.\n' +
+      '- Write about THIS one product: what it is, what problem it solves, why it is worth buying.\n' +
+      '- A question or an open loop is fine; a numbered promise is not.\n' +
+      'Return step_count: null.'
+    : '';
   const angle = ANGLE_OPTIONS.includes(suggestedAngle) ? suggestedAngle : ANGLE_OPTIONS[0];
 
   const ideasList = Array.isArray(keyIdeas) && keyIdeas.length
@@ -936,7 +951,7 @@ async function generateStrategicPinMetadata(
     .replace('{{article_key_ideas}}', ideasList || '- (not provided)')
     .replace('{{keyword}}', keyword || '')
     .replace('{{strategy}}', strategyLabel)
-    .replace('{{layout_rule}}', layoutRule)
+    .replace('{{layout_rule}}', layoutRule + singleProductRule)
     .replace('{{suggested_angle}}', angle)
     + avoidBlock
     + priorBlock

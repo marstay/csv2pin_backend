@@ -11430,6 +11430,7 @@ app.post('/api/urltopin/preview', async (req, res) => {
         layoutOverlayGuidance,
         outputLanguage,
         strictLanguage: false,
+        singleProduct: isSingleProductPageBase(base),
       },
       openai
     );
@@ -12274,6 +12275,7 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
             outputLanguage,
             strictLanguage,
             winnerContext: winnerCtxForMeta,
+            singleProduct: isSingleProductPageBase(base),
           },
           openai
         );
