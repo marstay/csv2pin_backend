@@ -806,7 +806,7 @@ Also return:
 - reason: one short sentence (max 80 chars) explaining why THIS pin works for Pinterest (e.g. "Creates curiosity without revealing the answer", "Numbers signal clear value for saves")
 
 Return JSON only (no markdown) with these exact keys:
-- title: the Pinterest SEARCH surface, not the hook. Lead with the concrete subject and words someone would actually type to find it. It must ALSO be clearly different from every other title in this batch: vary the opening words, the structure, and which attribute you lead with (use case, size, material, colour, who it suits, the problem it solves). Do NOT open every title in a batch with the brand or product name, and do NOT reuse the same trailing phrase. Do NOT phrase the title as a question. Numbers up front are good when they are true. Max 100 chars. Must NOT start with a BANNED OPENING WORD.
+- title: the Pinterest SEARCH surface, not the hook. Lead with the concrete subject and the words someone would actually type to find it -- brand, product type, size, colour, material. KEEP those keywords in every pin of the batch even though other pins already use them; each pin is a separate chance to rank for the same search, so repeating the important terms is correct and wanted. What must differ between pins is what you SAY about the product -- the attribute or benefit you highlight -- not the keywords themselves. Never produce a title identical to another pin in the batch. Do NOT phrase the title as a question; a hook belongs in overlay_headline. Numbers are good when true. Max 100 chars. Must NOT start with a BANNED OPENING WORD.
 - overlay_headline: main on-image text (max 60 chars, 5-10 words)
 - overlay_subheadline: supporting on-image line (max 80 chars, optional)
 - description: pin description with 4-6 hashtags at end (max 450 chars). Must NOT start with a BANNED OPENING WORD.
@@ -1042,7 +1042,7 @@ async function generateStrategicPinMetadataOnce(
  * only ever covered title and overlay_headline, so descriptions were never in scope at all.
  */
 const BANNED_COPY_OPENERS =
-  /^\s*["']?(elevate|transform|discover|unlock|unleash|upgrade|experience|revolutionize|boost|master|ultimate|effortless|supercharge|reveal|level up)\b/i;
+  /^\s*["']?(elevate|transform|discover|unlock|unleash|upgrade|experience|revolutionize|boost|master|ultimate|effortless|supercharge|reveal|level up|enhance)\b/i;
 const BANNED_COPY_PATTERN = /\b(elevate|transform|upgrade|revolutionize|supercharge)\s+your\b/i;
 
 function findBannedCopyViolations(meta) {
@@ -1066,27 +1066,26 @@ function findBannedCopyViolations(meta) {
 
 
 /**
- * Batch monotony, caught deterministically rather than asked for in the prompt.
+ * Duplicate titles within a batch.
  *
- * OPENING VARIETY has been in the prompt for a long time and is routinely ignored: one live batch
- * came back with all ten titles opening "KOL ..." and six ending "Indoor & Outdoor". Distinct as
- * strings, identical in a feed. Allows a repeated first word twice, flags the third.
+ * Deliberately narrow: it flags a title that is effectively the SAME STRING as one already in the
+ * batch, and nothing else. Shared keywords across pins are wanted, not a defect -- the title is
+ * the Pinterest search surface, so ten pins carrying "KOL" and "urn planters" are ten chances to
+ * rank for those terms. An earlier version of this rejected titles for merely opening with the
+ * same word, which pushed the model off the primary keyword; that was the wrong trade.
+ *
+ * What is worthless is the literal duplicate -- two pins with byte-identical titles are one pin's
+ * worth of coverage, seen live as "Fossil Analog Blue Dial Men's Watch - 44mm Case" twice.
  */
-function findRepeatedOpeningViolations(meta, priorPinCopy) {
+function findDuplicateTitleViolations(meta, priorPinCopy) {
   if (!Array.isArray(priorPinCopy) || !priorPinCopy.length) return [];
-  const words = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
-  const mine = words(meta && meta.title);
-  if (!mine.length) return [];
-  const priors = priorPinCopy.map((p) => words(p && p.title)).filter((w) => w.length);
-  const twoMatch = priors.some((w) => w[0] === mine[0] && w[1] === mine[1]);
-  if (twoMatch) {
-    return [`title opens with the same two words as an earlier pin in this batch ("${mine.slice(0, 2).join(' ')} ...") -- open it differently`];
-  }
-  const firstWordUses = priors.filter((w) => w[0] === mine[0]).length;
-  if (firstWordUses >= 2) {
-    return [`title starts with "${mine[0]}" and ${firstWordUses} earlier pins in this batch already do -- lead with a different attribute`];
-  }
-  return [];
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const mine = norm(meta && meta.title);
+  if (!mine) return [];
+  const clash = priorPinCopy.some((p) => norm(p && p.title) === mine);
+  return clash
+    ? [`title is identical to another pin in this batch ("${String(meta.title).slice(0, 70)}") -- keep the same keywords but say something different about the product`]
+    : [];
 }
 
 /**
@@ -1096,11 +1095,11 @@ function findRepeatedOpeningViolations(meta, priorPinCopy) {
  */
 async function generateStrategicPinMetadata(args, openai) {
   const first = await generateStrategicPinMetadataOnce(args, openai);
-  const violations = findBannedCopyViolations(first).concat(findRepeatedOpeningViolations(first, args && args.priorPinCopy));
+  const violations = findBannedCopyViolations(first).concat(findDuplicateTitleViolations(first, args && args.priorPinCopy));
   if (!violations.length) return first;
   console.warn('pin copy violated banned-word rules, retrying once:', violations.join(' | '));
   const second = await generateStrategicPinMetadataOnce({ ...args, copyViolations: violations }, openai);
-  const stillBad = findBannedCopyViolations(second).concat(findRepeatedOpeningViolations(second, args && args.priorPinCopy));
+  const stillBad = findBannedCopyViolations(second).concat(findDuplicateTitleViolations(second, args && args.priorPinCopy));
   return stillBad.length ? first : second;
 }
 

@@ -11589,6 +11589,32 @@ app.post('/api/urltopin/plan-strategic', requireUser, async (req, res) => {
   }
 });
 
+/**
+ * Prior pins from the SAME client-side batch, sent by the browser.
+ *
+ * Every generate call is one pin (mode: "strategic_single"), so the server-side priorPinCopy /
+ * usedOverlayTexts arrays it builds are always empty by the time copy is written -- the batch
+ * exists only in the browser. Without this the model writes each pin blind and independently
+ * lands on the same phrasing: one live batch returned two byte-identical titles and ten openings
+ * of "KOL ...". Generation is concurrent, so the first few pins still have nothing to compare
+ * against; later ones do.
+ */
+function normalizeBatchPriorPins(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const title = String(item.title || '').trim().slice(0, 120);
+    const overlay_headline = String(item.overlay_headline || item.overlayHeadline || '').trim().slice(0, 80);
+    const overlay_subheadline = String(item.overlay_subheadline || item.overlaySubheadline || '').trim().slice(0, 80);
+    const layoutId = String(item.layoutId || item.styleId || '').trim().slice(0, 60);
+    if (!title && !overlay_headline) continue;
+    out.push({ title, overlay_headline, overlay_subheadline, layoutId });
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
 app.post('/api/urltopin/generate', requireUser, async (req, res) => {
   // Per-run timing. Without this there is no way to tell whether a slow generation was the
   // scrape, the copy loop, or the image provider — and therefore no way to know if a change helped.
@@ -11646,10 +11672,12 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       winnerContext: rawWinnerContext,
       manualProduct: rawManualProduct,
       productPageUrl: rawProductPageUrl,
+      batchPriorPins: rawBatchPriorPins,
     } = req.body || {};
     const winnerContext = normalizeWinnerContext(rawWinnerContext);
     const manualProduct = normalizeManualProductOverride(rawManualProduct);
     const productPageUrl = normalizeProductPageUrlOverride(rawProductPageUrl);
+    const batchPriorPins = normalizeBatchPriorPins(rawBatchPriorPins);
     const outputLanguage = String(rawOutputLanguage || 'auto').trim().toLowerCase() || 'auto';
     const strictLanguage = rawStrictLanguage === true || rawStrictLanguage === 'true';
     const metadataOnly = rawMetadataOnly === true || rawMetadataOnly === 'true';
@@ -12244,8 +12272,15 @@ app.post('/api/urltopin/generate', requireUser, async (req, res) => {
       const plan = req._strategicPlan;
       keyIdeas = await extractArticleKeyIdeas(articleSummary, openai);
       const usedOverlayByLayout = new Map(); // layoutId -> [{ headline, subheadline }, ...]
+      // Seed from the client-side batch so single-pin requests still see their siblings.
+      for (const prev of batchPriorPins) {
+        if (!prev.layoutId || !prev.overlay_headline) continue;
+        const seeded = usedOverlayByLayout.get(prev.layoutId) || [];
+        seeded.push({ headline: prev.overlay_headline, subheadline: prev.overlay_subheadline });
+        usedOverlayByLayout.set(prev.layoutId, seeded);
+      }
       const metaResults = [];
-      const priorPinCopy = [];
+      const priorPinCopy = batchPriorPins.map((p) => ({ title: p.title, overlay_headline: p.overlay_headline, overlay_subheadline: p.overlay_subheadline }));
       if (winnerContext) {
         priorPinCopy.push({
           title: winnerContext.title,
