@@ -9588,7 +9588,14 @@ const ROUNDUP_STYLES = [
     label: 'Gift-guide grid',
     build: (n, list, title) =>
       `a bright PRODUCT GRID gift guide. A bold header band across the top shows the title "${title}". ` +
-      `Below it, arrange EXACTLY ${n} products in a neat two-column grid of equal rounded cards, filled left-to-right then top-to-bottom in this exact order: ${list}. ` +
+      // An odd count in a two-column grid leaves a hole in the bottom-right. Describe the exact
+      // row shape instead of the column count, and centre a lone final card.
+      (n % 2 === 0
+        ? `Below it, arrange EXACTLY ${n} products in a neat two-column grid of ${n / 2} equal rows, filled left-to-right then top-to-bottom in this exact order: ${list}. `
+        : n === 3
+          ? `Below it, arrange EXACTLY 3 products: TWO equal cards side by side on the first row, and the THIRD card centred on its own row beneath them, at the same width as one of the cards above. Fill them in this exact order: ${list}. `
+          : `Below it, arrange EXACTLY ${n} products as ${Math.floor(n / 2)} full rows of two equal cards, then ONE final card centred on its own row beneath, at the same width as a single card above. Fill them in this exact order: ${list}. `) +
+      'There must be NO empty cell, gap or blank placeholder anywhere in the layout. ' +
       'Each card shows the product photo large and centred, with a short product name on one line beneath it. ' +
       'Even gutters between cards, soft background, plenty of white space, no numbers.',
   },
@@ -13366,8 +13373,21 @@ app.post('/api/urltopin/regenerate-image-with-text', requireUser, async (req, re
     // the "reproduce the attached pin exactly" instruction carries the layout -- but a wrong base
     // is noise the model can blend in. Give it a neutral one instead.
     const isMultiProductStyle = /^(roundup|comparison)[:_]/i.test(String(styleId || ''));
+    // The preserve-art suffix says "replace the words with the SPECIFIED headline/footer", so the
+    // base prompt must still state them. An empty base left nothing to point at and the model
+    // simply reproduced the original wording.
+    //
+    // Only the header band and footer are named: a roundup also carries a product label per card,
+    // and those must be left alone, so the instruction is explicit about which text changes.
+    const multiHeadline = String(overlayForRender?.headline || '').trim().slice(0, 90);
+    const multiFooter = String(overlayForRender?.source || brand?.brandName || '').trim().slice(0, 80);
     let imagePrompt = isMultiProductStyle
-      ? 'Create a vertical 1000x1500 px (2:3) Pinterest pin.'
+      ? 'Create a vertical 1000x1500 px (2:3) Pinterest pin. ' +
+        (multiHeadline
+          ? `The main header band at the top must read exactly "${multiHeadline}". `
+          : '') +
+        (multiFooter ? `The small footer line at the very bottom must read exactly "${multiFooter}". ` : '') +
+        'Leave every product name label on the individual cards exactly as it already appears.'
       : buildOverlayImagePrompt({
       styleId: nanoStyleId,
       topic,
