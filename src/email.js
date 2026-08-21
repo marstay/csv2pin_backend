@@ -369,6 +369,42 @@ export function renderDay3TipEmail() {
   return { subject, html };
 }
 
+/**
+ * Sent once, immediately after someone registers as a partner.
+ *
+ * Registration used to be followed by silence: no link, no terms, no idea what to promote. Two of
+ * the first nine partners signed up within minutes of creating an account and never returned.
+ * Commission is stated as NET here on purpose -- discovering that later feels like a bait-and-switch.
+ */
+export function renderAffiliateWelcomeEmail({ displayName, slug, ratePct = 30, months = 12 } = {}) {
+  const name = String(displayName || '').trim();
+  const link = `${FRONTEND_URL}/?ref=${encodeURIComponent(String(slug || '').trim())}`;
+  const subject = `You're in — here's your ${BRAND} referral link`;
+  const bodyHtml = `
+    <p style="margin:0 0 14px;">Hi${name ? ` ${name}` : ''},</p>
+    <p style="margin:0 0 14px;">Thanks for joining the ${BRAND} partner programme. Here is your referral link:</p>
+    <p style="margin:0 0 16px;"><a href="${link}" style="font-weight:600;">${link}</a></p>
+    <p style="margin:0 0 14px;">Anyone who signs up through it is credited to you for <strong>${months} months</strong>. You earn <strong>${ratePct}% of what they pay every month they stay</strong> &mdash; not just on their first payment.</p>
+    <p style="margin:0 0 14px;">One thing worth knowing up front: commission is calculated on <strong>net</strong> revenue, after payment processing and tax, rather than the sticker price. On a $25/month plan that works out around $7 a month. Plans run $12 to $129, so one customer on the top tier is worth roughly $430 over a year.</p>
+    <p style="margin:0 0 8px;font-weight:600;">What tends to convert</p>
+    <p style="margin:0 0 14px;">Amazon affiliates, Etsy sellers and bloggers who already use Pinterest and are stuck producing enough pins. An honest post about that specific problem lands far better than a feature list &mdash; the tool sells itself once someone recognises the grind it removes.</p>
+    <p style="margin:0 0 14px;">Your dashboard shows clicks, signups and earnings as they come in. I handle payouts personally, so I will be in touch once you have commissions to pay out.</p>`;
+  const html = emailLayout({
+    heading: "You're in — here's your link",
+    bodyHtml,
+    ctaText: 'Open my partner dashboard',
+    ctaUrl: `${FRONTEND_URL}/affiliate/dashboard`,
+    ps: `Reply and tell me where you plan to share it — I read every email, and I can tell you what tends to land with that audience.`,
+    footerNote: `You're receiving this because you just registered as a ${BRAND} partner.`,
+  });
+  return { subject, html };
+}
+
+export async function sendAffiliateWelcomeEmail({ to, displayName, slug, ratePct, months } = {}) {
+  const { subject, html } = renderAffiliateWelcomeEmail({ displayName, slug, ratePct, months });
+  return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });
+}
+
 export async function sendWelcomeEmail({ to } = {}) {
   const { subject, html } = renderWelcomeEmail();
   return sendEmail({ to, subject, html, replyTo: SUPPORT_EMAIL });

@@ -57,6 +57,7 @@ import {
   sendPinterestReconnectEmail,
   nextPlanFor,
   sendWelcomeEmail,
+  sendAffiliateWelcomeEmail,
   sendDay3TipEmail,
   sendFirstPinEmail,
   isEmailEnabled,
@@ -15469,6 +15470,22 @@ app.post('/api/affiliate/apply', requireUser, async (req, res) => {
       }
       return res.status(500).json({ error: 'Failed to submit application' });
     }
+    // Registration used to be followed by silence. Fire-and-log: a mail failure must never
+    // turn a successful registration into an error for the partner.
+    try {
+      const r = await sendAffiliateWelcomeEmail({
+        to: email,
+        displayName: displayName || slug,
+        slug,
+        ratePct: Math.round(DEFAULT_AFFILIATE_COMMISSION_RATE * 100),
+        months: DEFAULT_AFFILIATE_RECURRING_MONTHS,
+      });
+      if (r?.ok) console.log('affiliate: welcome email sent', { slug });
+      else console.warn('affiliate: welcome email not sent', { slug, reason: r?.error || 'unknown' });
+    } catch (e) {
+      console.warn('affiliate: welcome email error', { slug, error: e?.message || e });
+    }
+
     return res.json({
       ok: true,
       status: 'active',
